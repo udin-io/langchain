@@ -663,10 +663,36 @@ defmodule LangChain.ChatModels.ChatGoogleAI do
   @spec get_action(t()) :: String.t()
   defp get_action(%ChatGoogleAI{stream: false}), do: "generateContent"
   defp get_action(%ChatGoogleAI{stream: true}), do: "streamGenerateContent"
+# In LangChain.ChatModels.ChatGoogleAI
 
-  def complete_final_delta(data) when is_list(data) do
-    update_in(data, [Access.at(-1), Access.at(-1)], &%{&1 | status: :complete})
+def complete_final_delta(data) when is_list(data) do
+  # If the stream collected an error as a keyword list, surface it properly.
+  if Keyword.keyword?(data) and Keyword.has_key?(data, :error) do
+    {:error, Keyword.fetch!(data, :error)}
+  else
+    try do
+      # Typical shape: a list of candidate delta lists; mark the last delta complete
+      update_in(data, [Access.at(-1), Access.at(-1)], &%{&1 | status: :complete})
+    rescue
+      _ ->
+        {:error,
+         LangChainError.exception(
+           type: "unexpected_response",
+           message: "Unexpected streamed response shape",
+           original: data
+         )}
+    end
   end
+end
+
+def complete_final_delta(other) do
+  {:error,
+   LangChainError.exception(
+     type: "unexpected_response",
+     message: "Unexpected streamed response",
+     original: other
+   )}
+end
 
   def do_process_response(model, response, message_type \\ Message)
 
@@ -773,6 +799,7 @@ defmodule LangChain.ChatModels.ChatGoogleAI do
       status: finish_reason_to_status(data["finishReason"]),
       index: data["index"]
     }
+    |> Utils.conditionally_add_to_map(:status, Map.get(data, "finishReason") |> finish_reason_to_status())
     |> Utils.conditionally_add_to_map(:tool_calls, tool_calls_from_parts)
     |> MessageDelta.new()
     |> case do
@@ -818,6 +845,28 @@ defmodule LangChain.ChatModels.ChatGoogleAI do
     {:error,
      LangChainError.exception(type: "invalid_json", message: error_message, original: response)}
   end
+# In LangChain.ChatModels.ChatGoogleAI
+
+# Handle finish-only streamed events like:
+# %{"finishReason" => "STOP", "content" => %{"role" => "model"}, "index" => 0}
+def do_process_response(
+      _model,
+      %{"content" => %{"role" => role}, "index" => index} = _data,
+      MessageDelta
+    ) do
+  %{
+    role: unmap_role(role),
+    content: nil,
+    complete: true,
+    index: index
+  }
+  |> MessageDelta.new()
+  |> case do
+    {:ok, message} -> message
+    {:error, %Ecto.Changeset{} = changeset} ->
+      {:error, LangChainError.exception(changeset)}
+  end
+end
 
   def do_process_response(_model, other, _) do
     Logger.error("Trying to process an unexpected response. #{inspect(other)}")
