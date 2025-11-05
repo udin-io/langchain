@@ -608,8 +608,8 @@ defmodule LangChain.ChatModels.ChatGoogleAI do
 
             message_delta, {acc, last_index} ->
               [last_message_delta | _] = acc
-              last_content_type = get_in(last_message_delta.content.type)
-              content_type = get_in(message_delta.content.type)
+              last_content_type = get_in(last_message_delta, [:content, :type])
+              content_type = get_in(message_delta, [:content, :type])
 
               new_index =
                 case not is_nil(content_type) && content_type != last_content_type do
