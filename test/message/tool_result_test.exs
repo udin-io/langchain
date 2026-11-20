@@ -80,6 +80,28 @@ defmodule LangChain.Message.ToolResultTest do
       assert msg.is_error == true
     end
 
+    test "defaults is_exception to false with no exception" do
+      assert {:ok, %ToolResult{is_exception: false, exception: nil}} =
+               ToolResult.new(%{tool_call_id: "call_1", content: "fine"})
+    end
+
+    test "accepts a rescued exception and its stacktrace" do
+      rescued = {%RuntimeError{message: "boom"}, [{Mod, :fun, 2, [file: ~c"a.ex", line: 1]}]}
+
+      assert {:ok, %ToolResult{} = msg} =
+               ToolResult.new(%{
+                 tool_call_id: "call_1",
+                 content: "ERROR executing tool: boom",
+                 is_error: true,
+                 is_exception: true,
+                 exception: rescued
+               })
+
+      assert msg.is_error == true
+      assert msg.is_exception == true
+      assert msg.exception == rescued
+    end
+
     test "returns errors when invalid" do
       {:error, changeset} =
         ToolResult.new(%{tool_call_id: nil, content: nil})
@@ -100,6 +122,77 @@ defmodule LangChain.Message.ToolResultTest do
       assert_raise LangChainError, "tool_call_id: can't be blank; content: can't be blank", fn ->
         ToolResult.new!(%{tool_call_id: nil, content: nil})
       end
+    end
+  end
+
+  describe "is_refusal" do
+    test "defaults to false" do
+      assert {:ok, %ToolResult{is_refusal: false}} =
+               ToolResult.new(%{tool_call_id: "c1", content: "ok"})
+    end
+
+    test "a refusal is always an error" do
+      assert {:ok, %ToolResult{is_refusal: true, is_error: true}} =
+               ToolResult.new(%{tool_call_id: "c1", content: "no", is_refusal: true})
+
+      assert {:ok, %ToolResult{is_refusal: true, is_error: true}} =
+               ToolResult.new(%{
+                 tool_call_id: "c1",
+                 content: "no",
+                 is_refusal: true,
+                 is_error: false
+               })
+    end
+
+    test "a rescued exception cannot be a refusal" do
+      assert {:error, changeset} =
+               ToolResult.new(%{
+                 tool_call_id: "c1",
+                 content: "boom",
+                 is_refusal: true,
+                 is_exception: true
+               })
+
+      assert {"cannot be set on a rescued exception", _opts} = changeset.errors[:is_refusal]
+    end
+  end
+
+  describe "interrupt fields" do
+    test "is_interrupt defaults to false" do
+      {:ok, result} = ToolResult.new(%{tool_call_id: "call_1", content: "OK"})
+      assert result.is_interrupt == false
+      assert result.interrupt_data == nil
+    end
+
+    test "creates with is_interrupt: true and interrupt_data" do
+      interrupt_data = %{type: :subagent_hitl, sub_agent_id: "agent-1"}
+
+      result =
+        ToolResult.new!(%{
+          tool_call_id: "call_1",
+          content: "SubAgent requires approval.",
+          is_interrupt: true,
+          interrupt_data: interrupt_data
+        })
+
+      assert result.is_interrupt == true
+      assert result.interrupt_data == interrupt_data
+      assert result.content == [ContentPart.text!("SubAgent requires approval.")]
+    end
+
+    test "interrupt fields survive round-trip" do
+      data = %{reason: "approval_needed"}
+
+      {:ok, result} =
+        ToolResult.new(%{
+          tool_call_id: "call_1",
+          content: "paused",
+          is_interrupt: true,
+          interrupt_data: data
+        })
+
+      assert result.is_interrupt == true
+      assert result.interrupt_data == data
     end
   end
 end

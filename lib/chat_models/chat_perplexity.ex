@@ -36,6 +36,32 @@ defmodule LangChain.ChatModels.ChatPerplexity do
   - keywords: An array of SEO keywords
   - meta_description: The SEO meta description
   ```
+
+  ## Connection Retry Behavior
+
+  The `retry_count` option controls how many times a request is retried when
+  a pooled HTTP connection turns out to be stale (server closed it between
+  requests). This is a transport-level issue where retrying with a fresh
+  connection is the correct response.
+
+  **Only closed-connection errors are retried.** Timeouts, rate limits (429),
+  overloaded (529), authentication errors, and invalid requests all return
+  immediately -- they are not problems that a simple retry will fix.
+
+  | `retry_count` | Total HTTP requests |
+  |---|---|
+  | `0` | 1 (no retries) |
+  | `1` | 2 (1 initial + 1 retry) |
+  | `2` (default) | 3 (1 initial + 2 retries) |
+
+  Req's built-in HTTP retry is disabled to prevent the two retry layers from
+  compounding. See [GitHub issue #503](https://github.com/brainlid/langchain/issues/503).
+
+  When running LLM calls from a background job queue (e.g., Oban) that has its
+  own retry logic, set `retry_count: 0` so there are no hidden retries:
+
+      ChatPerplexity.new!(%{model: "...", retry_count: 0})
+
   """
   use Ecto.Schema
   require Logger
@@ -45,6 +71,7 @@ defmodule LangChain.ChatModels.ChatPerplexity do
   alias LangChain.ChatModels.ChatModel
   alias LangChain.Message
   alias LangChain.MessageDelta
+  alias LangChain.Message.Citation
   alias LangChain.Message.ContentPart
   alias LangChain.Message.ToolCall
   alias LangChain.TokenUsage
@@ -111,6 +138,14 @@ defmodule LangChain.ChatModels.ChatPerplexity do
 
     # A list of maps for callback handlers
     field :callbacks, {:array, :map}, default: []
+
+    # For help with debugging. It outputs the RAW Req response received and the
+    # RAW Elixir map being submitted to the API.
+    field :verbose_api, :boolean, default: false
+
+    # Number of retries on closed-connection errors (stale pool). The initial
+    # request always runs; this controls additional attempts only.
+    field :retry_count, :integer, default: 2
   end
 
   @type t :: %ChatPerplexity{}
@@ -131,7 +166,10 @@ defmodule LangChain.ChatModels.ChatPerplexity do
     :return_related_questions,
     :search_recency_filter,
     :response_format,
-    :receive_timeout
+    :receive_timeout,
+    :verbose_api,
+    :retry_count,
+    :callbacks
   ]
 
   @required_fields [:model]
@@ -182,6 +220,8 @@ defmodule LangChain.ChatModels.ChatPerplexity do
   """
   @spec for_api(t(), [Message.t()], ChatModel.tools()) :: %{atom() => any()}
   def for_api(%ChatPerplexity{} = perplexity, messages, tools) do
+    tools = LangChain.NativeTool.drop_tool_search(tools)
+
     response_format =
       if tools && !Enum.empty?(tools) do
         %{
@@ -312,11 +352,12 @@ defmodule LangChain.ChatModels.ChatPerplexity do
   def call(%ChatPerplexity{} = perplexity, messages, tools) when is_list(messages) do
     metadata = %{
       model: perplexity.model,
+      provider: provider(),
       message_count: length(messages),
       tools_count: length(tools)
     }
 
-    Telemetry.span([:langchain, :llm, :call], metadata, fn ->
+    ChatModel.llm_telemetry_span(perplexity, metadata, fn ->
       try do
         # Track the prompt being sent
         Telemetry.llm_prompt(
@@ -328,8 +369,17 @@ defmodule LangChain.ChatModels.ChatPerplexity do
           {:error, reason} ->
             {:error, reason}
 
+          {:ok, %Req.Response{body: body}} when is_list(body) ->
+            # Streaming response - body contains accumulated MessageDelta lists
+            Telemetry.llm_response(
+              %{system_time: System.system_time()},
+              %{model: perplexity.model, response: body}
+            )
+
+            {:ok, body}
+
           parsed_data ->
-            # Track the response being received
+            # Non-streaming response
             Telemetry.llm_response(
               %{system_time: System.system_time()},
               %{model: perplexity.model, response: parsed_data}
@@ -345,9 +395,12 @@ defmodule LangChain.ChatModels.ChatPerplexity do
   end
 
   @doc false
-  @spec do_api_request(t(), [Message.t()], ChatModel.tools(), integer()) ::
-          list() | struct() | {:error, LangChainError.t()}
-  def do_api_request(perplexity, messages, tools, retry_count \\ 3)
+  @spec do_api_request(t(), [Message.t()], ChatModel.tools(), integer() | nil) ::
+          list()
+          | struct()
+          | {:ok, Req.Response.t()}
+          | {:error, term()}
+  def do_api_request(perplexity, messages, tools, retry_count \\ nil)
 
   def do_api_request(_perplexity, _messages, _tools, 0) do
     raise LangChainError, "Retries exceeded. Connection failed."
@@ -359,6 +412,8 @@ defmodule LangChain.ChatModels.ChatPerplexity do
         tools,
         retry_count
       ) do
+    retry_count = retry_count || perplexity.retry_count + 1
+
     req =
       Req.new(
         url: perplexity.endpoint,
@@ -373,16 +428,18 @@ defmodule LangChain.ChatModels.ChatPerplexity do
       {:ok, %Req.Response{body: data} = response} ->
         Callbacks.fire(perplexity.callbacks, :on_llm_response_headers, [response.headers])
 
-        Callbacks.fire(perplexity.callbacks, :on_llm_token_usage, [
-          get_token_usage(data)
-        ])
+        token_usage = get_token_usage(data)
+        Callbacks.fire(perplexity.callbacks, :on_llm_token_usage, [token_usage])
 
         case do_process_response(perplexity, data, tools) do
           {:error, %LangChainError{} = reason} ->
-            Logger.error("Error processing response: #{inspect(reason)}")
             {:error, reason}
 
           result ->
+            # Attach usage to the message so it rides on the returned result in
+            # the `%TokenUsage{}` shape `ChatModel.token_usage_from_result/1`
+            # reads; otherwise the LLM-call span reports `token_usage: nil`.
+            result = TokenUsage.set(result, token_usage)
             Callbacks.fire(perplexity.callbacks, :on_llm_new_message, [result])
 
             # Track non-streaming response completion
@@ -407,7 +464,7 @@ defmodule LangChain.ChatModels.ChatPerplexity do
         do_api_request(perplexity, messages, tools, retry_count - 1)
 
       other ->
-        Logger.error("Unexpected and unhandled API response! #{inspect(other)}")
+        Logger.warning(fn -> "Unexpected and unhandled API response! #{inspect(other)}" end)
         other
     end
   end
@@ -418,6 +475,8 @@ defmodule LangChain.ChatModels.ChatPerplexity do
         tools,
         retry_count
       ) do
+    retry_count = retry_count || perplexity.retry_count + 1
+
     Req.new(
       url: perplexity.endpoint,
       json: for_api(perplexity, messages, tools),
@@ -447,7 +506,7 @@ defmodule LangChain.ChatModels.ChatPerplexity do
         do_api_request(perplexity, messages, tools, retry_count - 1)
 
       other ->
-        Logger.error("Unexpected and unhandled API response! #{inspect(other)}")
+        Logger.warning(fn -> "Unexpected and unhandled API response! #{inspect(other)}" end)
         other
     end
   end
@@ -455,7 +514,8 @@ defmodule LangChain.ChatModels.ChatPerplexity do
   @doc """
   Decode a streamed response from the Perplexity API.
   """
-  @spec decode_stream({String.t(), String.t()}) :: {%{String.t() => any()}}
+  @spec decode_stream({String.t(), String.t()}, list()) ::
+          {[%{String.t() => any()}], String.t()}
   def decode_stream({raw_data, buffer}, done \\ []) do
     raw_data
     |> String.split("data: ")
@@ -507,8 +567,10 @@ defmodule LangChain.ChatModels.ChatPerplexity do
       end
     end
 
-    # Process the first choice
-    do_process_response(model, choice, tools)
+    # Process the first choice and attach citations from top-level response
+    model
+    |> do_process_response(choice, tools)
+    |> attach_perplexity_citations(data)
   end
 
   def do_process_response(
@@ -520,18 +582,49 @@ defmodule LangChain.ChatModels.ChatPerplexity do
       when tools != [] do
     status = finish_reason_to_status(finish_reason)
 
-    # Try to parse content as JSON since we expect structured output
+    # Try to parse content as JSON since we expect structured output.
+    # Perplexity returns structured output matching the tool_calls JSON schema
+    # we send in for_api: {"tool_calls": [{"name": "...", "arguments": {...}}]}
     case Jason.decode(content) do
+      {:ok, %{"tool_calls" => tool_calls}} when is_list(tool_calls) ->
+        parsed_tool_calls =
+          Enum.map(tool_calls, fn call ->
+            args_json = Jason.encode!(call["arguments"])
+
+            tool_call =
+              ToolCall.new!(%{
+                type: :function,
+                status: :complete,
+                name: call["name"],
+                arguments: args_json,
+                call_id: Utils.generate_tool_call_id()
+              })
+
+            # Force arguments back to JSON string (validate_and_parse_arguments
+            # decodes it to a map, but we want to keep the string form)
+            %{tool_call | arguments: args_json}
+          end)
+
+        case Message.new(%{
+               "role" => role,
+               "content" => nil,
+               "status" => status,
+               "index" => data["index"],
+               "tool_calls" => parsed_tool_calls
+             }) do
+          {:ok, message} -> message
+          {:error, changeset} -> {:error, LangChainError.exception(changeset)}
+        end
+
       {:ok, _parsed} ->
-        # Create a tool call from the parsed content
+        # Valid JSON but not in tool_calls format — treat as single tool call
         tool_call =
           ToolCall.new!(%{
             type: :function,
             status: :complete,
             name: List.first(tools).name,
-            # Keep the original JSON string
             arguments: content,
-            call_id: Ecto.UUID.generate()
+            call_id: Utils.generate_tool_call_id()
           })
 
         case Message.new(%{
@@ -575,12 +668,10 @@ defmodule LangChain.ChatModels.ChatPerplexity do
   end
 
   def do_process_response(_model, %{"error" => %{"message" => reason, "type" => type}}) do
-    Logger.error("Received error from API: #{inspect(reason)}")
     {:error, LangChainError.exception(type: type, message: reason)}
   end
 
   def do_process_response(_model, %{"error" => %{"message" => reason}}) do
-    Logger.error("Received error from API: #{inspect(reason)}")
     {:error, LangChainError.exception(message: reason)}
   end
 
@@ -638,7 +729,7 @@ defmodule LangChain.ChatModels.ChatPerplexity do
                        status: :complete,
                        name: call["name"],
                        arguments: Jason.encode!(call["arguments"]),
-                       call_id: Ecto.UUID.generate()
+                       call_id: Utils.generate_tool_call_id()
                      })
 
                    # Force the arguments field to be a JSON string even if the ToolCall schema casts it
@@ -727,15 +818,18 @@ defmodule LangChain.ChatModels.ChatPerplexity do
 
   def do_process_response(_model, {:error, %Jason.DecodeError{} = response}) do
     error_message = "Received invalid JSON: #{inspect(response)}"
-    Logger.error(error_message)
 
     {:error,
      LangChainError.exception(type: "invalid_json", message: error_message, original: response)}
   end
 
   def do_process_response(_model, other) do
-    Logger.error("Trying to process an unexpected response. #{inspect(other)}")
-    {:error, LangChainError.exception(message: "Unexpected response")}
+    {:error,
+     LangChainError.exception(
+       type: "unexpected_response",
+       message: "Unexpected response",
+       original: other
+     )}
   end
 
   defp finish_reason_to_status(nil), do: :incomplete
@@ -756,6 +850,23 @@ defmodule LangChain.ChatModels.ChatPerplexity do
   end
 
   defp get_token_usage(_response_body), do: nil
+
+  @impl ChatModel
+  def provider, do: "perplexity"
+
+  @doc """
+  Determine if an error should be retried. If `true`, a fallback LLM may be
+  used. If `false`, the error is understood to be more fundamental with the
+  request rather than a service issue and it should not be retried or fallback
+  to another service.
+  """
+  @impl ChatModel
+  @spec retry_on_fallback?(LangChainError.t()) :: boolean()
+  def retry_on_fallback?(%LangChainError{type: "rate_limited"}), do: true
+  def retry_on_fallback?(%LangChainError{type: "rate_limit_exceeded"}), do: true
+  def retry_on_fallback?(%LangChainError{type: "timeout"}), do: true
+  def retry_on_fallback?(%LangChainError{type: "too_many_requests"}), do: true
+  def retry_on_fallback?(_), do: false
 
   @doc """
   Generate a config map that can later restore the model's configuration.
@@ -780,7 +891,8 @@ defmodule LangChain.ChatModels.ChatPerplexity do
         :return_related_questions,
         :search_recency_filter,
         :response_format,
-        :receive_timeout
+        :receive_timeout,
+        :verbose_api
       ],
       @current_config_version
     )
@@ -795,52 +907,229 @@ defmodule LangChain.ChatModels.ChatPerplexity do
     ChatPerplexity.new(data)
   end
 
-  defp process_stream_chunk(_perplexity, %{
-         "choices" => [
-           %{
-             "delta" => %{"content" => content},
-             "finish_reason" => finish_reason
-           }
-           | _
-         ]
-       })
-       when finish_reason in [nil, "stop"] do
-    delta = %MessageDelta{content: content, role: :assistant, status: :complete}
-    send(self(), {:message_delta, delta})
-    {:cont, delta}
+  defp process_stream_chunk(perplexity, chunk) do
+    chunk
+    |> decode_stream_chunk()
+    |> attach_stream_usage(perplexity, chunk)
   end
 
-  defp process_stream_chunk(_perplexity, %{
+  # Perplexity reports usage once, on the chunk that closes the stream, riding
+  # alongside the final content delta rather than on a chunk of its own.
+  # Attaching it to the deltas that chunk produced is what carries it onto the
+  # assembled message, and from there to the
+  # `[:langchain, :llm, :call, :stop]` telemetry event and the OTEL span.
+  # `TokenUsage.add/2` combines several readings of one message by keeping the
+  # larger count per field, so a delta pair that both carry it still reports it
+  # once.
+  defp attach_stream_usage(deltas, perplexity, %{"usage" => usage}) when is_map(usage) do
+    case get_token_usage(%{"usage" => usage}) do
+      %TokenUsage{} = token_usage ->
+        Callbacks.fire(perplexity.callbacks, :on_llm_token_usage, [token_usage])
+        apply_stream_usage(deltas, token_usage)
+
+      nil ->
+        deltas
+    end
+  end
+
+  defp attach_stream_usage(deltas, _perplexity, _chunk), do: deltas
+
+  defp apply_stream_usage(deltas, usage) when is_list(deltas),
+    do: Enum.map(deltas, &TokenUsage.set(&1, usage))
+
+  defp apply_stream_usage(delta, usage), do: TokenUsage.set(delta, usage)
+
+  # Content delta on the final chunk (finish_reason: "stop"). Also extract
+  # citations from the chunk since Perplexity includes them on every chunk
+  # but we only need to process them once at completion. Returns a list
+  # [citation_delta, content_delta] so both flow through the pipeline.
+  defp decode_stream_chunk(
+         %{
+           "choices" => [
+             %{
+               "delta" => %{"content" => content},
+               "finish_reason" => "stop"
+             }
+             | _
+           ]
+         } = chunk
+       ) do
+    content_delta = %MessageDelta{content: content, role: :assistant, status: :complete}
+
+    case build_streaming_citation_delta(chunk) do
+      nil -> content_delta
+      citation_delta -> [citation_delta, content_delta]
+    end
+  end
+
+  # Content delta on intermediate chunks (no finish_reason or nil).
+  # Ignore citations here since they repeat on every chunk.
+  defp decode_stream_chunk(%{
          "choices" => [
            %{"delta" => %{"content" => content}} | _
          ]
        }) do
-    delta = %MessageDelta{content: content, role: :assistant}
-    send(self(), {:message_delta, delta})
-    {:cont, delta}
+    %MessageDelta{content: content, role: :assistant}
   end
 
-  defp process_stream_chunk(_perplexity, %{
-         "choices" => [
-           %{"finish_reason" => finish_reason} | _
-         ]
-       })
-       when finish_reason in [nil, "stop"] do
-    delta = %MessageDelta{status: :complete}
-    send(self(), {:message_delta, delta})
-    {:cont, delta}
+  # Completion chunk with no content delta.
+  defp decode_stream_chunk(
+         %{
+           "choices" => [
+             %{"finish_reason" => "stop"} | _
+           ]
+         } = chunk
+       ) do
+    content_delta = %MessageDelta{status: :complete, role: :assistant}
+
+    case build_streaming_citation_delta(chunk) do
+      nil -> content_delta
+      citation_delta -> [citation_delta, content_delta]
+    end
   end
 
-  defp process_stream_chunk(_perplexity, %{
-         "choices" => [
-           %{"message" => message} | _
-         ]
-       }) do
-    send(self(), {:message, message})
-    {:cont, message}
+  defp decode_stream_chunk(_chunk) do
+    %MessageDelta{}
   end
 
-  defp process_stream_chunk(_perplexity, _chunk) do
-    {:cont, %MessageDelta{}}
+  # --- Citation Support ---
+
+  # Attach citations from top-level Perplexity response data to a Message.
+  @doc false
+  @spec attach_perplexity_citations(Message.t() | any(), map()) :: Message.t() | any()
+  def attach_perplexity_citations(%Message{} = msg, data) do
+    citation_urls = Map.get(data, "citations", [])
+    search_results = Map.get(data, "search_results", [])
+
+    sources = build_perplexity_sources(citation_urls, search_results)
+
+    if sources == [] do
+      msg
+    else
+      full_text = get_message_text(msg)
+      citations = find_citation_markers(full_text, sources)
+
+      if citations == [] do
+        msg
+      else
+        updated_content = attach_citations_to_first_text_part(msg.content, citations)
+        %{msg | content: updated_content}
+      end
+    end
   end
+
+  def attach_perplexity_citations(other, _data), do: other
+
+  @doc false
+  @spec build_perplexity_sources(list(), list()) :: [map()]
+  def build_perplexity_sources(citation_urls, search_results) do
+    cond do
+      is_list(search_results) and search_results != [] ->
+        search_results
+        |> Enum.with_index()
+        |> Enum.map(fn {result, idx} ->
+          url = Map.get(result, "url") || Enum.at(citation_urls || [], idx)
+
+          metadata =
+            %{}
+            |> maybe_put_metadata("date", Map.get(result, "date"))
+            |> maybe_put_metadata("snippet", Map.get(result, "snippet"))
+            |> maybe_put_metadata("source_domain", Map.get(result, "source"))
+
+          %{
+            type: :web,
+            title: Map.get(result, "title"),
+            url: url,
+            metadata: metadata
+          }
+        end)
+
+      is_list(citation_urls) and citation_urls != [] ->
+        Enum.map(citation_urls, fn url ->
+          %{type: :web, url: url}
+        end)
+
+      true ->
+        []
+    end
+  end
+
+  @doc false
+  @spec find_citation_markers(String.t(), [map()]) :: [Citation.t()]
+  def find_citation_markers(text, sources) when is_binary(text) and text != "" do
+    ~r/\[(\d+)\]/
+    |> Regex.scan(text, return: :index)
+    |> Enum.flat_map(fn [{full_start, full_len}, {num_start, num_len}] ->
+      number_str = binary_part(text, num_start, num_len)
+      index = String.to_integer(number_str) - 1
+
+      case Enum.at(sources, index) do
+        nil ->
+          []
+
+        source ->
+          [
+            Citation.new!(%{
+              start_index: full_start,
+              end_index: full_start + full_len,
+              source: source,
+              metadata: %{"provider_type" => "perplexity_citation", "citation_index" => index}
+            })
+          ]
+      end
+    end)
+  end
+
+  def find_citation_markers(_, _), do: []
+
+  defp get_message_text(%Message{content: content}) when is_list(content) do
+    content
+    |> Enum.filter(&(&1.type == :text))
+    |> Enum.map_join("", & &1.content)
+  end
+
+  defp get_message_text(%Message{content: content}) when is_binary(content), do: content
+  defp get_message_text(_), do: ""
+
+  defp attach_citations_to_first_text_part(content, citations) when is_list(content) do
+    case Enum.find_index(content, &(&1.type == :text)) do
+      nil ->
+        content
+
+      idx ->
+        List.update_at(content, idx, fn part ->
+          %{part | citations: citations}
+        end)
+    end
+  end
+
+  defp attach_citations_to_first_text_part(content, _citations), do: content
+
+  # Build a citation-only MessageDelta from a streaming chunk's citation data.
+  # Returns nil if no citations are present.
+  defp build_streaming_citation_delta(chunk) do
+    citation_urls = Map.get(chunk, "citations", [])
+    search_results = Map.get(chunk, "search_results", [])
+    sources = build_perplexity_sources(citation_urls, search_results)
+
+    if sources == [] do
+      nil
+    else
+      citation_structs =
+        sources
+        |> Enum.with_index()
+        |> Enum.map(fn {source, idx} ->
+          Citation.new!(%{
+            source: source,
+            metadata: %{"provider_type" => "perplexity_citation", "citation_index" => idx}
+          })
+        end)
+
+      citation_part = %ContentPart{type: :text, content: nil, citations: citation_structs}
+      %MessageDelta{content: citation_part, role: :assistant, status: :incomplete}
+    end
+  end
+
+  defp maybe_put_metadata(map, _key, nil), do: map
+  defp maybe_put_metadata(map, key, value), do: Map.put(map, key, value)
 end

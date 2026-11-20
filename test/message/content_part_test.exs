@@ -2,6 +2,7 @@ defmodule LangChain.Message.ContentPartTest do
   use ExUnit.Case
   doctest LangChain.Message.ContentPart, import: true
   alias LangChain.Message.ContentPart
+  alias LangChain.Message.Citation
 
   describe "new/1" do
     test "accepts valid settings" do
@@ -24,6 +25,57 @@ defmodule LangChain.Message.ContentPartTest do
       {:ok, %ContentPart{} = part} = ContentPart.new(%{type: :text, content: " "})
       assert part.type == :text
       assert part.content == " "
+    end
+  end
+
+  describe "new/1 options" do
+    test "keeps a keyword list of options as-is" do
+      {:ok, %ContentPart{} = part} =
+        ContentPart.new(%{type: :thinking, content: "hmm", options: [signature: "sig"]})
+
+      assert part.options == [signature: "sig"]
+    end
+
+    test "converts a map of options into a keyword list" do
+      {:ok, %ContentPart{} = part} =
+        ContentPart.new(%{
+          type: :unsupported,
+          options: %{id: "ws_1", status: "completed", type: "web_search_call"}
+        })
+
+      assert is_list(part.options)
+      assert part.options[:id] == "ws_1"
+      assert part.options[:status] == "completed"
+      assert part.options[:type] == "web_search_call"
+    end
+
+    test "converts an empty map of options into an empty list" do
+      {:ok, %ContentPart{} = part} = ContentPart.new(%{type: :text, content: "hi", options: %{}})
+      assert part.options == []
+    end
+
+    test "rejects a map of options with non-atom keys" do
+      # Converting caller-supplied strings to atoms would let untrusted input
+      # grow the atom table.
+      assert {:error, changeset} =
+               ContentPart.new(%{type: :unsupported, options: %{"id" => "ws_1"}})
+
+      refute changeset.valid?
+      assert {"keys must be atoms", _} = changeset.errors[:options]
+    end
+
+    test "options survive the writers and readers that expect a keyword list" do
+      part =
+        ContentPart.new!(%{
+          type: :unsupported,
+          options: %{id: "ws_1", type: "web_search_call"}
+        })
+
+      assert [%ContentPart{} = updated] =
+               ContentPart.set_option_on_last_part([part], :cache_control, true)
+
+      assert updated.options[:cache_control] == true
+      assert updated.options[:id] == "ws_1"
     end
   end
 
@@ -153,6 +205,66 @@ defmodule LangChain.Message.ContentPartTest do
       assert merged.options == [signature: "woofwoofwoofbowwowwow"]
     end
 
+    test "appends citations from new part to existing" do
+      citation1 =
+        Citation.new!(%{cited_text: "first", source: %{type: :web, url: "https://a.com"}})
+
+      citation2 =
+        Citation.new!(%{cited_text: "second", source: %{type: :web, url: "https://b.com"}})
+
+      %ContentPart{} = base_1 = ContentPart.text!("Hello")
+      part_1 = %ContentPart{base_1 | citations: [citation1]}
+      %ContentPart{} = base_2 = ContentPart.text!(" world")
+      part_2 = %ContentPart{base_2 | citations: [citation2]}
+
+      merged = ContentPart.merge_part(part_1, part_2)
+      assert merged.content == "Hello world"
+      assert [%Citation{cited_text: "first"}, %Citation{cited_text: "second"}] = merged.citations
+    end
+
+    test "handles nil citations on primary when merging" do
+      citation = Citation.new!(%{cited_text: "text", source: %{type: :web}})
+      %ContentPart{} = base_1 = ContentPart.text!("Hello")
+      part_1 = %ContentPart{base_1 | citations: nil}
+      %ContentPart{} = base_2 = ContentPart.text!(" world")
+      part_2 = %ContentPart{base_2 | citations: [citation]}
+
+      merged = ContentPart.merge_part(part_1, part_2)
+      assert [%Citation{}] = merged.citations
+    end
+
+    test "handles empty citations gracefully" do
+      part_1 = ContentPart.text!("Hello")
+      part_2 = ContentPart.text!(" world")
+
+      merged = ContentPart.merge_part(part_1, part_2)
+      assert merged.citations == []
+    end
+
+    test "merges citation-only delta (nil content) with text part" do
+      citation =
+        Citation.new!(%{cited_text: "cited", source: %{type: :document, document_id: "0"}})
+
+      part_1 = ContentPart.text!("Some text")
+      part_2 = %ContentPart{type: :text, content: nil, citations: [citation]}
+
+      merged = ContentPart.merge_part(part_1, part_2)
+      assert merged.content == "Some text"
+      assert [%Citation{cited_text: "cited"}] = merged.citations
+    end
+
+    test "merges text delta into citation-only part (nil content primary)" do
+      citation =
+        Citation.new!(%{cited_text: "cited", source: %{type: :document, document_id: "0"}})
+
+      part_1 = %ContentPart{type: :text, content: nil, citations: [citation]}
+      part_2 = ContentPart.text!("Apollo 11")
+
+      merged = ContentPart.merge_part(part_1, part_2)
+      assert merged.content == "Apollo 11"
+      assert [%Citation{cited_text: "cited"}] = merged.citations
+    end
+
     test "merges a redacted thinking content" do
       part_1 =
         ContentPart.new!(%{
@@ -165,6 +277,85 @@ defmodule LangChain.Message.ContentPartTest do
       assert merged.type == :unsupported
       assert merged.content == nil
       assert merged.options == [redacted: "redactedREDACTEDredactedMOREmoreMORE"]
+    end
+  end
+
+  describe "utterance markers" do
+    test "narration!/1 builds a text part marked as narration" do
+      part = ContentPart.narration!("I'll check the logs.")
+      assert %ContentPart{type: :text, content: "I'll check the logs."} = part
+      assert part.options == [utterance: "narration"]
+      assert ContentPart.utterance(part) == "narration"
+      assert ContentPart.narration?(part)
+    end
+
+    test "answer!/1 builds a text part marked as an answer" do
+      part = ContentPart.answer!("Done.")
+      assert %ContentPart{type: :text, content: "Done."} = part
+      assert ContentPart.utterance(part) == "answer"
+      refute ContentPart.narration?(part)
+    end
+
+    test "put_utterance/2 keeps existing options and replaces a previous marker" do
+      part =
+        ContentPart.text!("Hi", cache_control: true)
+        |> ContentPart.put_utterance("narration")
+        |> ContentPart.put_utterance("answer")
+
+      assert part.options[:cache_control] == true
+      assert ContentPart.utterance(part) == "answer"
+    end
+
+    test "put_utterance/2 rejects an unknown kind" do
+      assert_raise FunctionClauseError, fn ->
+        ContentPart.put_utterance(ContentPart.text!("Hi"), "commentary")
+      end
+    end
+
+    test "utterance/1 is nil for an unmarked part" do
+      assert ContentPart.utterance(ContentPart.text!("Hi")) == nil
+      assert ContentPart.utterance(%ContentPart{type: :text, content: "Hi", options: nil}) == nil
+      refute ContentPart.narration?(ContentPart.text!("Hi"))
+    end
+
+    test "utterance/1 reads an unrecognized value as nil" do
+      assert ContentPart.utterance(ContentPart.text!("Hi", utterance: "bogus")) == nil
+      assert ContentPart.utterance(ContentPart.text!("Hi", utterance: :narration)) == nil
+      refute ContentPart.narration?(ContentPart.text!("Hi", utterance: :narration))
+    end
+
+    test "merge_part/2 keeps a single marker when both parts carry it" do
+      merged =
+        ContentPart.merge_part(
+          ContentPart.text!("I'll ", utterance: "narration"),
+          ContentPart.text!("check.", utterance: "narration")
+        )
+
+      assert merged.content == "I'll check."
+      assert merged.options[:utterance] == "narration"
+      assert ContentPart.narration?(merged)
+    end
+
+    test "merge_part/2 takes the marker from a delta with no text" do
+      merged =
+        ContentPart.merge_part(
+          ContentPart.text!("I'll check."),
+          ContentPart.text!("", utterance: "narration")
+        )
+
+      assert merged.content == "I'll check."
+      assert ContentPart.narration?(merged)
+    end
+
+    test "merge_part/2 still concatenates other string options" do
+      merged =
+        ContentPart.merge_part(
+          ContentPart.thinking!("a", signature: "abc", utterance: "narration"),
+          ContentPart.thinking!("b", signature: "def", utterance: "narration")
+        )
+
+      assert merged.options[:signature] == "abcdef"
+      assert merged.options[:utterance] == "narration"
     end
   end
 
@@ -189,6 +380,17 @@ defmodule LangChain.Message.ContentPartTest do
       ]
 
       assert ContentPart.parts_to_string(parts) == "Hello\n\nworld\n\nhow are you"
+    end
+
+    test "tolerates nil entries (as produced by MessageDelta index-padded merges)" do
+      # MessageDelta.merge_content_part_at_index/3 pads positions with nil when
+      # a ContentPart is merged at an index beyond the current list length.
+      # parts_to_string must not crash on those nils.
+      parts = [nil, ContentPart.text!("Hello"), nil, ContentPart.text!("world")]
+      assert ContentPart.parts_to_string(parts) == "Hello\n\nworld"
+
+      assert ContentPart.parts_to_string([nil]) == nil
+      assert ContentPart.parts_to_string([nil, nil]) == nil
     end
 
     test "matches on content type and can return thinking blocks" do
@@ -329,6 +531,186 @@ defmodule LangChain.Message.ContentPartTest do
       # Test with string value
       updated_parts = ContentPart.set_option_on_last_part(parts, :filename, "test.pdf")
       assert List.first(updated_parts).options == [filename: "test.pdf"]
+    end
+  end
+
+  describe "citations/1" do
+    test "returns empty list by default" do
+      part = ContentPart.text!("Hello")
+      assert ContentPart.citations(part) == []
+    end
+
+    test "returns citations when present" do
+      citation = Citation.new!(%{cited_text: "text", source: %{type: :web}})
+      %ContentPart{} = base = ContentPart.text!("Hello")
+      part = %ContentPart{base | citations: [citation]}
+      assert ContentPart.citations(part) == [citation]
+    end
+
+    test "returns empty list when citations is nil" do
+      %ContentPart{} = base = ContentPart.text!("Hello")
+      part = %ContentPart{base | citations: nil}
+      assert ContentPart.citations(part) == []
+    end
+  end
+
+  describe "has_citations?/1" do
+    test "returns false for empty citations" do
+      refute ContentPart.has_citations?(ContentPart.text!("Hello"))
+    end
+
+    test "returns true when citations are present" do
+      citation = Citation.new!(%{cited_text: "text", source: %{type: :web}})
+      %ContentPart{} = base = ContentPart.text!("Hello")
+      part = %ContentPart{base | citations: [citation]}
+      assert ContentPart.has_citations?(part)
+    end
+
+    test "returns false when citations is nil" do
+      %ContentPart{} = base = ContentPart.text!("Hello")
+      part = %ContentPart{base | citations: nil}
+      refute ContentPart.has_citations?(part)
+    end
+  end
+
+  describe "reasoning?/1" do
+    test "is true for thinking parts" do
+      assert ContentPart.reasoning?(ContentPart.thinking!("hmm", signature: "SIG"))
+    end
+
+    test "is true for Anthropic redacted thinking" do
+      part =
+        ContentPart.new!(%{
+          type: :unsupported,
+          content: "x",
+          options: [type: "redacted_thinking"]
+        })
+
+      assert ContentPart.reasoning?(part)
+    end
+
+    test "is true for OpenAI Responses reasoning items" do
+      unsupported =
+        ContentPart.new!(%{
+          type: :unsupported,
+          options: [type: "reasoning", id: "rs_1", encrypted_content: "enc"]
+        })
+
+      streamed =
+        ContentPart.new!(%{
+          type: :thinking,
+          content: "",
+          options: [type: "reasoning", id: "rs_1"]
+        })
+
+      assert ContentPart.reasoning?(unsupported)
+      assert ContentPart.reasoning?(streamed)
+    end
+
+    test "is true for req_llm reasoning details" do
+      part =
+        ContentPart.new!(%{type: :unsupported, options: [reasoning_details: [%{"text" => "t"}]]})
+
+      assert ContentPart.reasoning?(part)
+    end
+
+    test "is false for output and provider items" do
+      refute ContentPart.reasoning?(ContentPart.text!("Hello"))
+      refute ContentPart.reasoning?(ContentPart.provider_item!("anthropic", %{"type" => "x"}))
+
+      refute ContentPart.reasoning?(
+               ContentPart.new!(%{type: :unsupported, options: [type: "other"]})
+             )
+    end
+  end
+
+  describe "provider_item!/2" do
+    test "holds the provider and the item in options" do
+      item = %{"type" => "tool_search_tool_result", "tool_use_id" => "srvtoolu_1"}
+
+      assert %ContentPart{type: :provider_item, content: nil, options: options} =
+               ContentPart.provider_item!("anthropic", item)
+
+      assert Keyword.get(options, :provider) == "anthropic"
+      assert Keyword.get(options, :item) == item
+    end
+  end
+
+  describe "provider_item?/2" do
+    test "matches only items from the named provider" do
+      part = ContentPart.provider_item!("anthropic", %{"type" => "server_tool_use"})
+
+      assert ContentPart.provider_item?(part, "anthropic")
+      refute ContentPart.provider_item?(part, "openai")
+      refute ContentPart.provider_item?(ContentPart.text!("hi"), "anthropic")
+    end
+  end
+
+  describe "tool_reference!/1" do
+    test "holds the tool name as content" do
+      assert %ContentPart{type: :tool_reference, content: "devices_list"} =
+               ContentPart.tool_reference!("devices_list")
+    end
+
+    test "renders as text" do
+      part = ContentPart.tool_reference!("devices_list")
+      assert ContentPart.tool_reference_text(part) == "Tool available: devices_list"
+    end
+  end
+
+  describe "merge_part/2 with provider items" do
+    test "keeps a single provider name across merged deltas" do
+      first =
+        ContentPart.new!(%{
+          type: :provider_item,
+          content: "{\"query\":",
+          options: [provider: "anthropic", item: %{"type" => "server_tool_use", "input" => %{}}]
+        })
+
+      second =
+        ContentPart.new!(%{
+          type: :provider_item,
+          content: "\"devices\"}",
+          options: [provider: "anthropic"]
+        })
+
+      merged = ContentPart.merge_part(first, second)
+
+      assert merged.content == "{\"query\":\"devices\"}"
+      assert Keyword.get(merged.options, :provider) == "anthropic"
+      assert Keyword.get(merged.options, :item) == %{"type" => "server_tool_use", "input" => %{}}
+    end
+
+    test "a later item replaces the earlier one" do
+      first = ContentPart.provider_item!("anthropic", %{"type" => "server_tool_use"})
+
+      second =
+        ContentPart.provider_item!("anthropic", %{"type" => "server_tool_use", "id" => "x"})
+
+      merged = ContentPart.merge_part(first, second)
+
+      assert Keyword.get(merged.options, :item) == %{"type" => "server_tool_use", "id" => "x"}
+    end
+  end
+
+  describe "text helpers with tool search parts" do
+    test "parts_to_string/1 reads tool references and skips provider items" do
+      parts = [
+        ContentPart.text!("Loaded."),
+        ContentPart.provider_item!("anthropic", %{"type" => "server_tool_use"}),
+        ContentPart.tool_reference!("devices_list")
+      ]
+
+      assert ContentPart.parts_to_string(parts) == "Loaded.\n\nTool available: devices_list"
+    end
+
+    test "a result made only of references still reads as text" do
+      assert ContentPart.content_to_string([ContentPart.tool_reference!("devices_list")]) ==
+               "Tool available: devices_list"
+    end
+
+    test "references are not included when asking for another type" do
+      assert ContentPart.parts_to_string([ContentPart.tool_reference!("x")], :thinking) == nil
     end
   end
 end

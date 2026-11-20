@@ -1,5 +1,5 @@
 defmodule LangChain.Chains.LLMChain do
-  @doc """
+  @moduledoc """
   Define an LLMChain. This is the heart of the LangChain library.
 
   The chain deals with tools, a tool map, delta tracking, tracking the messages
@@ -15,9 +15,22 @@ defmodule LangChain.Chains.LLMChain do
   The set of events are defined in `LangChain.Chains.ChainCallbacks`.
 
   To be notified of an event you care about, register a callback handler with
-  the chain. Multiple callback handlers can be assigned. The callback handler
-  assigned to the `LLMChain` is not provided to an LLM chat model. For callbacks
-  on a chat model, set them there.
+  the chain. Multiple callback handlers can be assigned.
+
+  Callbacks can be registered on the chain or directly on the chat model, and
+  both fire. The difference is the arguments they receive. A handler registered
+  on the chain is given the chain as its first argument; a handler registered on
+  the chat model is fired by the model and receives only the event's argument:
+
+      # on the chain
+      LLMChain.add_callback(chain, %{on_llm_ratelimit_info: fn _chain, headers -> ... end})
+
+      # on the model
+      ChatOpenAI.new!(%{callbacks: [%{on_llm_ratelimit_info: fn headers -> ... end}]})
+
+  For the LLM-level events, the chain forwards its own handlers down to the
+  model for the duration of a run. Handlers already assigned to the model are
+  kept, so both sets run.
 
   ### Registering a callback handler
 
@@ -182,6 +195,81 @@ defmodule LangChain.Chains.LLMChain do
 
   See `LangChain.Chains.LLMChain.run_until_tool_used/3` for more details.
 
+  ## Async Tool Timeout
+
+  When tools are defined with `async: true`, they execute in parallel using Elixir's
+  `Task.async/1`. The `async_tool_timeout` setting controls how long to wait for
+  these parallel tasks to complete.
+
+  **Important**: This timeout only applies to tools with `async: true`. Synchronous
+  tools (the default) run inline and are not subject to this timeout.
+
+  ### Default Behavior
+
+  The default is `:infinity`, meaning async tools can run indefinitely. This is
+  appropriate for human-interactive agents where the user can manually stop
+  execution if needed.
+
+  For automated or unattended agents, consider setting a finite timeout.
+
+  ### Configuration Levels
+
+  Timeout can be configured at three levels (highest precedence first):
+
+  1. **Chain-level** - Set when creating an LLMChain:
+
+         LLMChain.new!(%{
+           llm: model,
+           async_tool_timeout: 10 * 60 * 1000  # 10 minutes
+         })
+
+  2. **Application-level** - Set in config/runtime.exs:
+
+         config :langchain, async_tool_timeout: 5 * 60 * 1000  # 5 minutes
+
+  3. **Library default** - `:infinity` (no timeout)
+
+  ### When to Use Async Tools
+
+  Mark a tool as `async: true` when:
+  - The operation may take significant time (web requests, file processing)
+  - Multiple such operations can run in parallel safely
+  - The tool has no side effects that depend on ordering
+
+      Function.new!(%{
+        name: "web_search",
+        async: true,  # Enables parallel execution
+        function: fn args, ctx -> ... end
+      })
+
+  ### Timeout Values
+
+  - `:infinity` - No timeout (wait forever)
+  - Integer - Milliseconds (e.g., `300_000` for 5 minutes)
+
+  ## Failure Limits
+
+  A chain stops with an `"exceeded_failure_count"` error, and fires
+  `:on_retries_exceeded`, once too many rounds in a row have failed. The check
+  runs before each LLM call.
+
+  - `:max_retry_count` (default `3`) - Consecutive failed rounds allowed. A tool
+    round fails when any of its results is an error. An LLM response a message
+    processor rejects also fails. A clean tool round, or an assistant message that
+    is not tool related, resets the count.
+
+  - `:max_refusal_count` (default `nil`) - Consecutive refusal rounds allowed: tool
+    rounds whose errors are all refusals, calls turned down before they changed
+    anything (see `LangChain.Message.ToolResult`). With `nil`, a refusal round
+    counts as a failed round. When set, refusal rounds are counted apart and stop
+    the chain with the message `"Exceeded max refusal count"`.
+
+  When `:max_refusal_count` is set, a round with any error that is not a refusal
+  counts against `:max_retry_count` and leaves the refusal count as it is. A
+  refusal round leaves the failure count as it is. A chain therefore makes at
+  most `max_retry_count + max_refusal_count - 1` failing rounds in a row before
+  it stops.
+
   """
   use Ecto.Schema
   import Ecto.Changeset
@@ -200,6 +288,7 @@ defmodule LangChain.Chains.LLMChain do
   alias LangChain.LangChainError
   alias LangChain.Utils
   alias LangChain.NativeTool
+  alias LangChain.Chains.LLMChain.Modes
 
   @primary_key false
   embedded_schema do
@@ -227,12 +316,21 @@ defmodule LangChain.Chains.LLMChain do
     # Internal failure count tracker. Is reset on a successful assistant
     # response.
     field :current_failure_count, :integer, default: 0
+    # The maximum consecutive refusal rounds (tool rounds whose errors are all
+    # refusals) permitted before failing the process. When nil, a refusal round
+    # counts as a failure.
+    field :max_refusal_count, :integer
+    # Internal refusal count tracker. Only used when max_refusal_count is set.
+    field :current_refusal_count, :integer, default: 0
 
     # Track the current merged `%MessageDelta{}` struct received when streamed.
     # Set to `nil` when there is no current delta being tracked. This happens
     # when the final delta is received that completes the message. At that point,
-    # the delta is converted to a message and the delta is set to nil.
+    # the delta is converted to a message and the delta is set to nil. An LLM
+    # call neither starts nor finishes with a delta attached, so a delta never
+    # outlives the call that produced it.
     field :delta, :any, virtual: true
+
     # Track the last `%Message{}` received in the chain.
     field :last_message, :any, virtual: true
     # Internally managed. The list of exchanged messages during a `run` function
@@ -248,15 +346,22 @@ defmodule LangChain.Chains.LLMChain do
     field :needs_response, :boolean, default: false
 
     # The timeout for async tool execution. An async Task execution is used when
-    # running a tool that has `async: true` set. Time is in milliseconds.
-    field :async_tool_timeout, :integer
+    # running a tool that has `async: true` set. Accepts an integer (milliseconds)
+    # or :infinity. Defaults to :infinity for human-interactive use cases.
+    # Configure via Application.get_env(:langchain, :async_tool_timeout).
+    field :async_tool_timeout, :any, virtual: true
 
     # A list of maps for callback handlers
     field :callbacks, {:array, :map}, default: []
   end
 
-  # default to 2 minutes
-  @default_task_await_timeout 2 * 60 * 1000
+  # default to infinity for human-interactive use cases
+  @default_task_await_timeout :infinity
+
+  # Get the async tool timeout from application config or use library default
+  defp default_async_tool_timeout do
+    Application.get_env(:langchain, :async_tool_timeout, @default_task_await_timeout)
+  end
 
   @type t :: %LLMChain{}
 
@@ -292,6 +397,7 @@ defmodule LangChain.Chains.LLMChain do
     :tools,
     :custom_context,
     :max_retry_count,
+    :max_refusal_count,
     :callbacks,
     :verbose,
     :verbose_deltas,
@@ -337,6 +443,7 @@ defmodule LangChain.Chains.LLMChain do
   def common_validation(changeset) do
     changeset
     |> validate_required(@required_fields)
+    |> validate_number(:max_refusal_count, greater_than: 0)
     |> Utils.validate_llm_is_struct()
     |> build_tools_map_from_tools()
   end
@@ -377,6 +484,41 @@ defmodule LangChain.Chains.LLMChain do
   end
 
   @doc """
+  Execute a single LLM call step.
+
+  This is the core primitive that modes use to call the LLM. It:
+
+  1. Sends the chain's messages and tools to the LLM
+  2. Processes the LLM's response (message or streaming deltas)
+  3. Adds the response to the chain's messages
+  4. Sets `needs_response` based on whether the model's turn is still open:
+     tool calls are pending, or the assistant message leaves the turn open (see
+     `LangChain.Message.continues_turn?/1`)
+
+  Returns `{:ok, updated_chain}` or `{:error, chain, reason}`.
+
+  This function does NOT execute tool calls — use `execute_tool_calls/1` for that.
+
+  ## Usage in Custom Modes
+
+      def run(chain, opts) do
+        case LLMChain.execute_step(chain) do
+          {:ok, updated_chain} ->
+            updated_chain = LLMChain.execute_tool_calls(updated_chain)
+            if updated_chain.needs_response, do: run(updated_chain, opts), else: {:ok, updated_chain}
+
+          {:error, _chain, _reason} = error ->
+            error
+        end
+      end
+
+  """
+  @spec execute_step(t()) :: {:ok, t()} | {:error, t(), LangChainError.t()}
+  def execute_step(%LLMChain{} = chain) do
+    do_run(chain)
+  end
+
+  @doc """
   Run the chain on the LLM using messages and any registered functions. This
   formats the request for a ChatLLMChain where messages are passed to the API.
 
@@ -386,7 +528,8 @@ defmodule LangChain.Chains.LLMChain do
 
   - `:mode` - It defaults to run the chain one time, stopping after receiving a
     response from the LLM. Supports `:until_success`, `:while_needs_response`,
-    and `:step`.
+    `:step`, or a module implementing the `LangChain.Chains.LLMChain.Mode`
+    behaviour.
 
   - `mode: :until_success` - (for non-interactive processing done by the LLM
     where it may repeatedly fail and need to re-try) Repeatedly evaluates a
@@ -399,6 +542,9 @@ defmodule LangChain.Chains.LLMChain do
     and only the failed `ToolCall` until it succeeds or exceeds the
     `max_retry_count`. In essence, once we have a successful response from the
     LLM, we don't return any more to it and don't want any further responses.
+    An assistant message that leaves the turn open (see
+    `LangChain.Message.continues_turn?/1`) is not a response, so the LLM is
+    called again. Bounded by `:max_runs`, which defaults to 25.
 
   - `mode: :while_needs_response` - (for interactive chats that make
     `ToolCalls`) Repeatedly evaluates functions and submits to the LLM so long
@@ -408,11 +554,36 @@ defmodule LangChain.Chains.LLMChain do
     an opportunity to use the `ToolResult` information in an assistant response
     message. In essence, this mode always gives the LLM the last word.
 
+    An assistant message that leaves the turn open is not the last word, so
+    the LLM is called again rather than the run ending on it. That is a
+    message the provider reported as not ending the turn, or one whose text is
+    entirely narration (the model saying what it is about to do). See
+    `LangChain.Message.continues_turn?/1`.
+
+    The loop is bounded by `:max_runs`, the number of LLM calls allowed in one
+    run. It defaults to 25. When exceeded, a
+    `%LangChainError{type: "exceeded_max_runs"}` is returned.
+
   - `mode: :step` - (for step-by-step execution control) Executes one step of
     the chain: makes an LLM call, processes the message, executes any tool
-    calls, and then stops. This allows the caller to inspect the result and
-    decide whether to continue by calling `run` again. Perfect for scenarios
-    where you need to examine each message or tool result before proceeding.
+    calls, and then stops. This allows the caller to inspect messages and
+    modify the chain between steps before deciding whether to continue by
+    calling `run` again. Perfect for scenarios where you need to examine
+    each message, update context, or modify the chain state before proceeding.
+
+  - `mode: MyCustomMode` - Pass a module implementing the
+    `LangChain.Chains.LLMChain.Mode` behaviour to use a custom execution loop.
+    The module's `run/2` callback receives the chain and the full opts keyword
+    list.
+
+  - `should_continue?` - (for automated stepped execution with conditional
+    stopping) Needs to be used with `mode: :step`, this option accepts a function
+    that receives the updated chain after each step and returns a boolean
+    indicating whether to continue. This internally handles the loop logic,
+    making stepped execution more streamlined for scenarios where you need
+    to inspect the chain state to determine when to stop (e.g., max iterations,
+    completion conditions, error thresholds). The function signature is
+    `(LLMChain.t() -> boolean())`.
 
   - `with_fallbacks: [...]` - Provide a list of chat models to use as a fallback
     when one fails. This helps a production system remain operational when an
@@ -443,6 +614,17 @@ defmodule LangChain.Chains.LLMChain do
 
       LLMChain.run(chain, mode: :until_success)
 
+  **Use Case**: Automated stepped execution with a continuation function.
+  When you want step-by-step control but prefer the loop to be handled
+  internally based on a condition function.
+
+      should_continue_fn = fn updated_chain ->
+        # Continue while we need a response and haven't hit max iterations
+        updated_chain.needs_response && Enum.count(updated_chain.exchanged_messages) < 10
+      end
+
+      {:ok, final_chain} = LLMChain.run(chain, mode: :step, should_continue?: should_continue_fn)
+
   **Use Case**: Step-by-step execution where you need control of the loop.
   In case you want to inspect the result of each step and decide whether to
   continue or not, This is useful for debugging, to stop when you receive a
@@ -451,11 +633,25 @@ defmodule LangChain.Chains.LLMChain do
       {:ok, updated_chain} = LLMChain.run(chain, mode: :step)
       # Inspect the result, check tool calls, etc.
       if should_continue?(updated_chain) do
-        {:ok, final_chain} = LLMChain.run(updated_chain, mode: :step)
+        # Optionally modify the chain before continuing
+        modified_chain = updated_chain
+          |> LLMChain.update_custom_context(%{iteration_count: get_iteration_count() + 1})
+          |> LLMChain.add_message(Message.new_user!("Continue with the next step"))
+
+        {:ok, final_chain} = LLMChain.run(modified_chain, mode: :step)
       end
 
+  **Use Case**: Custom execution mode:
+
+      LLMChain.run(chain, mode: MyApp.Modes.Custom)
+
   """
-  @spec run(t(), Keyword.t()) :: {:ok, t()} | {:error, t(), LangChainError.t()}
+  @spec run(t(), Keyword.t()) ::
+          {:ok, t()}
+          | {:ok, t(), term()}
+          | {:pause, t()}
+          | {:interrupt, t(), term()}
+          | {:error, t(), LangChainError.t()}
   def run(chain, opts \\ [])
 
   def run(%LLMChain{} = chain, opts) do
@@ -474,13 +670,23 @@ defmodule LangChain.Chains.LLMChain do
             &do_run/1
 
           :while_needs_response ->
-            &run_while_needs_response/1
+            fn chain ->
+              Modes.WhileNeedsResponse.run(chain, opts)
+            end
 
           :until_success ->
-            &run_until_success/1
+            fn chain ->
+              Modes.UntilSuccess.run(chain, opts)
+            end
 
           :step ->
-            &run_step/1
+            fn chain ->
+              Modes.Step.run(chain, opts)
+            end
+
+          # When "mode" is a module, execute the run/2 function on it.
+          module when is_atom(module) ->
+            fn chain -> module.run(chain, opts) end
         end
 
       # Add telemetry for chain execution
@@ -488,38 +694,90 @@ defmodule LangChain.Chains.LLMChain do
         chain_type: "llm_chain",
         mode: Keyword.get(opts, :mode, "default"),
         message_count: length(chain.messages),
-        tool_count: length(chain.tools)
+        tools_count: length(chain.tools),
+        custom_context: chain.custom_context
       }
 
-      LangChain.Telemetry.span([:langchain, :chain, :execute], metadata, fn ->
-        # Run the chain and return the success or error results. NOTE: We do not add
-        # the current LLM to the list and process everything through a single
-        # codepath because failing after attempted fallbacks returns a different
-        # error.
-        if Keyword.has_key?(opts, :with_fallbacks) do
-          # run function and using fallbacks as needed.
-          with_fallbacks(chain, opts, function_to_run)
-        else
-          # run it directly right now and return the success or error
-          function_to_run.(chain)
-        end
-      end)
+      result =
+        LangChain.Telemetry.span(
+          [:langchain, :chain, :execute],
+          metadata,
+          fn ->
+            # Run the chain and return the success or error results. NOTE: We do not add
+            # the current LLM to the list and process everything through a single
+            # codepath because failing after attempted fallbacks returns a different
+            # error.
+            if Keyword.has_key?(opts, :with_fallbacks) do
+              # run function and using fallbacks as needed.
+              with_fallbacks(chain, opts, function_to_run)
+            else
+              # run it directly right now and return the success or error
+              function_to_run.(chain)
+            end
+          end,
+          enrich_stop: &chain_stop_metadata/1
+        )
+
+      case result do
+        {:error, error_chain, reason} ->
+          Callbacks.fire(error_chain.callbacks, :on_error, [error_chain, reason])
+          result
+
+        _other ->
+          result
+      end
     rescue
       err in LangChainError ->
+        Callbacks.fire(chain.callbacks, :on_error, [chain, err])
         {:error, chain, err}
     end
+  end
+
+  defp chain_stop_metadata({:ok, %LLMChain{} = chain}), do: chain_stop_from_chain(chain)
+
+  # `:until_tool_used` terminates with a 3-tuple `{:ok, chain, tool_result}` when
+  # the target tool is found (the common success path). Enrich from the chain the
+  # same way so this path doesn't lose `last_message`/aggregated token usage.
+  defp chain_stop_metadata({:ok, %LLMChain{} = chain, _extra}), do: chain_stop_from_chain(chain)
+
+  defp chain_stop_metadata(_result), do: %{last_message: nil, token_usage: nil}
+
+  defp chain_stop_from_chain(%LLMChain{last_message: %Message{} = msg} = chain) do
+    # Aggregate token usage across the assistant messages produced by *this run*
+    # — not the whole conversation history. A single run can make several LLM
+    # calls (e.g. a tool-call loop), and each contributes usage that would be
+    # lost if we only read the last message. But summing `chain.messages` would
+    # re-count every earlier turn each time a persisted chain is run again (the
+    # normal `add_message |> run` agent loop), inflating the per-run `:stop`
+    # event. `exchanged_messages` is reset at the start of every run and holds
+    # only the messages exchanged during it, which is exactly this run's scope.
+    token_usage = aggregate_token_usage(chain.exchanged_messages)
+    %{last_message: msg, token_usage: token_usage}
+  end
+
+  defp chain_stop_from_chain(_chain), do: %{last_message: nil, token_usage: nil}
+
+  defp aggregate_token_usage(messages) do
+    messages
+    |> Enum.reduce(nil, fn
+      %Message{role: :assistant} = msg, acc ->
+        # Each assembled assistant message's usage is already the final total for
+        # that message, so these are per-message totals being summed rather than
+        # several readings of one message. `add_total/2` is the combination that
+        # models that; `add/2` would keep the largest turn instead of the sum.
+        LangChain.TokenUsage.add_total(acc, LangChain.TokenUsage.get(msg))
+
+      _, acc ->
+        acc
+    end)
   end
 
   defp initial_run_logging(%LLMChain{verbose: false} = _chain), do: :ok
 
   defp initial_run_logging(%LLMChain{verbose: true} = chain) do
-    # set the callback function on the chain
-    if chain.verbose, do: IO.inspect(chain.llm, label: "LLM")
-
-    if chain.verbose, do: IO.inspect(chain.messages, label: "MESSAGES")
-
-    if chain.verbose, do: IO.inspect(chain.tools, label: "TOOLS")
-
+    IO.inspect(chain.llm, label: "LLM")
+    IO.inspect(chain.messages, label: "MESSAGES")
+    IO.inspect(chain.tools, label: "TOOLS")
     :ok
   end
 
@@ -538,7 +796,7 @@ defmodule LangChain.Chains.LLMChain do
   end
 
   # nothing left to try
-  defp try_chain_with_llm(chain, [], _before_fallback_fn, _run_fn) do
+  defp try_chain_with_llm(%LLMChain{} = chain, [], _before_fallback_fn, _run_fn) do
     {:error, chain,
      LangChainError.exception(
        type: "all_fallbacks_failed",
@@ -546,7 +804,9 @@ defmodule LangChain.Chains.LLMChain do
      )}
   end
 
-  defp try_chain_with_llm(chain, [llm | tail], before_fallback_fn, run_fn) do
+  defp try_chain_with_llm(%LLMChain{} = chain, [llm | tail], before_fallback_fn, run_fn) do
+    %llm_module{} = llm
+
     use_chain = %LLMChain{chain | llm: llm}
 
     use_chain =
@@ -559,111 +819,43 @@ defmodule LangChain.Chains.LLMChain do
 
     try do
       case run_fn.(use_chain) do
-        {:ok, result} ->
-          {:ok, result}
+        {:ok, _chain} = ok ->
+          ok
 
-        {:error, _error_chain, reason} ->
-          # run attempt received an error. Try again with the next LLM
-          Logger.warning("LLM call failed, using next fallback. Reason: #{inspect(reason)}")
+        {:ok, _chain, _extra} = ok ->
+          ok
 
-          try_chain_with_llm(use_chain, tail, before_fallback_fn, run_fn)
+        {:interrupt, _chain, _data} = interrupt ->
+          # Interrupt is a deliberate pause for human-in-the-loop or similar
+          # workflows. It is not an error and should not be retried.
+          interrupt
+
+        {:pause, _chain} = pause ->
+          # Pause is a clean checkpoint that can be resumed later.
+          # It is not an error and should not be retried.
+          pause
+
+        {:error, _error_chain, reason} = error ->
+          # Check with the chat model if this error should be retried on a
+          # fallback model or not.
+          if llm_module.retry_on_fallback?(reason) do
+            # run attempt received an error. Try again with the next LLM
+            Logger.warning("LLM call failed, using next fallback. Reason: #{inspect(reason)}")
+
+            try_chain_with_llm(use_chain, tail, before_fallback_fn, run_fn)
+          else
+            # error should not be retried. Return the error.
+            error
+          end
       end
     rescue
       err ->
         # Log the error and stack trace, then try again.
-        Logger.error(
+        Logger.warning(fn ->
           "Rescued from exception during with_fallback processing. Error: #{inspect(err)}\nStack trace:\n#{Exception.format(:error, err, __STACKTRACE__)}"
-        )
+        end)
 
         try_chain_with_llm(use_chain, tail, before_fallback_fn, run_fn)
-    end
-  end
-
-  # Repeatedly run the chain until we get a successful ToolResponse or processed
-  # assistant message. Once we've reached a successful response, it is not
-  # submitted back to the LLM, the process ends there.
-  @spec run_until_success(t()) :: {:ok, t()} | {:error, t(), LangChainError.t()}
-  defp run_until_success(
-         %LLMChain{last_message: %Message{} = last_message} = chain,
-         force_recurse \\ false
-       ) do
-    stop_or_recurse =
-      cond do
-        force_recurse ->
-          :recurse
-
-        chain.current_failure_count >= chain.max_retry_count ->
-          {:error, chain,
-           LangChainError.exception(
-             type: "exceeded_failure_count",
-             message: "Exceeded max failure count"
-           )}
-
-        last_message.role == :tool && !Message.tool_had_errors?(last_message) ->
-          # a successful tool result has no errors
-          {:ok, chain}
-
-        last_message.role == :assistant ->
-          # it was successful if we didn't generate a user message in response to
-          # an error.
-          {:ok, chain}
-
-        true ->
-          :recurse
-      end
-
-    case stop_or_recurse do
-      :recurse ->
-        chain
-        |> do_run()
-        |> case do
-          {:ok, updated_chain} ->
-            updated_chain
-            |> execute_tool_calls()
-            |> run_until_success()
-
-          {:error, updated_chain, reason} ->
-            {:error, updated_chain, reason}
-        end
-
-      other ->
-        # return the error or success result
-        other
-    end
-  end
-
-  # Repeatedly run the chain while `needs_response` is true. This will execute
-  # tools and re-submit the tool result to the LLM giving the LLM an
-  # opportunity to execute more tools or return a response.
-  @spec run_while_needs_response(t()) :: {:ok, t()} | {:error, t(), LangChainError.t()}
-  defp run_while_needs_response(%LLMChain{needs_response: false} = chain) do
-    {:ok, chain}
-  end
-
-  defp run_while_needs_response(%LLMChain{needs_response: true} = chain) do
-    chain
-    |> execute_tool_calls()
-    |> do_run()
-    |> case do
-      {:ok, updated_chain} ->
-        run_while_needs_response(updated_chain)
-
-      {:error, updated_chain, reason} ->
-        {:error, updated_chain, reason}
-    end
-  end
-
-  # Run the chain one step at a time. This executes the LLM call, processes
-  # the message, executes any tool calls, and then returns the updated chain.
-  @spec run_step(t()) :: {:ok, t()} | {:error, t(), LangChainError.t()}
-  defp run_step(%LLMChain{} = chain) do
-    chain_after_tools = execute_tool_calls(chain)
-
-    # if no tools were executed, automatically run again
-    if chain_after_tools == chain do
-      do_run(chain_after_tools)
-    else
-      {:ok, chain_after_tools}
     end
   end
 
@@ -720,122 +912,120 @@ defmodule LangChain.Chains.LLMChain do
   end
 
   def run_until_tool_used(%LLMChain{} = chain, tool_names, opts) do
-    chain
-    |> raise_when_no_messages()
-    |> initial_run_logging()
+    try do
+      raise_when_no_messages(chain)
+      initial_run_logging(chain)
 
-    # clear the set of exchanged messages.
-    chain = clear_exchanged_messages(chain)
+      chain = clear_exchanged_messages(chain)
 
-    # Check if the tool_name exists in the registered tools
-    missing_tools =
-      Enum.filter(tool_names, fn tool_name ->
-        !Map.has_key?(chain._tool_map, tool_name)
-      end)
+      mode_opts =
+        opts
+        |> Keyword.put(:tool_names, tool_names)
+        |> Keyword.put_new(:max_runs, 25)
 
-    if Enum.empty?(missing_tools) do
-      do_run_until_tool_used(chain, tool_names, Keyword.put_new(opts, :max_runs, 25))
-    else
-      message =
-        if length(missing_tools) > 1 do
-          "Tool names '#{Enum.join(missing_tools, ", ")}' not found in available tools"
-        else
-          "Tool name '#{List.first(missing_tools)}' not found in available tools"
-        end
-
-      {:error, chain,
-       LangChainError.exception(
-         type: "invalid_tool_name",
-         message: message
-       )}
-    end
-  end
-
-  defp do_run_until_tool_used(%LLMChain{} = chain, tool_names, opts) do
-    max_runs = Keyword.get(opts, :max_runs)
-
-    if max_runs <= 0 do
-      {:error, chain,
-       LangChainError.exception(
-         type: "exceeded_max_runs",
-         message: "Exceeded maximum number of runs"
-       )}
-    else
-      # Decrement max_runs for next recursion
-      next_opts = Keyword.put(opts, :max_runs, max_runs - 1)
-
-      # Add telemetry for run_until_tool_used chain execution
       metadata = %{
         chain_type: "llm_chain",
         mode: "run_until_tool_used",
         message_count: length(chain.messages),
-        tool_count: length(chain.tools)
+        tools_count: length(chain.tools),
+        custom_context: chain.custom_context
       }
 
-      run_result =
-        try do
-          LangChain.Telemetry.span([:langchain, :chain, :execute], metadata, fn ->
-            # Run the chain and return the success or error results. NOTE: We do
-            # not add the current LLM to the list and process everything through a
-            # single codepath because failing after attempted fallbacks returns a
-            # different error.
-            #
-            # The run_until_success passes in a `true` force it to recuse and call
-            # even if a ToolResult was successfully run. We check _which_ tool
-            # result was returned here and make a separate decision.
-            if Keyword.has_key?(opts, :with_fallbacks) do
-              # run function and using fallbacks as needed.
-              with_fallbacks(chain, opts, &run_until_success(&1, true))
-            else
-              # run it directly right now and return the success or error
-              run_until_success(chain, true)
-            end
-          end)
-        rescue
-          err in LangChainError ->
-            {:error, chain, err}
-        end
+      result =
+        LangChain.Telemetry.span(
+          [:langchain, :chain, :execute],
+          metadata,
+          fn ->
+            Modes.UntilToolUsed.run(chain, mode_opts)
+          end,
+          enrich_stop: &chain_stop_metadata/1
+        )
 
-      case run_result do
-        {:ok, updated_chain} ->
-          # Check if the last message contains a tool call matching the
-          # specified name
-          case updated_chain.last_message do
-            %Message{role: :tool, tool_results: tool_results} when is_list(tool_results) ->
-              matching_call = Enum.find(tool_results, &(&1.name in tool_names))
+      case result do
+        {:error, error_chain, reason} ->
+          Callbacks.fire(error_chain.callbacks, :on_error, [error_chain, reason])
+          result
 
-              if matching_call do
-                {:ok, updated_chain, matching_call}
-              else
-                # If no matching tool result found, continue running.
-                do_run_until_tool_used(updated_chain, tool_names, next_opts)
-              end
-
-            _ ->
-              # If no tool results in last message, continue running
-              do_run_until_tool_used(updated_chain, tool_names, next_opts)
-          end
-
-        {:error, updated_chain, reason} ->
-          {:error, updated_chain, reason}
+        _other ->
+          result
       end
+    rescue
+      err in LangChainError ->
+        Callbacks.fire(chain.callbacks, :on_error, [chain, err])
+        {:error, chain, err}
     end
   end
 
   # internal reusable function for running the chain
   @spec do_run(t()) :: {:ok, t()} | {:error, t(), LangChainError.t()}
-  defp do_run(%LLMChain{current_failure_count: current_count, max_retry_count: max} = chain)
-       when current_count >= max do
-    Callbacks.fire(chain.callbacks, :on_retries_exceeded, [chain])
+  defp do_run(%LLMChain{} = chain) do
+    case exceeded_retry_limit(chain) do
+      nil ->
+        chain
+        |> call_llm_and_process()
+        |> end_on_truncated_response()
 
-    {:error, chain,
-     LangChainError.exception(
-       type: "exceeded_failure_count",
-       message: "Exceeded max failure count"
-     )}
+      stop ->
+        stop
+    end
   end
 
-  defp do_run(%LLMChain{} = chain) do
+  @doc false
+  # The stop for a chain that has reached a failure limit, or `nil` when it may
+  # call the LLM again. Fires `:on_retries_exceeded` when it stops. Every mode
+  # that checks the limits goes through here, so they stop the same way.
+  @spec exceeded_retry_limit(t()) :: nil | {:error, t(), LangChainError.t()}
+  def exceeded_retry_limit(%LLMChain{} = chain) do
+    message =
+      cond do
+        chain.current_failure_count >= chain.max_retry_count ->
+          "Exceeded max failure count"
+
+        is_integer(chain.max_refusal_count) and
+            chain.current_refusal_count >= chain.max_refusal_count ->
+          "Exceeded max refusal count"
+
+        true ->
+          nil
+      end
+
+    if message do
+      Callbacks.fire(chain.callbacks, :on_retries_exceeded, [chain])
+
+      {:error, chain, LangChainError.exception(type: "exceeded_failure_count", message: message)}
+    end
+  end
+
+  # A received assistant message whose status says the provider cut the
+  # response off (`:length` when it ran out of output tokens or context,
+  # `:content_filtered` when it was filtered) ends the run as an error. Its
+  # tool calls may be partial and must not run, and any text in it is not the
+  # model's finished turn. The message stays in the chain so the caller can
+  # show what was received.
+  defp end_on_truncated_response(
+         {:ok, %LLMChain{last_message: %Message{role: :assistant, status: status}} = chain}
+       )
+       when status in [:length, :content_filtered] do
+    {type, message} =
+      case status do
+        :length ->
+          {"response_truncated",
+           "The LLM response was cut off before it finished, by its output token limit or context window"}
+
+        :content_filtered ->
+          {"content_filtered", "The LLM response was stopped by the provider's content filter"}
+      end
+
+    reason = LangChainError.exception(type: type, message: message)
+    Callbacks.fire(chain.callbacks, :on_llm_error, [chain, reason])
+    {:error, chain, reason}
+  end
+
+  defp end_on_truncated_response(result), do: result
+
+  defp call_llm_and_process(%LLMChain{} = chain) do
+    chain = drop_stale_delta(chain)
+
     # submit to LLM. The "llm" is a struct. Match to get the name of the module
     # then execute the `.call` function on that module.
     %module{} = chain.llm
@@ -873,31 +1063,67 @@ defmodule LangChain.Chains.LLMChain do
 
       {:ok, [%MessageDelta{} | _] = deltas} ->
         if chain.verbose_deltas, do: IO.inspect(deltas, label: "DELTA MESSAGE LIST RESPONSE")
-        updated_chain = apply_deltas(chain, deltas)
-
-        if chain.verbose,
-          do: IO.inspect(updated_chain.last_message, label: "COMBINED DELTA MESSAGE RESPONSE")
-
-        {:ok, updated_chain}
+        apply_deltas_from_ended_stream(chain, deltas)
 
       {:ok, [[%MessageDelta{} | _] | _] = deltas} ->
         if chain.verbose_deltas, do: IO.inspect(deltas, label: "DELTA MESSAGE LIST RESPONSE")
-        updated_chain = apply_deltas(chain, deltas)
-
-        if chain.verbose,
-          do: IO.inspect(updated_chain.last_message, label: "COMBINED DELTA MESSAGE RESPONSE")
-
-        {:ok, updated_chain}
+        apply_deltas_from_ended_stream(chain, deltas)
 
       {:error, %LangChainError{} = reason} ->
         if chain.verbose, do: IO.inspect(reason, label: "ERROR")
-        Logger.error("Error during chat call. Reason: #{inspect(reason)}")
+        Callbacks.fire(chain.callbacks, :on_llm_error, [chain, reason])
         {:error, chain, reason}
 
       {:error, string_reason} when is_binary(string_reason) ->
         if chain.verbose, do: IO.inspect(string_reason, label: "ERROR")
-        Logger.error("Error during chat call. Reason: #{inspect(string_reason)}")
-        {:error, chain, LangChainError.exception(message: string_reason)}
+        reason = LangChainError.exception(message: string_reason)
+        Callbacks.fire(chain.callbacks, :on_llm_error, [chain, reason])
+        {:error, chain, reason}
+
+      {:ok, []} ->
+        # Empty response — all choices were filtered out (e.g., thinking model
+        # streaming where all chunks produce empty parsed results). Treat as
+        # an error rather than crashing with CaseClauseError.
+        Logger.warning("LLM returned an empty response (no messages or deltas)")
+
+        {:error, chain,
+         LangChainError.exception(
+           type: "empty_response",
+           message:
+             "LLM returned an empty response with no messages. " <>
+               "This can happen with thinking/reasoning models during streaming."
+         )}
+
+      {:ok, [[error: %LangChainError{} = reason] | _]} ->
+        if chain.verbose, do: IO.inspect(reason, label: "ERROR")
+        Logger.error("Error during chat call. Reason: #{inspect(reason)}")
+        {:error, chain, reason}
+
+      # A streamed response can fail before producing any delta (e.g. a
+      # provider error frame as the first event), arriving as a flat list
+      # whose head is an error tuple.
+      {:ok, [{:error, %LangChainError{} = reason} | _]} ->
+        if chain.verbose, do: IO.inspect(reason, label: "ERROR")
+        Callbacks.fire(chain.callbacks, :on_llm_error, [chain, reason])
+        {:error, chain, reason}
+
+      {:ok, unexpected} ->
+        Logger.warning("Unexpected LLM response format: #{inspect(unexpected)}")
+
+        {:error, chain,
+         LangChainError.exception(
+           type: "unexpected_response",
+           message: "Unexpected response format from LLM: #{inspect(unexpected)}"
+         )}
+
+      {:error, reason} ->
+        Logger.error("Error during chat call. Reason: #{inspect(reason)}")
+
+        {:error, chain,
+         LangChainError.exception(
+           type: "unknown_error",
+           message: "LLM error: #{inspect(reason)}"
+         )}
     end
   end
 
@@ -949,21 +1175,28 @@ defmodule LangChain.Chains.LLMChain do
   `last_message` and list of messages are updated. The message is processed and
   fires any registered callbacks.
   """
-  @spec apply_deltas(t(), list()) :: t()
+  @spec apply_deltas(t(), list()) :: {:ok, t()} | {:error, t(), LangChainError.t()}
   def apply_deltas(%LLMChain{} = chain, deltas) when is_list(deltas) do
-    chain
-    |> merge_deltas(deltas)
-    |> delta_to_message_when_complete()
+    case merge_deltas(chain, deltas) do
+      {:error, _chain, _reason} = error ->
+        error
+
+      %LLMChain{} = merged_chain ->
+        delta_to_message_when_complete(merged_chain)
+    end
   end
 
   @doc """
   Merge a list of deltas into the chain.
   """
-  @spec merge_deltas(t(), list()) :: t()
+  @spec merge_deltas(t(), list()) :: t() | {:error, t(), LangChainError.t()}
   def merge_deltas(%LLMChain{} = chain, deltas) do
     deltas
     |> List.flatten()
-    |> Enum.reduce(chain, fn d, acc -> merge_delta(acc, d) end)
+    |> Enum.reduce(chain, fn
+      _d, {:error, _chain, _reason} = error -> error
+      d, %LLMChain{} = acc -> merge_delta(acc, d)
+    end)
   end
 
   @doc """
@@ -974,7 +1207,12 @@ defmodule LangChain.Chains.LLMChain do
   @spec merge_delta(t(), MessageDelta.t() | TokenUsage.t() | {:error, LangChainError.t()}) :: t()
   def merge_delta(%LLMChain{} = chain, %MessageDelta{} = new_delta) do
     merged = MessageDelta.merge_delta(chain.delta, new_delta)
-    %LLMChain{chain | delta: merged}
+    updated_chain = %LLMChain{chain | delta: merged}
+
+    # Augment tool calls with display_text and fire early identification callbacks.
+    # Uses display_text presence on ToolCall as the "already processed" signal.
+    augmented_delta = augment_and_notify_tool_calls(updated_chain, updated_chain.delta)
+    %LLMChain{updated_chain | delta: augmented_delta}
   end
 
   def merge_delta(%LLMChain{} = chain, %TokenUsage{} = usage) do
@@ -985,10 +1223,147 @@ defmodule LangChain.Chains.LLMChain do
     %LLMChain{chain | delta: merged}
   end
 
-  # Handle when the server is overloaded and cancelled the stream on the server side.
-  def merge_delta(%LLMChain{} = chain, {:error, %LangChainError{type: "overloaded"}}) do
-    cancel_delta(chain, :cancelled)
+  # Handle when the server is overloaded and ended the stream on the server side.
+  def merge_delta(%LLMChain{} = chain, {:error, %LangChainError{type: "overloaded"} = error}) do
+    cancel_delta(chain, :stream_error, error)
   end
+
+  # Handle any other error received during streaming (e.g. content filtering, invalid_request_error).
+  def merge_delta(%LLMChain{} = chain, {:error, %LangChainError{} = error}) do
+    Logger.warning("Received error during streaming: #{error.message}")
+    cancel_delta(chain, :stream_error, error)
+  end
+
+  # Unified function to augment tool calls with display_text and optionally
+  # fire :on_tool_call_identified callbacks. Works on any struct with a
+  # `tool_calls` field (both MessageDelta and Message).
+  #
+  # Uses the presence of `display_text` on each ToolCall as the "already
+  # processed" signal — no separate tracking map needed.
+  #
+  # Options:
+  #   - notify: true (default) — fire :on_tool_call_identified for new tool calls
+  #   - notify: false — only augment display_text, don't fire callbacks
+  @spec augment_and_notify_tool_calls(t(), struct(), keyword()) :: struct()
+  defp augment_and_notify_tool_calls(chain, struct, opts \\ [])
+
+  defp augment_and_notify_tool_calls(
+         %LLMChain{} = chain,
+         %{tool_calls: tool_calls} = struct,
+         opts
+       )
+       when is_list(tool_calls) and tool_calls != [] do
+    notify = Keyword.get(opts, :notify, true)
+
+    augmented_calls =
+      Enum.map(tool_calls, fn call ->
+        cond do
+          # Already augmented — skip
+          call.display_text != nil ->
+            call
+
+          # No name yet — can't look up
+          call.name == nil ->
+            call
+
+          # New tool call to augment. A call whose arguments are already parsed
+          # (a message received whole) is labelled from them right away; a
+          # streamed call's arguments are still a partial string here, so it
+          # gets the static label and is relabelled when the message completes.
+          true ->
+            func = chain._tool_map[call.name]
+
+            display_text =
+              display_text_from_args(func, call.arguments) ||
+                resolve_display_text(chain._tool_map, call.name)
+
+            augmented_call = %{call | display_text: display_text}
+
+            if notify do
+              case func do
+                %Function{} = func ->
+                  Callbacks.fire(chain.callbacks, :on_tool_call_identified, [
+                    chain,
+                    augmented_call,
+                    func
+                  ])
+
+                nil ->
+                  :ok
+              end
+            end
+
+            augmented_call
+        end
+      end)
+
+    %{struct | tool_calls: augmented_calls}
+  end
+
+  defp augment_and_notify_tool_calls(_chain, struct, _opts), do: struct
+
+  # Relabel tool calls that were labelled before their arguments were complete
+  # (a streamed message), using each Function's `display_text_from_args`. A
+  # call whose label changes is announced again through
+  # :on_tool_call_identified so live observers update it.
+  #
+  # Runs only on a message the model just produced. Messages added through
+  # `add_message/2`, such as restored history, keep the label they carry.
+  @spec relabel_tool_calls_from_args(t(), Message.t()) :: Message.t()
+  defp relabel_tool_calls_from_args(
+         %LLMChain{} = chain,
+         %Message{tool_calls: tool_calls} = message
+       )
+       when is_list(tool_calls) and tool_calls != [] do
+    relabelled =
+      Enum.map(tool_calls, fn call ->
+        with %Function{display_text_from_args: resolver} = func when resolver != nil <-
+               chain._tool_map[call.name],
+             label when is_binary(label) <- display_text_from_args(func, call.arguments),
+             true <- label != call.display_text do
+          updated_call = %{call | display_text: label}
+          Callbacks.fire(chain.callbacks, :on_tool_call_identified, [chain, updated_call, func])
+          updated_call
+        else
+          _unchanged -> call
+        end
+      end)
+
+    %Message{message | tool_calls: relabelled}
+  end
+
+  defp relabel_tool_calls_from_args(_chain, message), do: message
+
+  # The label a Function's `display_text_from_args` gives a call, or nil when
+  # there is no resolver, the arguments are not parsed yet, or the resolver
+  # returns nothing usable or raises.
+  @spec display_text_from_args(Function.t() | nil, any()) :: String.t() | nil
+  defp display_text_from_args(
+         %Function{display_text_from_args: resolver, name: name},
+         arguments
+       )
+       when is_function(resolver, 1) and is_map(arguments) do
+    case resolver.(arguments) do
+      label when is_binary(label) ->
+        case String.trim(label) do
+          "" -> nil
+          trimmed -> trimmed
+        end
+
+      _other ->
+        nil
+    end
+  rescue
+    err ->
+      Logger.warning(fn ->
+        "Function #{name} :display_text_from_args raised an exception. " <>
+          "Keeping the static display_text. Exception: #{Exception.message(err)}"
+      end)
+
+      nil
+  end
+
+  defp display_text_from_args(_func, _arguments), do: nil
 
   @doc """
   Drop the current delta. This is useful when needing to ignore a partial or
@@ -996,7 +1371,98 @@ defmodule LangChain.Chains.LLMChain do
   """
   @spec drop_delta(t()) :: t()
   def drop_delta(%LLMChain{} = chain) do
+    reset_streaming_state(chain)
+  end
+
+  @spec reset_streaming_state(t()) :: t()
+  defp reset_streaming_state(%LLMChain{} = chain) do
     %LLMChain{chain | delta: nil}
+  end
+
+  # Every path that consumes or rejects a streamed delta clears it from the
+  # chain, so a delta present at the start of an LLM call can only be leftover
+  # state from a caller re-running a chain after an errored stream, or from a
+  # host that accumulated deltas onto the chain itself. Drop it: merging it
+  # with the new call's deltas would put text from two responses into one
+  # message.
+  @spec drop_stale_delta(t()) :: t()
+  defp drop_stale_delta(%LLMChain{delta: nil} = chain), do: chain
+
+  defp drop_stale_delta(%LLMChain{} = chain) do
+    Logger.warning("Starting an LLM call with a leftover streaming delta; dropping it")
+    drop_delta(chain)
+  end
+
+  # The streamed response has fully ended by the time apply_deltas/2 runs here,
+  # so a delta still on the chain means the response carried no terminal delta.
+  # Reporting that as success adds no message, which leaves `needs_response`
+  # unchanged and the hanging delta ready to merge with the next call's text:
+  # a looping mode re-invokes the model and several separate generations arrive
+  # as one run-on message. Treat it as a retryable LLM error instead.
+  #
+  # The partial text is discarded rather than salvaged. The chain cannot tell a
+  # response cut off partway through from one that finished and lost only its
+  # terminator, and half-streamed text or an incomplete set of tool calls must
+  # not enter the transcript. A ChatModel that can tell the difference is
+  # expected to close the turn itself.
+  @spec apply_deltas_from_ended_stream(t(), list()) ::
+          {:ok, t()} | {:error, t(), LangChainError.t()}
+  defp apply_deltas_from_ended_stream(%LLMChain{} = chain, deltas) do
+    case apply_deltas(chain, deltas) do
+      {:ok, %LLMChain{delta: nil} = updated_chain} ->
+        if chain.verbose,
+          do: IO.inspect(updated_chain.last_message, label: "COMBINED DELTA MESSAGE RESPONSE")
+
+        {:ok, updated_chain}
+
+      {:ok, %LLMChain{delta: %MessageDelta{status: status}} = updated_chain} ->
+        Logger.warning(
+          "LLM stream ended without a terminal delta (delta status: #{inspect(status)})"
+        )
+
+        handle_delta_error(
+          {:error, drop_delta(updated_chain),
+           LangChainError.exception(
+             type: "incomplete_stream",
+             message: "LLM stream ended without completing the message"
+           )}
+        )
+
+      {:error, _chain, _reason} = error ->
+        handle_delta_error(error)
+    end
+  end
+
+  # Handle a delta-conversion error like a retryable LLM error: fire
+  # :on_llm_error, increment the failure count, and recurse into do_run/1 if
+  # retries remain. Streaming state is already cleared by
+  # delta_to_message_when_complete/1 before this is called, so the retry starts
+  # from a clean chain. On final failure we propagate the original `reason`
+  # (e.g. "delta_conversion_failed") rather than letting do_run/1's guard
+  # convert it to a generic "exceeded_failure_count" — downstream apps
+  # pattern-match on the original type for user-facing copy.
+  @spec handle_delta_error({:error, t(), LangChainError.t()}) ::
+          {:ok, t()} | {:error, t(), LangChainError.t()}
+  defp handle_delta_error({:error, error_chain, reason}) do
+    Callbacks.fire(error_chain.callbacks, :on_llm_error, [error_chain, reason])
+    bumped = increment_current_failure_count(error_chain)
+
+    if bumped.current_failure_count >= bumped.max_retry_count do
+      Callbacks.fire(bumped.callbacks, :on_retries_exceeded, [bumped])
+      {:error, bumped, reason}
+    else
+      do_run(bumped)
+    end
+  end
+
+  # Resolve display text for a tool call by looking up the Function definition.
+  # Falls back to a humanized version of the tool name.
+  @spec resolve_display_text(map(), String.t()) :: String.t()
+  defp resolve_display_text(tool_map, tool_name) do
+    case tool_map[tool_name] do
+      %Function{display_text: dt} when not is_nil(dt) -> dt
+      _ -> Utils.humanize_tool_name(tool_name)
+    end
   end
 
   @doc """
@@ -1004,27 +1470,33 @@ defmodule LangChain.Chains.LLMChain do
 
   If the delta is `nil`, the chain is returned unmodified.
   """
-  @spec delta_to_message_when_complete(t()) :: t()
+  @spec delta_to_message_when_complete(t()) ::
+          {:ok, t()} | {:error, t(), LangChainError.t()}
   def delta_to_message_when_complete(
         %LLMChain{delta: %MessageDelta{status: status} = delta} = chain
       )
-      when status in [:complete, :length] do
+      when status in [:complete, :length, :content_filtered] do
     # it's complete. Attempt to convert delta to a message
     case MessageDelta.to_message(delta) do
       {:ok, %Message{} = message} ->
-        process_message(%LLMChain{chain | delta: nil}, message)
+        {:ok, process_message(reset_streaming_state(chain), message)}
 
       {:error, reason} ->
-        # should not have failed, but it did. Log the error and return
-        # the chain unmodified.
+        # Delta conversion failed. Log the error and clear the delta to prevent
+        # it from interfering with subsequent API calls.
         Logger.warning("Error applying delta message. Reason: #{inspect(reason)}")
-        chain
+
+        {:error, reset_streaming_state(chain),
+         LangChainError.exception(
+           type: "delta_conversion_failed",
+           message: "Error applying delta message: #{inspect(reason)}"
+         )}
     end
   end
 
   def delta_to_message_when_complete(%LLMChain{} = chain) do
     # either no delta or incomplete
-    chain
+    {:ok, chain}
   end
 
   # Process an assistant message sequentially through each message processor.
@@ -1037,7 +1509,10 @@ defmodule LangChain.Chains.LLMChain do
       )
       when is_list(processors) and processors != [] do
     # start `processed_content` with the message's content as a string
-    message = %Message{message | processed_content: ContentPart.parts_to_string(message.content)}
+    message = %Message{
+      message
+      | processed_content: ContentPart.content_to_string(message.content) || ""
+    }
 
     processors
     |> Enum.reduce_while(message, fn proc, m = _acc ->
@@ -1055,10 +1530,10 @@ defmodule LangChain.Chains.LLMChain do
         end
       rescue
         err ->
-          Logger.error("Exception raised in processor #{inspect(proc)}")
+          Logger.warning(fn -> "Exception raised in processor #{inspect(proc)}" end)
 
           {:halt,
-           {:halted,
+           {:halted, m,
             Message.new_user!("ERROR: An exception was raised! Exception: #{inspect(err)}")}}
       end
     end)
@@ -1095,12 +1570,94 @@ defmodule LangChain.Chains.LLMChain do
       %Message{role: :assistant} = updated_message ->
         if chain.verbose, do: IO.inspect(updated_message, label: "MESSAGE PROCESSED")
 
+        # Augment tool_calls with display_text and fire :on_tool_call_identified.
+        # For non-streaming, this is the first time we see the tool calls. For
+        # streaming, display_text was set during merge_delta, before the
+        # arguments were complete, so calls are relabelled from their
+        # now-complete arguments.
+        augmented_message =
+          chain
+          |> augment_and_notify_tool_calls(updated_message)
+          |> then(&relabel_tool_calls_from_args(chain, &1))
+
         chain
-        |> add_message(updated_message)
-        |> reset_current_failure_count_if(fn -> !Message.is_tool_related?(updated_message) end)
-        |> fire_callback_and_return(:on_message_processed, [updated_message])
-        |> fire_usage_callback_and_return(:on_llm_token_usage, [updated_message])
+        |> add_message(augmented_message)
+        |> report_turn_without_answer(augmented_message)
+        |> reset_failure_counts_if(!Message.is_tool_related?(augmented_message))
+        |> fire_callback_and_return(:on_message_processed, [augmented_message])
+        |> fire_usage_callback_and_return(:on_llm_token_usage, [augmented_message])
     end
+  end
+
+  # A run that has narrated and then ends on an assistant message holding no
+  # answer text finishes with the model's last visible words being narration:
+  # it said what it would do next and the turn closed without it. The provider
+  # reported nothing wrong, so the result is still `{:ok, chain}`. This reports
+  # it, as the `[:langchain, :chain, :turn, :no_answer]` telemetry event and a
+  # warning, carrying the shape of the message and of the run's last narration
+  # but none of their text.
+  defp report_turn_without_answer(
+         %LLMChain{needs_response: false} = chain,
+         %Message{role: :assistant} = message
+       ) do
+    with true <- blank?(Message.answer_content(message)),
+         %Message{} = narration <- last_narration_in_run(chain, message) do
+      metadata = %{
+        custom_context: chain.custom_context,
+        message: message_shape(message),
+        last_narration: message_shape(narration)
+      }
+
+      Logger.warning(fn ->
+        "LLM turn ended without an answer after narration. #{inspect(Map.delete(metadata, :custom_context))}"
+      end)
+
+      LangChain.Telemetry.emit_event(
+        [:langchain, :chain, :turn, :no_answer],
+        %{system_time: System.system_time()},
+        metadata
+      )
+    end
+
+    chain
+  end
+
+  defp report_turn_without_answer(%LLMChain{} = chain, _message), do: chain
+
+  defp blank?(nil), do: true
+  defp blank?(text) when is_binary(text), do: String.trim(text) == ""
+
+  # The most recent assistant message of this run, before `message`, holding a
+  # narration part. `exchanged_messages` starts empty on every run.
+  defp last_narration_in_run(%LLMChain{exchanged_messages: exchanged}, message) do
+    exchanged
+    |> Enum.reverse()
+    |> Enum.reject(&(&1 == message))
+    |> Enum.find(fn
+      %Message{role: :assistant, content: parts} when is_list(parts) ->
+        Enum.any?(parts, &ContentPart.narration?/1)
+
+      _other ->
+        false
+    end)
+  end
+
+  # For assistance when needing to log a message with a possible issue.
+  defp message_shape(%Message{} = message) do
+    %{
+      response_id: (message.metadata || %{})[:response_id],
+      status: message.status,
+      end_turn: Message.end_turn(message),
+      tool_call_count: length(message.tool_calls || []),
+      parts:
+        for %ContentPart{} = part <- List.wrap(message.content) do
+          %{
+            type: part.type,
+            utterance: ContentPart.utterance(part),
+            length: if(is_binary(part.content), do: String.length(part.content), else: 0)
+          }
+        end
+    }
   end
 
   @doc """
@@ -1108,13 +1665,26 @@ defmodule LangChain.Chains.LLMChain do
   `last_message` received and the complete list of messages exchanged. Depending
   on the message role, the chain may be in a pending or incomplete state where
   a response from the LLM is anticipated.
+
+  For assistant messages with tool_calls, the tool_calls are automatically
+  augmented with display_text from the corresponding Function definitions.
+  This ensures display_text is available to all downstream consumers.
   """
   @spec add_message(t(), Message.t()) :: t()
   def add_message(%LLMChain{} = chain, %Message{} = new_message) do
+    # Label tool calls that have no display_text yet and fire
+    # :on_tool_call_identified for each. Calls labelled earlier (in
+    # merge_delta or process_message, or restored with a label) are left as
+    # they are and not announced again.
+    new_message = augment_and_notify_tool_calls(chain, new_message, notify: true)
+
     needs_response =
       cond do
         new_message.role in [:user, :tool] -> true
         Message.is_tool_call?(new_message) -> true
+        # The provider reported the turn is not over, or the model narrated
+        # what it is about to do and has not answered.
+        Message.continues_turn?(new_message) -> true
         new_message.role in [:system, :assistant] -> false
       end
 
@@ -1179,6 +1749,11 @@ defmodule LangChain.Chains.LLMChain do
   The `context` is additional data that will be passed to the executed tool.
   The value given here will override any `custom_context` set on the LLMChain.
   If not set, the global `custom_context` is used.
+
+  When the model resends a call that failed in the round just before, with the
+  same name and arguments, and it fails again, its error is prefixed with a
+  sentence telling the model so. The call still runs. The same applies to
+  calls run by `execute_tool_calls_with_decisions/3`.
   """
   @spec execute_tool_calls(t(), context :: nil | %{atom() => any()}) :: t()
   def execute_tool_calls(chain, context \\ nil)
@@ -1191,79 +1766,580 @@ defmodule LangChain.Chains.LLMChain do
     if Message.is_tool_call?(message) do
       # context to use
       use_context = context || chain.custom_context
-      verbose = chain.verbose
 
-      # Get all the tools to call. Accumulate them into a map.
-      # Stored as
-      grouped =
-        Enum.reduce(message.tool_calls, %{async: [], sync: [], invalid: []}, fn call, acc ->
+      # What review handlers are told about the circumstances of the call. On
+      # this path no human has weighed in on it.
+      review_context = %{human_decision: nil, custom_context: use_context}
+
+      # Resolve every tool call to a disposition, keeping the order the model
+      # asked for them in. Review settles a call here, so one it turns away is
+      # never announced as started and never reaches a Task: a denial leaves
+      # no trace of a tool that appeared to run.
+      dispositions =
+        Enum.map(message.tool_calls, fn call ->
           case chain._tool_map[call.name] do
-            %Function{async: true} = func ->
-              Map.put(acc, :async, acc.async ++ [{call, func}])
+            %Function{} = func ->
+              case review_tool_call(chain, call, func, review_context) do
+                {:execute, reviewed_call} -> {:execute, reviewed_call, func}
+                settled -> {:settled, reviewed_tool_result(chain, settled, func)}
+              end
 
-            %Function{async: false} = func ->
-              Map.put(acc, :sync, acc.sync ++ [{call, func}])
-
-            # invalid tool call
             nil ->
-              Map.put(acc, :invalid, acc.invalid ++ [{call, nil}])
+              {:settled, tool_not_found_result(chain, call)}
           end
         end)
 
-      # execute all the async calls. This keeps the responses in order too.
-      async_results =
-        grouped[:async]
-        |> Enum.map(fn {call, func} ->
-          Task.async(fn ->
-            execute_tool_call(call, func, verbose: verbose, context: use_context)
-          end)
-        end)
-        |> Task.await_many(chain.async_tool_timeout || @default_task_await_timeout)
-
-      sync_results =
-        Enum.map(grouped[:sync], fn {call, func} ->
-          execute_tool_call(call, func, verbose: verbose, context: use_context)
-        end)
-
-      # log invalid tool calls
-      invalid_calls =
-        Enum.map(grouped[:invalid], fn {call, _} ->
-          text = "Tool call made to #{call.name} but tool not found"
-          Logger.warning(text)
-
-          ToolResult.new!(%{tool_call_id: call.call_id, content: text, is_error: true})
-        end)
-
-      combined_results = async_results ++ sync_results ++ invalid_calls
-      # create a single tool message that contains all the tool results
-      result_message =
-        Message.new_tool_result!(%{content: nil, tool_results: combined_results})
-
-      # add the tool result message to the chain
-      updated_chain = LLMChain.add_message(chain, result_message)
-
-      # if the tool results had an error, increment the failure counter. If not,
-      # clear it.
-      updated_chain =
-        if Message.tool_had_errors?(result_message) do
-          # something failed, increment our error counter
-          LLMChain.increment_current_failure_count(updated_chain)
-        else
-          # no errors, clear any errors
-          LLMChain.reset_current_failure_count(updated_chain)
-        end
-
-      # fire the callbacks
-      if chain.verbose, do: IO.inspect(result_message, label: "TOOL RESULTS")
-
-      updated_chain
-      |> fire_callback_and_return(:on_message_processed, [result_message])
-      |> fire_callback_and_return(:on_tool_response_created, [result_message])
+      run_dispositions(chain, dispositions, use_context)
     else
       # Not a complete tool call
       chain
     end
   end
+
+  @doc """
+  Execute tool calls with human decisions (approve, edit, reject).
+
+  This is used for Human-in-the-Loop workflows where tool calls need human approval
+  before execution. Each decision controls how the corresponding tool call is handled:
+
+  - `:approve` - Execute the tool with original arguments
+  - `:edit` - Execute the tool with modified arguments from the decision
+  - `:reject` - Create a result without executing the tool. By default it says
+    a human reviewer rejected the call and is not an error. A decision may
+    carry `:message` to replace that text, and `:is_error` to mark the result
+    as an error, for a rejection made because the call could not run. An error
+    result counts toward the chain's failure count like any other tool error.
+
+  An approved or edited call is still put to any `:on_tool_call_review`
+  handlers, which are told the answer the user gave. A user agreeing to a call is
+  not the same as policy agreeing to it, and a handler that asked the user about
+  the call reads the answer to know not to ask again. A rejected call is not
+  reviewed, since it does not run.
+
+  The calls that will run are executed the way `execute_tool_calls/2` executes
+  them. Every one is announced with `:on_tool_execution_started` before any of
+  them runs. Calls to `async: true` tools run concurrently, each in its own
+  Task, under one shared `async_tool_timeout` deadline; the rest run after
+  them, in call order. Results keep the order of `tool_calls` whatever order
+  the calls finish in.
+
+  Returns the updated chain with tool results added and callbacks fired.
+
+  ## Parameters
+
+    * `chain` - The LLMChain instance
+    * `tool_calls` - List of ToolCall structs to execute
+    * `decisions` - List of decision maps, one per tool call. Each decision must have:
+      - `:type` - One of `:approve`, `:edit`, or `:reject`
+      - `:arguments` - (optional, required for `:edit`) The modified arguments map
+      - `:message` - (optional, `:reject` only) The result's content in place of
+        the default rejection text
+      - `:is_error` - (optional, `:reject` only) Whether the result is an error.
+        Defaults to `false`. A rejected call never runs, so a rejection reported
+        as an error is also marked `is_refusal: true` (see `LangChain.Message.ToolResult`)
+
+  ## Examples
+
+      decisions = [
+        %{type: :approve},
+        %{type: :edit, arguments: %{"path" => "modified.txt"}},
+        %{type: :reject},
+        %{type: :reject, message: "That account is closed.", is_error: true}
+      ]
+
+      updated_chain = LLMChain.execute_tool_calls_with_decisions(chain, tool_calls, decisions)
+  """
+  @spec execute_tool_calls_with_decisions(t(), [ToolCall.t()], [map()]) :: t()
+  def execute_tool_calls_with_decisions(%LLMChain{} = chain, tool_calls, decisions)
+      when is_list(tool_calls) and is_list(decisions) do
+    use_context = chain.custom_context
+
+    # Resolve every call to a disposition from its decision, keeping call
+    # order. From here a decided call runs exactly as a model-requested one
+    # does, including concurrently with other async calls.
+    dispositions =
+      tool_calls
+      |> Enum.zip(decisions)
+      |> Enum.map(fn {tool_call, decision} ->
+        decided_disposition(chain, tool_call, decision, use_context)
+      end)
+
+    run_dispositions(chain, dispositions, use_context)
+  end
+
+  # Runs tool calls that have been resolved to dispositions, one per call in the
+  # order the calls were made: `{:execute, call, func}` for a call that will
+  # run, `{:settled, result}` for one whose result is already decided (denied
+  # by review, rejected by a human, or naming a tool the chain does not have).
+  # Both the model-driven and the human-decided paths end here, so a call runs
+  # the same way whichever path it came from.
+  defp run_dispositions(%LLMChain{} = chain, dispositions, use_context) do
+    verbose = chain.verbose
+    # Announce every call that is going to run, before any of them does. This
+    # is the ONLY place :on_tool_execution_started fires; :on_tool_call_identified
+    # already fired during streaming. A call review settled is not announced.
+    Enum.each(dispositions, fn
+      {:execute, call, func} ->
+        Callbacks.fire(chain.callbacks, :on_tool_execution_started, [chain, call, func])
+
+      {:settled, _result} ->
+        :ok
+    end)
+
+    # Start a Task for each async call, leaving it in the slot its call
+    # occupies. Everything downstream stays in call order as a result.
+    spawned =
+      Enum.map(dispositions, fn
+        {:execute, call, %Function{async: true} = func} ->
+          # Capture the current OpenTelemetry context in THIS (parent) process. It
+          # lives in the process dictionary and is NOT inherited by a spawned Task,
+          # so without this the async tool's span would orphan into its own root
+          # trace instead of nesting under the chain span. Re-attached inside the
+          # Task below. No-op (returns nil) when OTel isn't loaded or set up.
+          otel_ctx = capture_otel_context()
+
+          task =
+            Task.async(fn ->
+              # Re-attach the parent OTel context before anything telemetry-bearing
+              # runs, so the tool-call span (opened inside execute_tool_call) and any
+              # callback work parent correctly.
+              attach_otel_context(otel_ctx)
+
+              # Fires inside the spawned Task so handlers (e.g. tenancy/OTel
+              # propagation) can re-apply per-process state before the tool runs.
+              Callbacks.fire(chain.callbacks, :on_tool_pre_execution, [chain, call, func])
+              execute_tool_call(call, func, verbose: verbose, context: use_context)
+            end)
+
+          {:await, call, task}
+
+        disposition ->
+          disposition
+      end)
+
+    # One shared deadline covers the whole async batch, and it is awaited
+    # before any sync tool runs.
+    awaited =
+      for({:await, _call, task} <- spawned, do: task)
+      |> Task.await_many(chain.async_tool_timeout || default_async_tool_timeout())
+
+    # Walk the slots in call order, taking each async result off the awaited
+    # list and running each sync call in place. The empty accumulator match
+    # holds the two lists to the same length.
+    # An executed call's result is checked for an identical retry before its
+    # callbacks fire, so they report the content the model is given. A settled
+    # result was checked where it was made.
+    {combined_results, []} =
+      Enum.map_reduce(spawned, awaited, fn
+        {:await, call, _task}, [result | rest] ->
+          result = note_identical_retry(chain, result)
+          {fire_tool_execution_callbacks(chain, call, result), rest}
+
+        {:execute, call, func}, rest ->
+          Callbacks.fire(chain.callbacks, :on_tool_pre_execution, [chain, call, func])
+
+          result =
+            call
+            |> execute_tool_call(func, verbose: verbose, context: use_context)
+            |> then(&note_identical_retry(chain, &1))
+
+          {fire_tool_execution_callbacks(chain, call, result), rest}
+
+        {:settled, result}, rest ->
+          {result, rest}
+      end)
+
+    # Fire interrupt callback if any tools interrupted
+    interrupted_results = Enum.filter(combined_results, & &1.is_interrupt)
+
+    if interrupted_results != [] do
+      Callbacks.fire(chain.callbacks, :on_tool_interrupted, [chain, interrupted_results])
+    end
+
+    # create a single tool message that contains all the tool results
+    result_message =
+      Message.new_tool_result!(%{content: nil, tool_results: combined_results})
+
+    # add the tool result message to the chain
+    updated_chain = LLMChain.add_message(chain, result_message)
+
+    updated_chain = count_tool_round(updated_chain, result_message)
+
+    # fire the callbacks
+    if chain.verbose, do: IO.inspect(result_message, label: "TOOL RESULTS")
+
+    updated_chain
+    |> fire_callback_and_return(:on_message_processed, [result_message])
+    |> fire_callback_and_return(:on_tool_response_created, [result_message])
+  end
+
+  @doc """
+  Replace a tool result in the chain's messages by `tool_call_id`.
+
+  Delegates to `Message.replace_tool_result/3`, and applies the same replacement
+  to the chain's other views of the conversation.
+
+  `exchanged_messages` holds what this run exchanged and feeds token
+  aggregation; `last_message` is what a mode reads to decide whether the run is
+  over. A replacement that reached `messages` alone would leave the three
+  disagreeing about what the tool returned.
+  """
+  @spec replace_tool_result(t(), String.t(), ToolResult.t()) :: t()
+  def replace_tool_result(%LLMChain{} = chain, tool_call_id, %ToolResult{} = new_result) do
+    %LLMChain{
+      chain
+      | messages: Message.replace_tool_result(chain.messages, tool_call_id, new_result),
+        exchanged_messages:
+          Message.replace_tool_result(chain.exchanged_messages, tool_call_id, new_result),
+        last_message: replace_last_message_result(chain.last_message, tool_call_id, new_result)
+    }
+  end
+
+  defp replace_last_message_result(%Message{role: :tool} = message, tool_call_id, new_result) do
+    case Message.replace_tool_result([message], tool_call_id, new_result) do
+      [updated] -> updated
+      _other -> message
+    end
+  end
+
+  defp replace_last_message_result(last_message, _tool_call_id, _new_result), do: last_message
+
+  # Best-effort OpenTelemetry context propagation for async tools. LangChain does
+  # not depend on OpenTelemetry, so these dispatch at runtime only when the
+  # `opentelemetry_api` module is actually loaded (i.e. the host app opted into
+  # OTel). Otherwise they are no-ops and cost only a cached `ensure_loaded?` check.
+  # `apply/3` keeps `OpenTelemetry.Ctx` from being a compile-time dependency.
+  defp capture_otel_context do
+    if Code.ensure_loaded?(OpenTelemetry.Ctx) do
+      apply(OpenTelemetry.Ctx, :get_current, [])
+    end
+  end
+
+  defp attach_otel_context(nil), do: :ok
+
+  defp attach_otel_context(ctx) do
+    if Code.ensure_loaded?(OpenTelemetry.Ctx) do
+      apply(OpenTelemetry.Ctx, :attach, [ctx])
+    end
+
+    :ok
+  end
+
+  # Fires the per-result tool callbacks for one executed tool call and returns the
+  # result unchanged, so call sites can use it inline.
+  #
+  # `:on_tool_execution_exception` fires in addition to `:on_tool_execution_failed`
+  # rather than instead of it. A rescued exception is still a failure, and handlers
+  # registered for the lifecycle event must keep seeing it.
+  @spec fire_tool_execution_callbacks(t(), ToolCall.t(), ToolResult.t()) :: ToolResult.t()
+  defp fire_tool_execution_callbacks(
+         %LLMChain{} = chain,
+         %ToolCall{} = call,
+         %ToolResult{} = result
+       ) do
+    cond do
+      result.is_interrupt ->
+        :ok
+
+      result.is_error ->
+        Callbacks.fire(chain.callbacks, :on_tool_execution_failed, [chain, call, result.content])
+
+      true ->
+        Callbacks.fire(chain.callbacks, :on_tool_execution_completed, [chain, call, result])
+    end
+
+    case result.exception do
+      {exception, stacktrace} ->
+        Callbacks.fire(chain.callbacks, :on_tool_execution_exception, [
+          chain,
+          call,
+          exception,
+          stacktrace
+        ])
+
+      nil ->
+        :ok
+    end
+
+    result
+  end
+
+  # A call naming a tool the chain does not have. Review never sees it: there is
+  # no Function to hand a handler, so there is nothing to allow or deny.
+  defp tool_not_found_result(%LLMChain{} = chain, %ToolCall{} = call) do
+    text = "Tool call made to #{call.name} but tool not found"
+    Logger.warning(text)
+
+    text = note_identical_retry_text(chain, call, text)
+
+    Callbacks.fire(chain.callbacks, :on_tool_execution_failed, [chain, call, text])
+
+    ToolResult.new!(%{
+      tool_call_id: call.call_id,
+      name: call.name,
+      content: text,
+      is_error: true,
+      is_refusal: true
+    })
+  end
+
+  @identical_retry_notice "This is the same call that just failed, with the same arguments. " <>
+                            "Change it before trying again."
+
+  # Prefixes an error result with a notice when the model sent the same call,
+  # by name and arguments, that failed in the round just before this one. A
+  # model that resends a failed call unchanged usually gets the same error, and
+  # a second identical error message does not tell it that it repeated itself.
+  #
+  # The call still ran: a transient failure such as a timeout can succeed on a
+  # retry, so only the message changes. The comparison uses the arguments the
+  # model sent, found by `tool_call_id` in the assistant message, so a review
+  # handler's argument rewrite neither hides nor creates a match.
+  @spec note_identical_retry(t(), ToolResult.t()) :: ToolResult.t()
+  defp note_identical_retry(%LLMChain{} = chain, %ToolResult{is_error: true} = result) do
+    if identical_retry?(chain, result.tool_call_id) do
+      %ToolResult{result | content: prefix_content(@identical_retry_notice, result.content)}
+    else
+      result
+    end
+  end
+
+  defp note_identical_retry(%LLMChain{}, %ToolResult{} = result), do: result
+
+  # The same check for an error result that is settled before it is built,
+  # whose callbacks are given the message as a string.
+  @spec note_identical_retry_text(t(), ToolCall.t(), String.t()) :: String.t()
+  defp note_identical_retry_text(%LLMChain{} = chain, %ToolCall{} = call, text) do
+    if identical_retry?(chain, call.call_id),
+      do: prefix_content(@identical_retry_notice, text),
+      else: text
+  end
+
+  defp identical_retry?(%LLMChain{} = chain, tool_call_id) do
+    with %Message{role: :assistant, tool_calls: [_ | _] = calls} <- chain.last_message,
+         %ToolCall{} = call <- Enum.find(calls, &(&1.call_id == tool_call_id)) do
+      MapSet.member?(previous_failed_calls(chain), call_signature(call))
+    else
+      _no_match -> false
+    end
+  end
+
+  # The `{name, arguments}` of each call that failed in the previous round. The
+  # previous round is strictly the assistant message and tool message just
+  # before the current assistant message. Anything else between the rounds means
+  # there is no previous round to compare with.
+  defp previous_failed_calls(%LLMChain{messages: messages}) do
+    case Enum.take(messages, -3) do
+      [
+        %Message{role: :assistant, tool_calls: [_ | _] = calls},
+        %Message{role: :tool, tool_results: [_ | _] = results},
+        %Message{role: :assistant}
+      ] ->
+        failed_ids = for %ToolResult{is_error: true} = r <- results, do: r.tool_call_id
+
+        for %ToolCall{} = call <- calls,
+            call.call_id in failed_ids,
+            into: MapSet.new(),
+            do: call_signature(call)
+
+      _other ->
+        MapSet.new()
+    end
+  end
+
+  # An LLM can send `nil` instead of an empty map for a no-argument call.
+  defp call_signature(%ToolCall{name: name, arguments: arguments}),
+    do: {name, arguments || %{}}
+
+  defp prefix_content(notice, content) when is_binary(content),
+    do: notice <> "\n\n" <> content
+
+  defp prefix_content(notice, [%ContentPart{type: :text, content: text} = part | rest])
+       when is_binary(text),
+       do: [%ContentPart{part | content: notice <> "\n\n" <> text} | rest]
+
+  defp prefix_content(notice, parts) when is_list(parts),
+    do: [ContentPart.text!(notice) | parts]
+
+  # Consult every :on_tool_call_review handler in turn. Argument rewrites thread
+  # forward so a later handler reviews what an earlier one produced; the first
+  # handler to deny or interrupt settles the call and the rest are skipped.
+  defp review_tool_call(
+         %LLMChain{} = chain,
+         %ToolCall{} = call,
+         %Function{} = func,
+         review_context
+       ) do
+    Callbacks.reduce(
+      chain.callbacks,
+      :on_tool_call_review,
+      {:execute, call},
+      &apply_review_decision(&1, &2, chain, func, review_context)
+    )
+  end
+
+  defp apply_review_decision(
+         invoke,
+         {:execute, %ToolCall{} = current} = acc,
+         chain,
+         func,
+         review_context
+       ) do
+    case invoke.([chain, current, func, review_context]) do
+      :ok ->
+        {:cont, acc}
+
+      {:update_arguments, arguments} when is_map(arguments) ->
+        {:cont, {:execute, %ToolCall{current | arguments: arguments}}}
+
+      {:deny, reason} when is_binary(reason) ->
+        {:halt, {:deny, reason, current}}
+
+      {:interrupt, message, interrupt_data} when is_binary(message) ->
+        {:halt, {:interrupt, message, interrupt_data, current}}
+
+      other ->
+        raise LangChainError,
+              "Unexpected :on_tool_call_review result for tool #{inspect(func.name)}. " <>
+                "Expected :ok, {:update_arguments, map}, {:deny, reason} with a " <>
+                "string reason, or {:interrupt, message, data} with a string " <>
+                "message. Got: #{inspect(other)}"
+    end
+  end
+
+  # A denial is a decision about the call, not a fault in it, so it reports
+  # `is_error: false` and leaves the chain's failure counter untouched. A policy
+  # that turns down many calls in a row must not exhaust `max_retry_count`.
+  defp reviewed_tool_result(
+         %LLMChain{} = chain,
+         {:deny, reason, %ToolCall{} = call},
+         %Function{} = func
+       ) do
+    Callbacks.fire(chain.callbacks, :on_tool_execution_failed, [chain, call, reason])
+
+    ToolResult.new!(%{
+      tool_call_id: call.call_id,
+      name: func.name,
+      content: reason,
+      display_text: func.display_text,
+      is_error: false
+    })
+  end
+
+  defp reviewed_tool_result(
+         %LLMChain{},
+         {:interrupt, message, interrupt_data, %ToolCall{} = call},
+         %Function{} = func
+       ) do
+    ToolResult.new!(%{
+      tool_call_id: call.call_id,
+      name: func.name,
+      content: message,
+      display_text: func.display_text,
+      is_interrupt: true,
+      interrupt_data: interrupt_data
+    })
+  end
+
+  # The disposition for one call given the human decision about it.
+  defp decided_disposition(chain, %ToolCall{} = call, %{type: :approve}, use_context) do
+    resolve_decided_call(chain, call, use_context, :approve)
+  end
+
+  defp decided_disposition(chain, %ToolCall{} = call, %{type: :edit} = decision, use_context) do
+    edited_call = %{call | arguments: Map.get(decision, :arguments, %{})}
+    resolve_decided_call(chain, edited_call, use_context, :edit)
+  end
+
+  # A rejected call does not run, so its result is settled here.
+  defp decided_disposition(chain, %ToolCall{} = call, %{type: :reject} = decision, _use_context) do
+    rejection_msg =
+      Map.get(decision, :message) ||
+        "Tool call '#{call.name}' was rejected by a human reviewer."
+
+    is_error = Map.get(decision, :is_error, false)
+
+    rejection_msg =
+      if is_error, do: note_identical_retry_text(chain, call, rejection_msg), else: rejection_msg
+
+    Callbacks.fire(chain.callbacks, :on_tool_execution_failed, [chain, call, rejection_msg])
+
+    # A rejected call never ran, so as an error it is a refusal.
+    {:settled,
+     ToolResult.new!(%{
+       tool_call_id: call.call_id,
+       name: call.name,
+       content: rejection_msg,
+       is_error: is_error,
+       is_refusal: is_error
+     })}
+  end
+
+  # Resolve one call that a human decision cleared. Review still applies: an
+  # approval says a person agreed, not that policy did. The decision is passed
+  # on so a handler that escalated to a human can recognize the answer coming
+  # back and stand aside rather than escalating the same call again.
+  defp resolve_decided_call(%LLMChain{} = chain, %ToolCall{} = call, use_context, human_decision) do
+    case chain._tool_map[call.name] do
+      %Function{} = func ->
+        review_context = %{human_decision: human_decision, custom_context: use_context}
+
+        case review_tool_call(chain, call, func, review_context) do
+          {:execute, reviewed_call} -> {:execute, reviewed_call, func}
+          settled -> {:settled, reviewed_tool_result(chain, settled, func)}
+        end
+
+      nil ->
+        error_msg = note_identical_retry_text(chain, call, decided_tool_not_found_message(call))
+
+        Callbacks.fire(chain.callbacks, :on_tool_execution_failed, [chain, call, error_msg])
+
+        {:settled,
+         ToolResult.new!(%{
+           tool_call_id: call.call_id,
+           name: call.name,
+           content: error_msg,
+           is_error: true,
+           is_refusal: true
+         })}
+    end
+  end
+
+  @doc """
+  Parse a tool call's arguments with its tool's parser, without executing it.
+
+  Looks the tool up by name and runs `LangChain.Function.parse_arguments/3`
+  with the context the tool body would receive for this call: the chain's
+  `custom_context` with the call's `:tool_call_id` added. A caller deciding
+  something about a call before it runs, such as whether to ask a human to
+  approve it, gets the same answer execution would give.
+
+  Returns `{:ok, parsed_arguments}`, or `{:error, message}` with the message
+  the model would be given, including when the chain has no tool by that name.
+  """
+  @spec parse_tool_call_arguments(t(), ToolCall.t()) :: {:ok, map()} | {:error, String.t()}
+  def parse_tool_call_arguments(%LLMChain{} = chain, %ToolCall{} = call) do
+    case chain._tool_map[call.name] do
+      %Function{} = func ->
+        Function.parse_arguments(func, call.arguments, tool_context(chain.custom_context, call))
+
+      nil ->
+        {:error, decided_tool_not_found_message(call)}
+    end
+  end
+
+  # The context a tool receives for one call. The call's tool_call_id is added
+  # so tool implementations can correlate side-effects (e.g. spawned
+  # sub-processes) back to the originating tool call without threading it
+  # through arguments.
+  defp tool_context(nil, %ToolCall{} = call), do: %{tool_call_id: call.call_id}
+
+  defp tool_context(context, %ToolCall{} = call) when is_map(context),
+    do: Map.put(context, :tool_call_id, call.call_id)
+
+  defp tool_context(context, _call), do: context
+
+  defp decided_tool_not_found_message(%ToolCall{} = call), do: "Tool '#{call.name}' not found"
 
   @doc """
   Execute the tool call with the tool. Returns the tool's message response.
@@ -1276,92 +2352,208 @@ defmodule LangChain.Chains.LLMChain do
     metadata = %{
       tool_name: function.name,
       tool_call_id: call.call_id,
-      async: function.async
+      tool_description: function.description,
+      async: function.async,
+      custom_context: context,
+      arguments: call.arguments
     }
 
-    LangChain.Telemetry.span([:langchain, :tool, :call], metadata, fn ->
-      try do
-        if verbose, do: IO.inspect(function.name, label: "EXECUTING FUNCTION")
+    enrich_stop = fn result ->
+      %{tool_result: result}
+    end
 
-        case Function.execute(function, call.arguments, context) do
-          {:ok, %ToolResult{} = result} ->
-            # allow the tool execution to return a ToolResult. Just set the
-            # tool_call_id and fallback settings for name and display_text. This
-            # allows the tool to explicitly set the options for the ToolResult.
-            %{
-              result
-              | tool_call_id: call.call_id,
-                name: result.name || function.name,
-                display_text: result.display_text || function.display_text
-            }
+    enriched_context = tool_context(context, call)
 
-          {:ok, llm_result, processed_result} ->
-            if verbose, do: IO.inspect(processed_result, label: "FUNCTION PROCESSED RESULT")
-            # successful execution and storage of processed_content.
+    LangChain.Telemetry.span(
+      [:langchain, :tool, :call],
+      metadata,
+      fn ->
+        try do
+          if verbose, do: IO.inspect(function.name, label: "EXECUTING FUNCTION")
+
+          case Function.execute_call(function, call.arguments, enriched_context) do
+            {:ok, %ToolResult{} = result} ->
+              # allow the tool execution to return a ToolResult. Just set the
+              # tool_call_id and fallback settings for name and display_text. This
+              # allows the tool to explicitly set the options for the ToolResult.
+              # A refusal is always an error, including in a struct the tool
+              # built without `ToolResult.new/1`.
+              %{
+                result
+                | tool_call_id: call.call_id,
+                  name: result.name || function.name,
+                  display_text: result.display_text || function.display_text,
+                  is_error: result.is_error or result.is_refusal
+              }
+
+            {:ok, llm_result, processed_result} ->
+              if verbose, do: IO.inspect(processed_result, label: "FUNCTION PROCESSED RESULT")
+              # successful execution and storage of processed_content.
+              ToolResult.new!(%{
+                tool_call_id: call.call_id,
+                content: llm_result,
+                processed_content: processed_result,
+                name: function.name,
+                display_text: function.display_text
+              })
+
+            {:ok, result} ->
+              if verbose, do: IO.inspect(result, label: "FUNCTION RESULT")
+              # successful execution.
+              ToolResult.new!(%{
+                tool_call_id: call.call_id,
+                content: result,
+                name: function.name,
+                display_text: function.display_text
+              })
+
+            {:interrupt, display_message, interrupt_data} ->
+              if verbose, do: IO.inspect(display_message, label: "FUNCTION INTERRUPTED")
+
+              ToolResult.new!(%{
+                tool_call_id: call.call_id,
+                content: display_message,
+                name: function.name,
+                display_text: function.display_text,
+                is_interrupt: true,
+                interrupt_data: interrupt_data
+              })
+
+            {:refused, reason} ->
+              if verbose, do: IO.inspect(reason, label: "FUNCTION ARGUMENTS REFUSED")
+
+              ToolResult.new!(%{
+                tool_call_id: call.call_id,
+                content: reason,
+                name: function.name,
+                display_text: function.display_text,
+                is_error: true,
+                is_refusal: true
+              })
+
+            {:error, reason} when is_binary(reason) ->
+              if verbose, do: IO.inspect(reason, label: "FUNCTION ERROR")
+
+              ToolResult.new!(%{
+                tool_call_id: call.call_id,
+                content: reason,
+                name: function.name,
+                display_text: function.display_text,
+                is_error: true
+              })
+
+            {:error, reason, {_exception, _stacktrace} = rescued} when is_binary(reason) ->
+              if verbose, do: IO.inspect(reason, label: "FUNCTION RAISED")
+
+              ToolResult.new!(%{
+                tool_call_id: call.call_id,
+                content: reason,
+                name: function.name,
+                display_text: function.display_text,
+                is_error: true,
+                is_exception: true,
+                exception: rescued
+              })
+          end
+        rescue
+          err ->
+            stacktrace = __STACKTRACE__
+
+            Logger.warning(fn ->
+              "Function #{function.name} failed in execution. Exception: #{LangChainError.format_exception(err, stacktrace)}"
+            end)
+
             ToolResult.new!(%{
               tool_call_id: call.call_id,
-              content: llm_result,
-              processed_content: processed_result,
               name: function.name,
-              display_text: function.display_text
-            })
-
-          {:ok, result} ->
-            if verbose, do: IO.inspect(result, label: "FUNCTION RESULT")
-            # successful execution.
-            ToolResult.new!(%{
-              tool_call_id: call.call_id,
-              content: result,
-              name: function.name,
-              display_text: function.display_text
-            })
-
-          {:error, reason} when is_binary(reason) ->
-            if verbose, do: IO.inspect(reason, label: "FUNCTION ERROR")
-
-            ToolResult.new!(%{
-              tool_call_id: call.call_id,
-              content: reason,
-              name: function.name,
-              display_text: function.display_text,
-              is_error: true
+              content: "ERROR executing tool: #{inspect(err)}",
+              is_error: true,
+              is_exception: true,
+              exception: {err, stacktrace}
             })
         end
-      rescue
-        err ->
-          Logger.error(
-            "Function #{function.name} failed in execution. Exception: #{LangChainError.format_exception(err, __STACKTRACE__)}"
-          )
-
-          ToolResult.new!(%{
-            tool_call_id: call.call_id,
-            content: "ERROR executing tool: #{inspect(err)}",
-            is_error: true
-          })
-      end
-    end)
+      end,
+      enrich_stop: enrich_stop
+    )
   end
 
   @doc """
   Remove an incomplete MessageDelta from `delta` and add a Message with the
   desired status to the chain.
+
+  The partial content produced so far is preserved on the message rather than
+  discarded. Pass `:cancelled` for a caller-initiated stop and `:stream_error`
+  for a stream that died. See `LangChain.Message` for the full set.
   """
   def cancel_delta(%LLMChain{delta: nil} = chain, _message_status), do: chain
 
-  def cancel_delta(%LLMChain{delta: delta} = chain, message_status) do
-    # remove the in-progress delta
-    updated_chain = %LLMChain{chain | delta: nil}
+  def cancel_delta(%LLMChain{} = chain, message_status) do
+    cancel_delta(chain, message_status, nil)
+  end
+
+  @doc """
+  Same as `cancel_delta/2` but stores an optional error in the message's
+  metadata under `:streaming_error`. This preserves the error reason through the
+  chain so higher layers (like the Sagents Agent and AgentServer) can detect and
+  surface it.
+  """
+  def cancel_delta(%LLMChain{delta: nil} = chain, _message_status, _error), do: chain
+
+  def cancel_delta(%LLMChain{delta: %MessageDelta{} = delta} = chain, message_status, error) do
+    # remove the in-progress delta and reset streaming state
+    updated_chain = reset_streaming_state(chain)
 
     case MessageDelta.to_message(%MessageDelta{delta | status: :complete}) do
-      {:ok, message} ->
+      {:ok, %Message{} = message} ->
         message = %Message{message | status: message_status}
+
+        message =
+          if error do
+            metadata = (message.metadata || %{}) |> Map.put(:streaming_error, error)
+            %Message{message | metadata: metadata}
+          else
+            message
+          end
+
         add_message(updated_chain, message)
 
       {:error, reason} ->
-        Logger.error("Error attempting to cancel_delta. Reason: #{inspect(reason)}")
-        chain
+        Logger.warning(
+          "Failed to convert delta to message during cancel_delta. Reason: #{inspect(reason)}"
+        )
+
+        {:error, updated_chain,
+         LangChainError.exception(
+           type: "delta_conversion_failed",
+           message:
+             "Failed to convert streaming delta to message during cancellation: #{inspect(reason)}"
+         )}
     end
   end
+
+  # A clean round resets both counts. A round whose errors are all refusals
+  # counts as a refusal round when the chain has a refusal limit. Any other
+  # error is a failure. Each count leaves the other alone, so a refusal round
+  # between two failures does not reset the failure count.
+  defp count_tool_round(%LLMChain{} = chain, %Message{tool_results: results}) do
+    errors = Enum.filter(results || [], & &1.is_error)
+
+    cond do
+      errors == [] ->
+        reset_failure_counts_if(chain, true)
+
+      is_integer(chain.max_refusal_count) and Enum.all?(errors, & &1.is_refusal) ->
+        increment_current_refusal_count(chain)
+
+      true ->
+        increment_current_failure_count(chain)
+    end
+  end
+
+  defp reset_failure_counts_if(%LLMChain{} = chain, true),
+    do: %LLMChain{chain | current_failure_count: 0, current_refusal_count: 0}
+
+  defp reset_failure_counts_if(%LLMChain{} = chain, false), do: chain
 
   @doc """
   Increments the internal current_failure_count. Returns and incremented and
@@ -1392,6 +2584,23 @@ defmodule LangChain.Chains.LLMChain do
     else
       chain
     end
+  end
+
+  @doc """
+  Increments the internal current_refusal_count. Only consulted when
+  `max_refusal_count` is set.
+  """
+  @spec increment_current_refusal_count(t()) :: t()
+  def increment_current_refusal_count(%LLMChain{} = chain) do
+    %LLMChain{chain | current_refusal_count: chain.current_refusal_count + 1}
+  end
+
+  @doc """
+  Reset the internal current_refusal_count to 0.
+  """
+  @spec reset_current_refusal_count(t()) :: t()
+  def reset_current_refusal_count(%LLMChain{} = chain) do
+    %LLMChain{chain | current_refusal_count: 0}
   end
 
   @doc """

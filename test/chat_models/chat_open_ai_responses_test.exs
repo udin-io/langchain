@@ -1,0 +1,3086 @@
+defmodule LangChain.ChatModels.ChatOpenAIResponsesTest do
+  use LangChain.BaseCase
+  use Mimic
+
+  doctest LangChain.ChatModels.ChatOpenAIResponses
+  alias LangChain.ChatModels.ChatOpenAIResponses
+  alias LangChain.Function
+  alias LangChain.FunctionParam
+  alias LangChain.Message.ContentPart
+  alias LangChain.Message.ToolCall
+  alias LangChain.Message.ToolResult
+
+  @test_model "gpt-4o-mini-2024-07-18"
+
+  setup do
+    {:ok, hello_world} =
+      Function.new(%{
+        name: "hello_world",
+        description: "Give a hello world greeting",
+        function: fn _args, _context -> {:ok, "Hello world!"} end
+      })
+
+    {:ok, weather} =
+      Function.new(%{
+        name: "get_weather",
+        description: "Get the current weather in a given US location",
+        parameters: [
+          FunctionParam.new!(%{
+            name: "city",
+            type: "string",
+            description: "The city name, e.g. San Francisco",
+            required: true
+          }),
+          FunctionParam.new!(%{
+            name: "state",
+            type: "string",
+            description: "The 2 letter US state abbreviation, e.g. CA, NY, UT",
+            required: true
+          })
+        ],
+        function: fn _args, _context -> {:ok, "75 degrees"} end
+      })
+
+    %{hello_world: hello_world, weather: weather}
+  end
+
+  describe "new/1" do
+    test "works with minimal attr" do
+      assert {:ok, %ChatOpenAIResponses{} = openai} =
+               ChatOpenAIResponses.new(%{"model" => @test_model})
+
+      assert openai.model == @test_model
+    end
+
+    test "returns error when invalid" do
+      assert {:error, changeset} = ChatOpenAIResponses.new(%{"model" => nil})
+      refute changeset.valid?
+      assert {"can't be blank", _} = changeset.errors[:model]
+    end
+
+    test "supports overriding the API endpoint" do
+      override_url = "http://localhost:1234/v1/chat/completions"
+
+      model =
+        ChatOpenAIResponses.new!(%{
+          endpoint: override_url
+        })
+
+      assert model.endpoint == override_url
+    end
+
+    test "supports setting json_response and json_schema" do
+      json_schema = %{
+        "type" => "object",
+        "properties" => %{
+          "name" => %{"type" => "string"},
+          "age" => %{"type" => "integer"}
+        }
+      }
+
+      {:ok, openai} =
+        ChatOpenAIResponses.new(%{
+          "model" => @test_model,
+          "json_response" => true,
+          "json_schema" => json_schema
+        })
+
+      assert openai.json_response == true
+      assert openai.json_schema == json_schema
+    end
+
+    test "supports overriding temperature" do
+      {:ok, openai} = ChatOpenAIResponses.new(%{"model" => @test_model, "temperature" => 0.7})
+      assert openai.temperature == 0.7
+
+      # Verify it's included in API call when not default
+      data = ChatOpenAIResponses.for_api(openai, [], [])
+      assert data.temperature == 0.7
+    end
+
+    test "returns error for out-of-bounds temperature" do
+      assert {:error, changeset} =
+               ChatOpenAIResponses.new(%{"model" => @test_model, "temperature" => 2.5})
+
+      refute changeset.valid?
+      assert {"must be less than or equal to %{number}", _} = changeset.errors[:temperature]
+
+      assert {:error, changeset} =
+               ChatOpenAIResponses.new(%{"model" => @test_model, "temperature" => -0.1})
+
+      refute changeset.valid?
+      assert {"must be greater than or equal to %{number}", _} = changeset.errors[:temperature]
+    end
+
+    test "top_p defaults to 1.0 and is included for gpt-4 models" do
+      {:ok, openai} = ChatOpenAIResponses.new(%{"model" => @test_model})
+      assert openai.top_p == 1.0
+
+      data = ChatOpenAIResponses.for_api(openai, [], [])
+      assert data.top_p == 1.0
+    end
+
+    test "top_p is excluded for gpt-5.2 and newer models" do
+      {:ok, openai} = ChatOpenAIResponses.new(%{"model" => "gpt-5.2", "top_p" => 0.9})
+      assert openai.top_p == 0.9
+
+      data = ChatOpenAIResponses.for_api(openai, [], [])
+      refute Map.has_key?(data, :top_p)
+    end
+
+    test "top_p is included for gpt-5.1 and earlier models" do
+      {:ok, openai} = ChatOpenAIResponses.new(%{"model" => "gpt-5.1", "top_p" => 0.8})
+      data = ChatOpenAIResponses.for_api(openai, [], [])
+      assert data.top_p == 0.8
+
+      {:ok, openai} = ChatOpenAIResponses.new(%{"model" => "gpt-5.0", "top_p" => 0.7})
+      data = ChatOpenAIResponses.for_api(openai, [], [])
+      assert data.top_p == 0.7
+    end
+
+    test "supports_top_p?/1 returns correct values for various models" do
+      assert ChatOpenAIResponses.supports_top_p?("gpt-4")
+      assert ChatOpenAIResponses.supports_top_p?("gpt-4o")
+      assert ChatOpenAIResponses.supports_top_p?("gpt-4o-mini")
+      assert ChatOpenAIResponses.supports_top_p?("gpt-4o-mini-2024-07-18")
+      assert ChatOpenAIResponses.supports_top_p?("gpt-5.0")
+      assert ChatOpenAIResponses.supports_top_p?("gpt-5.1")
+      refute ChatOpenAIResponses.supports_top_p?("gpt-5.2")
+      refute ChatOpenAIResponses.supports_top_p?("gpt-5.3")
+      refute ChatOpenAIResponses.supports_top_p?("gpt-6")
+    end
+
+    test "supports overriding top_p" do
+      {:ok, openai} = ChatOpenAIResponses.new(%{"model" => @test_model, "top_p" => 0.9})
+      assert openai.top_p == 0.9
+
+      data = ChatOpenAIResponses.for_api(openai, [], [])
+      assert data.top_p == 0.9
+    end
+
+    test "returns error for out-of-bounds top_p" do
+      assert {:error, changeset} =
+               ChatOpenAIResponses.new(%{"model" => @test_model, "top_p" => 1.5})
+
+      refute changeset.valid?
+      assert {"must be less than or equal to %{number}", _} = changeset.errors[:top_p]
+
+      assert {:error, changeset} =
+               ChatOpenAIResponses.new(%{"model" => @test_model, "top_p" => -0.1})
+
+      refute changeset.valid?
+      assert {"must be greater than or equal to %{number}", _} = changeset.errors[:top_p]
+    end
+
+    test "supports setting reasoning options" do
+      {:ok, openai} =
+        ChatOpenAIResponses.new(%{
+          "model" => @test_model,
+          "reasoning" => %{
+            "effort" => "high"
+          }
+        })
+
+      assert openai.reasoning.effort == :high
+    end
+
+    test "validates reasoning_effort values" do
+      assert {:error, changeset} =
+               ChatOpenAIResponses.new(%{
+                 "model" => @test_model,
+                 "reasoning" => %{"effort" => "invalid"}
+               })
+
+      refute changeset.valid?
+      assert changeset.errors == []
+      assert changeset.changes.reasoning.errors[:effort] != nil
+    end
+
+    test "supports setting reasoning_summary" do
+      {:ok, openai} =
+        ChatOpenAIResponses.new(%{
+          "model" => @test_model,
+          "reasoning" => %{
+            "summary" => "detailed"
+          }
+        })
+
+      assert openai.reasoning.summary == :detailed
+    end
+
+    test "validates reasoning_summary values" do
+      assert {:error, changeset} =
+               ChatOpenAIResponses.new(%{
+                 "model" => @test_model,
+                 "reasoning" => %{"summary" => "invalid"}
+               })
+
+      refute changeset.valid?
+      assert changeset.errors == []
+      assert changeset.changes.reasoning.errors[:summary] != nil
+    end
+
+    test "supports setting reasoning_generate_summary (deprecated)" do
+      {:ok, openai} =
+        ChatOpenAIResponses.new(%{
+          "model" => @test_model,
+          "reasoning" => %{
+            "generate_summary" => "concise"
+          }
+        })
+
+      assert openai.reasoning.generate_summary == :concise
+    end
+
+    test "validates reasoning_generate_summary values" do
+      assert {:error, changeset} =
+               ChatOpenAIResponses.new(%{
+                 "model" => @test_model,
+                 "reasoning" => %{"generate_summary" => "invalid"}
+               })
+
+      refute changeset.valid?
+      assert changeset.errors == []
+      assert changeset.changes.reasoning.errors[:generate_summary] != nil
+    end
+
+    test "accepts all valid reasoning_effort values" do
+      valid_efforts = ["minimal", "low", "medium", "high"]
+
+      for effort <- valid_efforts do
+        assert {:ok, %ChatOpenAIResponses{reasoning: reasoning}} =
+                 ChatOpenAIResponses.new(%{
+                   "model" => @test_model,
+                   "reasoning" => %{"effort" => effort}
+                 })
+
+        assert reasoning.effort == String.to_atom(effort)
+      end
+    end
+
+    test "accepts all valid reasoning summary values" do
+      valid_summaries = ["auto", "concise", "detailed"]
+
+      for summary <- valid_summaries do
+        assert {:ok, %ChatOpenAIResponses{reasoning: reasoning}} =
+                 ChatOpenAIResponses.new(%{
+                   "model" => @test_model,
+                   "reasoning" => %{"summary" => summary}
+                 })
+
+        assert reasoning.summary == String.to_atom(summary)
+
+        assert {:ok, %ChatOpenAIResponses{reasoning: reasoning}} =
+                 ChatOpenAIResponses.new(%{
+                   "model" => @test_model,
+                   "reasoning" => %{"generate_summary" => summary}
+                 })
+
+        assert reasoning.generate_summary == String.to_atom(summary)
+      end
+    end
+
+    test "accepts valid verbosity values" do
+      for verbosity <- ["low", "medium", "high"] do
+        assert {:ok, %ChatOpenAIResponses{} = openai} =
+                 ChatOpenAIResponses.new(%{"model" => @test_model, "verbosity" => verbosity})
+
+        assert openai.verbosity == verbosity
+      end
+    end
+
+    test "rejects invalid verbosity values" do
+      assert {:error, changeset} =
+               ChatOpenAIResponses.new(%{"model" => @test_model, "verbosity" => "max"})
+
+      refute changeset.valid?
+      assert {"is invalid", _} = changeset.errors[:verbosity]
+    end
+
+    test "verbosity defaults to nil" do
+      {:ok, openai} = ChatOpenAIResponses.new(%{"model" => @test_model})
+      assert openai.verbosity == nil
+    end
+
+    test "accepts context management with atom keys" do
+      assert {:ok,
+              %ChatOpenAIResponses{
+                context_management: [
+                  %{"type" => "compaction", "compact_threshold" => 300_000}
+                ]
+              }} =
+               ChatOpenAIResponses.new(%{
+                 context_management: [%{type: "compaction", compact_threshold: 300_000}]
+               })
+    end
+
+    test "accepts context management with string keys" do
+      context_management = [%{"type" => "compaction", "compact_threshold" => 300_000}]
+
+      assert {:ok, %ChatOpenAIResponses{context_management: ^context_management}} =
+               ChatOpenAIResponses.new(%{"context_management" => context_management})
+    end
+
+    test "accepts context management without a compact_threshold" do
+      assert {:ok, %ChatOpenAIResponses{context_management: [%{"type" => "compaction"}]}} =
+               ChatOpenAIResponses.new(%{context_management: [%{type: "compaction"}]})
+    end
+
+    test "accepts context management entry types the library doesn't know about" do
+      assert {:ok, %ChatOpenAIResponses{context_management: [%{"type" => "future_type"}]}} =
+               ChatOpenAIResponses.new(%{context_management: [%{type: "future_type"}]})
+    end
+
+    test "preserves context management keys the library doesn't know about" do
+      assert {:ok, %ChatOpenAIResponses{context_management: [entry]}} =
+               ChatOpenAIResponses.new(%{
+                 context_management: [%{type: "compaction", future_option: "keep me"}]
+               })
+
+      assert entry == %{"type" => "compaction", "future_option" => "keep me"}
+    end
+
+    test "rejects malformed context management" do
+      invalid_values = [
+        %{type: "compaction", compact_threshold: 300_000},
+        ["compaction"],
+        [%{}],
+        [%{compact_threshold: 300_000}],
+        [%{type: :compaction}],
+        [%{type: ""}],
+        [%{type: "compaction", compact_threshold: 0}],
+        [%{type: "compaction", compact_threshold: -1}],
+        [%{type: "compaction", compact_threshold: 1.5}],
+        [%{type: "compaction", compact_threshold: "300000"}]
+      ]
+
+      for context_management <- invalid_values do
+        assert {:error, changeset} =
+                 ChatOpenAIResponses.new(%{context_management: context_management})
+
+        refute changeset.valid?
+      end
+    end
+
+    # Support
+  end
+
+  describe "for_api/3 context management" do
+    test "includes the exact context management configuration when set" do
+      model =
+        ChatOpenAIResponses.new!(%{
+          context_management: [%{type: "compaction", compact_threshold: 300_000}]
+        })
+
+      assert ChatOpenAIResponses.for_api(model, [], [])[:context_management] == [
+               %{"type" => "compaction", "compact_threshold" => 300_000}
+             ]
+    end
+
+    test "omits context management when unset" do
+      model = ChatOpenAIResponses.new!()
+
+      refute Map.has_key?(ChatOpenAIResponses.for_api(model, [], []), :context_management)
+    end
+
+    test "omits compact_threshold when unset rather than sending null" do
+      model = ChatOpenAIResponses.new!(%{context_management: [%{type: "compaction"}]})
+
+      assert ChatOpenAIResponses.for_api(model, [], [])[:context_management] == [
+               %{"type" => "compaction"}
+             ]
+    end
+
+    test "includes context management in the HTTP request payload" do
+      expect(Req, :post, fn request ->
+        assert request.options[:json][:context_management] == [
+                 %{"type" => "compaction", "compact_threshold" => 300_000}
+               ]
+
+        {:error, RuntimeError.exception("stop after inspecting request")}
+      end)
+
+      model =
+        ChatOpenAIResponses.new!(%{
+          context_management: [%{type: "compaction", compact_threshold: 300_000}]
+        })
+
+      assert {:error, _error} = ChatOpenAIResponses.do_api_request(model, [], [])
+      verify!()
+    end
+  end
+
+  describe "prompt caching" do
+    test "preserves cache configuration through JSON serialization and restoration" do
+      for options <- [%{mode: "explicit", ttl: "30m"}, %{"mode" => "explicit", "ttl" => "30m"}] do
+        model =
+          ChatOpenAIResponses.new!(%{
+            prompt_cache_key: "shared-reference-v1",
+            prompt_cache_options: options
+          })
+
+        payload = ChatOpenAIResponses.for_api(model, [], [])
+        assert payload[:prompt_cache_key] == "shared-reference-v1"
+        assert payload[:prompt_cache_options] == options
+
+        config =
+          model |> ChatOpenAIResponses.serialize_config() |> Jason.encode!() |> Jason.decode!()
+
+        assert config["prompt_cache_key"] == "shared-reference-v1"
+        assert config["prompt_cache_options"] == %{"mode" => "explicit", "ttl" => "30m"}
+        assert {:ok, restored} = ChatOpenAIResponses.restore_from_map(config)
+
+        assert restored
+               |> ChatOpenAIResponses.for_api([], [])
+               |> Jason.encode!()
+               |> Jason.decode!() ==
+                 payload |> Jason.encode!() |> Jason.decode!()
+      end
+    end
+
+    test "omits unset cache options and preserves extra_body overrides and removal" do
+      payload = ChatOpenAIResponses.for_api(ChatOpenAIResponses.new!(), [], [])
+      refute Map.has_key?(payload, :prompt_cache_key)
+      refute Map.has_key?(payload, :prompt_cache_options)
+
+      model =
+        ChatOpenAIResponses.new!(%{
+          prompt_cache_key: "original",
+          prompt_cache_options: %{mode: "explicit", ttl: "30m"},
+          extra_body: %{"prompt_cache_key" => "override", "prompt_cache_options" => nil}
+        })
+
+      payload = ChatOpenAIResponses.for_api(model, [], []) |> Jason.encode!() |> Jason.decode!()
+      assert payload["prompt_cache_key"] == "override"
+      refute Map.has_key?(payload, "prompt_cache_options")
+    end
+
+    test "adds breakpoints to supported input blocks while preserving their content attributes" do
+      model = ChatOpenAIResponses.new!()
+
+      cases = [
+        {ContentPart.text!("Reference"), %{"type" => "input_text", "text" => "Reference"}},
+        {ContentPart.file_url!("https://example.com/reference.pdf"),
+         %{"type" => "input_file", "file_url" => "https://example.com/reference.pdf"}},
+        {ContentPart.file!("file-document", type: :file_id),
+         %{"type" => "input_file", "file_id" => "file-document"}},
+        {ContentPart.file!("PDF_DATA", filename: "reference.pdf"),
+         %{
+           "type" => "input_file",
+           "filename" => "reference.pdf",
+           "file_data" => "data:application/pdf;base64,PDF_DATA"
+         }},
+        {ContentPart.image_url!("https://example.com/image.png", detail: "low"),
+         %{
+           "type" => "input_image",
+           "image_url" => "https://example.com/image.png",
+           "detail" => "low"
+         }},
+        {ContentPart.image!("file-image", type: :file_id, detail: "high"),
+         %{"type" => "input_image", "file_id" => "file-image", "detail" => "high"}},
+        {ContentPart.image!("IMAGE_DATA", media: :png, detail: "low"),
+         %{
+           "type" => "input_image",
+           "image_url" => "data:image/png;base64,IMAGE_DATA",
+           "detail" => "low"
+         }}
+      ]
+
+      for {part, expected} <- cases,
+          role <- [:user, :system, :developer],
+          breakpoint <- [nil, %{mode: "explicit"}, %{"mode" => "explicit"}] do
+        marked = %{
+          part
+          | options: Keyword.put(part.options, :prompt_cache_breakpoint, breakpoint)
+        }
+
+        result = ChatOpenAIResponses.content_part_for_api(model, marked, role)
+
+        if breakpoint do
+          assert result == Map.put(expected, "prompt_cache_breakpoint", breakpoint)
+        else
+          assert result == expected
+        end
+      end
+    end
+
+    test "does not add breakpoints to assistant output or reasoning items" do
+      model = ChatOpenAIResponses.new!()
+      breakpoint = %{mode: "explicit"}
+      text = ContentPart.text!("Answer", prompt_cache_breakpoint: breakpoint)
+
+      reasoning =
+        ContentPart.new!(%{
+          type: :thinking,
+          content: "",
+          options: [
+            id: "rs_example",
+            type: "reasoning",
+            encrypted_content: "encrypted-example",
+            prompt_cache_breakpoint: breakpoint
+          ]
+        })
+
+      message = Message.new_assistant!([reasoning, text])
+
+      assert [
+               %{"type" => "reasoning"} = reasoning_item,
+               %{"content" => [%{"type" => "output_text", "text" => "Answer"} = output]}
+             ] = ChatOpenAIResponses.for_api(model, message)
+
+      refute Map.has_key?(reasoning_item, "prompt_cache_breakpoint")
+      refute Map.has_key?(output, "prompt_cache_breakpoint")
+      assert [] = ChatOpenAIResponses.content_parts_for_api(model, [reasoning], :user)
+    end
+
+    test "preserves tool result order and IDs with plain, marked, and multimodal outputs" do
+      model = ChatOpenAIResponses.new!()
+      breakpoint = %{mode: "explicit"}
+
+      results = [
+        ToolResult.new!(%{tool_call_id: "call_string", content: "Plain string"}),
+        ToolResult.new!(%{tool_call_id: "call_text", content: [ContentPart.text!("Plain text")]}),
+        ToolResult.new!(%{
+          tool_call_id: "call_cached",
+          content: [ContentPart.text!("Reference", prompt_cache_breakpoint: breakpoint)],
+          processed_content: %{private: "application data"},
+          display_text: "Private display text"
+        }),
+        ToolResult.new!(%{
+          tool_call_id: "call_multimodal",
+          content: [
+            ContentPart.text!("Document preview"),
+            ContentPart.image_url!("https://example.com/preview.png", detail: "low"),
+            ContentPart.file!("file-document",
+              type: :file_id,
+              prompt_cache_breakpoint: breakpoint
+            )
+          ]
+        }),
+        ToolResult.new!(%{
+          tool_call_id: "call_multiple_text",
+          content: [ContentPart.text!("First"), ContentPart.text!("Second")]
+        })
+      ]
+
+      payload =
+        ChatOpenAIResponses.for_api(
+          model,
+          [Message.new_tool_result!(%{tool_results: results})],
+          []
+        )
+
+      assert payload.input == [
+               %{
+                 "type" => "function_call_output",
+                 "call_id" => "call_string",
+                 "output" => "Plain string"
+               },
+               %{
+                 "type" => "function_call_output",
+                 "call_id" => "call_text",
+                 "output" => "Plain text"
+               },
+               %{
+                 "type" => "function_call_output",
+                 "call_id" => "call_cached",
+                 "output" => [
+                   %{
+                     "type" => "input_text",
+                     "text" => "Reference",
+                     "prompt_cache_breakpoint" => breakpoint
+                   }
+                 ]
+               },
+               %{
+                 "type" => "function_call_output",
+                 "call_id" => "call_multimodal",
+                 "output" => [
+                   %{"type" => "input_text", "text" => "Document preview"},
+                   %{
+                     "type" => "input_image",
+                     "image_url" => "https://example.com/preview.png",
+                     "detail" => "low"
+                   },
+                   %{
+                     "type" => "input_file",
+                     "file_id" => "file-document",
+                     "prompt_cache_breakpoint" => breakpoint
+                   }
+                 ]
+               },
+               %{
+                 "type" => "function_call_output",
+                 "call_id" => "call_multiple_text",
+                 "output" => [
+                   %{"type" => "input_text", "text" => "First"},
+                   %{"type" => "input_text", "text" => "Second"}
+                 ]
+               }
+             ]
+    end
+
+    test "includes cache configuration and breakpoints in the HTTP payload" do
+      expect(Req, :post, fn request ->
+        payload = request.options[:json] |> Jason.encode!() |> Jason.decode!()
+        assert payload["prompt_cache_key"] == "shared-reference-v1"
+        assert payload["prompt_cache_options"] == %{"mode" => "explicit", "ttl" => "30m"}
+
+        assert [%{"content" => [%{"prompt_cache_breakpoint" => %{"mode" => "explicit"}}]}] =
+                 payload["input"]
+
+        {:error, RuntimeError.exception("stop after inspecting request")}
+      end)
+
+      model =
+        ChatOpenAIResponses.new!(%{
+          prompt_cache_key: "shared-reference-v1",
+          prompt_cache_options: %{mode: "explicit", ttl: "30m"}
+        })
+
+      message =
+        Message.new_user!([
+          ContentPart.text!("Reference", prompt_cache_breakpoint: %{mode: "explicit"})
+        ])
+
+      assert {:error, _error} = ChatOpenAIResponses.do_api_request(model, [message], [])
+      verify!()
+    end
+  end
+
+  describe "for_api/3 reasoning options" do
+    test "includes reasoning options when set" do
+      openai =
+        ChatOpenAIResponses.new!(%{
+          "model" => @test_model,
+          "reasoning" => %{
+            "effort" => "high",
+            "summary" => "detailed"
+          }
+        })
+
+      result = ChatOpenAIResponses.for_api(openai, [], [])
+
+      assert result.reasoning == %{
+               "effort" => "high",
+               "summary" => "detailed"
+             }
+    end
+
+    test "excludes reasoning when no options are set" do
+      openai = ChatOpenAIResponses.new!(%{"model" => @test_model})
+
+      result = ChatOpenAIResponses.for_api(openai, [], [])
+
+      refute Map.has_key?(result, :reasoning)
+    end
+
+    test "includes only set reasoning options" do
+      openai =
+        ChatOpenAIResponses.new!(%{
+          "model" => @test_model,
+          "reasoning" => %{
+            "effort" => "medium"
+          }
+        })
+
+      result = ChatOpenAIResponses.for_api(openai, [], [])
+
+      assert result.reasoning == %{"effort" => "medium"}
+    end
+
+    test "includes deprecated reasoning_generate_summary" do
+      openai =
+        ChatOpenAIResponses.new!(%{
+          "model" => @test_model,
+          "reasoning" => %{
+            "generate_summary" => "auto"
+          }
+        })
+
+      result = ChatOpenAIResponses.for_api(openai, [], [])
+
+      assert result.reasoning == %{"generate_summary" => "auto"}
+    end
+
+    test "includes all reasoning options when all are set" do
+      openai =
+        ChatOpenAIResponses.new!(%{
+          "model" => @test_model,
+          "reasoning" => %{
+            "effort" => "low",
+            "summary" => "concise",
+            "generate_summary" => "auto"
+          }
+        })
+
+      result = ChatOpenAIResponses.for_api(openai, [], [])
+
+      assert result.reasoning == %{
+               "effort" => "low",
+               "summary" => "concise",
+               "generate_summary" => "auto"
+             }
+    end
+  end
+
+  describe "for_api/3 messages" do
+    test "generates a map for an API call" do
+      {:ok, openai} =
+        ChatOpenAIResponses.new(%{
+          "model" => @test_model,
+          "temperature" => 1,
+          "api_key" => "api_key"
+        })
+
+      data = ChatOpenAIResponses.for_api(openai, [], [])
+      assert data.model == @test_model
+      assert data[:temperature] == 1.0
+      assert data.store == false
+      assert data[:text] == nil
+      assert data.input == []
+      assert data[:tools] == nil
+    end
+
+    test "generates a map for an API call with JSON response set to true" do
+      {:ok, openai} =
+        ChatOpenAIResponses.new(%{
+          "model" => @test_model,
+          "json_response" => true
+        })
+
+      data = ChatOpenAIResponses.for_api(openai, [], [])
+      assert data.model == @test_model
+      assert data.text == %{"format" => %{"type" => "json_object"}}
+      refute data[:temperature]
+    end
+
+    test "generates a map for an API call with JSON response and schema" do
+      json_schema = %{
+        "type" => "object",
+        "properties" => %{
+          "name" => %{"type" => "string"},
+          "age" => %{"type" => "integer"}
+        }
+      }
+
+      {:ok, openai} =
+        ChatOpenAIResponses.new(%{
+          "model" => @test_model,
+          "temperature" => 1,
+          "json_response" => true,
+          "json_schema" => json_schema,
+          "json_schema_name" => "person"
+        })
+
+      data = ChatOpenAIResponses.for_api(openai, [], [])
+      assert data.model == @test_model
+
+      assert data.text == %{
+               "format" => %{
+                 "type" => "json_schema",
+                 "name" => "person",
+                 "schema" => json_schema,
+                 "strict" => true
+               }
+             }
+    end
+
+    test "includes tools when provided" do
+      {:ok, openai} = ChatOpenAIResponses.new(%{"model" => @test_model})
+
+      {:ok, weather} =
+        Function.new(%{
+          name: "get_weather",
+          description: "Get weather",
+          function: fn _, _ -> {:ok, "sunny"} end
+        })
+
+      data = ChatOpenAIResponses.for_api(openai, [], [weather])
+      assert length(data.tools) == 1
+      [tool] = data.tools
+      assert tool["type"] == "function"
+      assert tool["name"] == "get_weather"
+    end
+
+    test "sets tool_choice correctly for different values" do
+      # Auto mode (default)
+      {:ok, openai} = ChatOpenAIResponses.new(%{"model" => @test_model, "tool_choice" => "auto"})
+      data = ChatOpenAIResponses.for_api(openai, [], [])
+      assert data.tool_choice == "auto"
+
+      # None mode
+      {:ok, openai} = ChatOpenAIResponses.new(%{"model" => @test_model, "tool_choice" => "none"})
+      data = ChatOpenAIResponses.for_api(openai, [], [])
+      assert data.tool_choice == "none"
+
+      # Required mode
+      {:ok, openai} =
+        ChatOpenAIResponses.new(%{"model" => @test_model, "tool_choice" => "required"})
+
+      data = ChatOpenAIResponses.for_api(openai, [], [])
+      assert data.tool_choice == "required"
+
+      # Specific function
+      {:ok, openai} =
+        ChatOpenAIResponses.new(%{"model" => @test_model, "tool_choice" => "get_weather"})
+
+      data = ChatOpenAIResponses.for_api(openai, [], [])
+      assert data.tool_choice == %{"type" => "function", "name" => "get_weather"}
+
+      # Native tool
+      {:ok, openai} =
+        ChatOpenAIResponses.new(%{"model" => @test_model, "tool_choice" => "web_search_preview"})
+
+      data = ChatOpenAIResponses.for_api(openai, [], [])
+      assert data.tool_choice == %{"type" => "web_search_preview"}
+    end
+  end
+
+  describe "assistant history serialization" do
+    test "preserves the role of plain assistant text and uses output_text" do
+      model = ChatOpenAIResponses.new!()
+
+      assert [
+               %{
+                 "type" => "message",
+                 "role" => "assistant",
+                 "content" => [%{"type" => "output_text", "text" => "Prior answer"}]
+               }
+             ] = ChatOpenAIResponses.for_api(model, Message.new_assistant!("Prior answer"))
+    end
+
+    test "omits assistant content parts the API cannot represent" do
+      model = ChatOpenAIResponses.new!()
+
+      # Assistant "output" messages only support `output_text` and `refusal`.
+      # An image has no valid representation and is omitted.
+      message =
+        Message.new_assistant!([
+          ContentPart.text!("Look at this image"),
+          ContentPart.image_url!("https://example.com/image.png")
+        ])
+
+      assert [
+               %{
+                 "type" => "message",
+                 "role" => "assistant",
+                 "content" => [%{"type" => "output_text", "text" => "Look at this image"}]
+               }
+             ] = ChatOpenAIResponses.for_api(model, message)
+    end
+
+    test "omits the assistant message entirely when no content survives" do
+      model = ChatOpenAIResponses.new!()
+
+      # A thinking part is output-only and dropped. Emitting a message item with
+      # an empty content list would be rejected by the API.
+      message = Message.new_assistant!([ContentPart.new!(%{type: :thinking, content: "hmm"})])
+
+      assert [] = ChatOpenAIResponses.for_api(model, message)
+    end
+
+    test "keeps native tool calls and tool calls when assistant content is dropped" do
+      model = ChatOpenAIResponses.new!()
+
+      tool_call =
+        ToolCall.new!(%{call_id: "call_abc", name: "calculator", arguments: %{expression: "1+1"}})
+
+      message =
+        Message.new_assistant!(%{
+          content: [ContentPart.new!(%{type: :thinking, content: "hmm"})],
+          tool_calls: [tool_call]
+        })
+
+      assert [%{"type" => "function_call", "call_id" => "call_abc"}] =
+               ChatOpenAIResponses.for_api(model, message)
+    end
+
+    test "preserves mixed system, user, and assistant history ordering" do
+      model = ChatOpenAIResponses.new!()
+
+      data =
+        ChatOpenAIResponses.for_api(
+          model,
+          [
+            Message.new_system!("Follow the rules"),
+            Message.new_user!("Question"),
+            Message.new_assistant!("Prior answer"),
+            Message.new_user!("Follow-up")
+          ],
+          []
+        )
+
+      assert [system, user, assistant, follow_up] = data.input
+      assert %{"role" => "system"} = system
+      assert %{"role" => "user"} = user
+      assert %{"role" => "assistant"} = assistant
+      assert %{"role" => "user"} = follow_up
+    end
+
+    test "preserves assistant history in a stateful request" do
+      model = ChatOpenAIResponses.new!(%{previous_response_id: "resp_previous"})
+
+      data =
+        ChatOpenAIResponses.for_api(
+          model,
+          [Message.new_assistant!("Prior answer"), Message.new_user!("Follow-up")],
+          []
+        )
+
+      assert data.previous_response_id == "resp_previous"
+      assert [%{"role" => "assistant"}, %{"role" => "user"}] = data.input
+    end
+
+    test "preserves structured stateless history" do
+      model = ChatOpenAIResponses.new!()
+
+      tool_call =
+        ToolCall.new!(%{
+          call_id: "call_123",
+          name: "calculator",
+          arguments: %{expression: "2 + 2"}
+        })
+
+      tool_result =
+        ToolResult.new!(%{
+          tool_call_id: "call_123",
+          content: [ContentPart.text!("4")]
+        })
+
+      messages = [
+        Message.new_user!("Calculate 2 + 2"),
+        Message.new_assistant!(%{content: "I will calculate it", tool_calls: [tool_call]}),
+        Message.new_tool_result!(%{tool_results: [tool_result]}),
+        Message.new_user!("Thanks")
+      ]
+
+      data = ChatOpenAIResponses.for_api(model, messages, [])
+
+      refute Map.has_key?(data, :previous_response_id)
+
+      assert [
+               %{"type" => "message", "role" => "user"},
+               %{"type" => "message", "role" => "assistant"},
+               %{"type" => "function_call", "call_id" => "call_123"},
+               %{"type" => "function_call_output", "call_id" => "call_123"},
+               %{"type" => "message", "role" => "user"}
+             ] = data.input
+    end
+  end
+
+  describe "native tool call option shape" do
+    setup do
+      %{model: ChatOpenAIResponses.new!(%{"model" => @test_model})}
+    end
+
+    # A stored conversation comes back with its ContentPart options as a keyword
+    # list. A native tool call has to serialize the same either way, or it goes
+    # missing from the history of a conversation that outlived its process.
+    test "serializes a web_search_call the same before and after a round trip", %{model: model} do
+      %ContentPart{} =
+        part =
+        ContentPart.new!(%{
+          type: :unsupported,
+          options: [id: "ws_1", status: "completed", type: "web_search_call"]
+        })
+
+      restored =
+        %ContentPart{
+          part
+          | options:
+              part.options
+              |> Map.new(fn {k, v} -> {to_string(k), v} end)
+              |> Enum.map(fn {k, v} -> {String.to_existing_atom(k), v} end)
+              |> Keyword.new()
+        }
+
+      assert %{id: "ws_1", type: "web_search_call", status: "completed"} =
+               ChatOpenAIResponses.native_tool_call_for_api(model, part)
+
+      assert ChatOpenAIResponses.native_tool_call_for_api(model, part) ==
+               ChatOpenAIResponses.native_tool_call_for_api(model, restored)
+    end
+
+    test "parses a web_search_call into keyword options", %{model: model} do
+      response = %{
+        "status" => "completed",
+        "output" => [
+          %{"type" => "web_search_call", "id" => "ws_1", "status" => "completed"}
+        ]
+      }
+
+      assert %LangChain.Message{} =
+               message = ChatOpenAIResponses.do_process_response(model, response)
+
+      assert [%ContentPart{type: :unsupported} = part] = message.content
+      assert is_list(part.options)
+      assert part.options[:type] == "web_search_call"
+
+      assert [%{id: "ws_1", type: "web_search_call", status: "completed"}] =
+               ChatOpenAIResponses.for_api(model, message)
+    end
+
+    test "ignores an unsupported part that is not a native tool call", %{model: model} do
+      part = ContentPart.new!(%{type: :unsupported, options: [type: "something_else"]})
+      assert nil == ChatOpenAIResponses.native_tool_call_for_api(model, part)
+    end
+  end
+
+  describe "reasoning item continuity" do
+    setup do
+      %{model: ChatOpenAIResponses.new!(%{"model" => @test_model})}
+    end
+
+    test "captures encrypted_content from a non-streamed reasoning item", %{model: model} do
+      response = %{
+        "status" => "completed",
+        "output" => [
+          %{
+            "type" => "reasoning",
+            "id" => "rs_abc123",
+            "summary" => [],
+            "encrypted_content" => "gAAAAAB-encrypted-payload"
+          },
+          %{
+            "type" => "message",
+            "content" => [%{"type" => "output_text", "text" => "Let me check."}]
+          }
+        ]
+      }
+
+      assert %LangChain.Message{} =
+               message = ChatOpenAIResponses.do_process_response(model, response)
+
+      assert [%ContentPart{type: :unsupported} = reasoning, %ContentPart{type: :text}] =
+               message.content
+
+      assert reasoning.options[:id] == "rs_abc123"
+      assert reasoning.options[:type] == "reasoning"
+      assert reasoning.options[:encrypted_content] == "gAAAAAB-encrypted-payload"
+    end
+
+    test "omits encrypted_content when the API did not return it", %{model: model} do
+      response = %{
+        "status" => "completed",
+        "output" => [
+          %{"type" => "reasoning", "id" => "rs_abc123", "summary" => []}
+        ]
+      }
+
+      assert %LangChain.Message{} =
+               message = ChatOpenAIResponses.do_process_response(model, response)
+
+      assert [%ContentPart{type: :unsupported} = reasoning] = message.content
+      assert reasoning.options[:id] == "rs_abc123"
+      refute Keyword.has_key?(reasoning.options, :encrypted_content)
+    end
+
+    test "captures the reasoning id and encrypted_content from a streamed item", %{model: model} do
+      response = %{
+        "type" => "response.output_item.done",
+        "output_index" => 0,
+        "item" => %{
+          "type" => "reasoning",
+          "id" => "rs_stream1",
+          "summary" => [],
+          "encrypted_content" => "gAAAAAB-streamed-payload"
+        }
+      }
+
+      assert %LangChain.MessageDelta{} =
+               delta = ChatOpenAIResponses.do_process_response(model, response)
+
+      assert %ContentPart{type: :thinking} = delta.content
+      assert delta.content.options[:id] == "rs_stream1"
+      assert delta.content.options[:type] == "reasoning"
+      assert delta.content.options[:encrypted_content] == "gAAAAAB-streamed-payload"
+    end
+
+    test "replays an unsupported reasoning part as its own input item", %{model: model} do
+      reasoning =
+        ContentPart.new!(%{
+          type: :unsupported,
+          options: [
+            id: "rs_abc123",
+            summary: [],
+            type: "reasoning",
+            encrypted_content: "gAAAAAB-encrypted-payload"
+          ]
+        })
+
+      message =
+        Message.new_assistant!(%{content: [reasoning, ContentPart.text!("Let me check.")]})
+
+      assert [
+               %{
+                 "type" => "reasoning",
+                 "id" => "rs_abc123",
+                 "summary" => [],
+                 "encrypted_content" => "gAAAAAB-encrypted-payload"
+               },
+               %{"type" => "message", "role" => "assistant"}
+             ] = ChatOpenAIResponses.for_api(model, message)
+    end
+
+    test "replays a thinking part that carries reasoning options", %{model: model} do
+      reasoning =
+        ContentPart.new!(%{
+          type: :thinking,
+          content: "",
+          options: [
+            id: "rs_stream1",
+            type: "reasoning",
+            encrypted_content: "gAAAAAB-streamed-payload"
+          ]
+        })
+
+      message = Message.new_assistant!(%{content: [reasoning, ContentPart.text!("Answer")]})
+
+      assert [
+               %{
+                 "type" => "reasoning",
+                 "id" => "rs_stream1",
+                 "encrypted_content" => "gAAAAAB-streamed-payload"
+               },
+               %{"type" => "message", "role" => "assistant"}
+             ] = ChatOpenAIResponses.for_api(model, message)
+    end
+
+    test "omits a reasoning part that has no encrypted_content", %{model: model} do
+      reasoning =
+        ContentPart.new!(%{
+          type: :unsupported,
+          options: [id: "rs_abc123", summary: [], type: "reasoning"]
+        })
+
+      message =
+        Message.new_assistant!(%{content: [reasoning, ContentPart.text!("Let me check.")]})
+
+      assert [%{"type" => "message", "role" => "assistant"}] =
+               ChatOpenAIResponses.for_api(model, message)
+    end
+
+    test "omits a plain thinking part that carries no reasoning item", %{model: model} do
+      message = Message.new_assistant!([ContentPart.new!(%{type: :thinking, content: "hmm"})])
+
+      assert [] = ChatOpenAIResponses.for_api(model, message)
+    end
+
+    test "replays reasoning ahead of the tool calls it produced", %{model: model} do
+      reasoning =
+        ContentPart.new!(%{
+          type: :unsupported,
+          options: [
+            id: "rs_abc123",
+            summary: [],
+            type: "reasoning",
+            encrypted_content: "gAAAAAB-encrypted-payload"
+          ]
+        })
+
+      tool_call =
+        ToolCall.new!(%{call_id: "call_abc", name: "calculator", arguments: %{expression: "1+1"}})
+
+      message =
+        Message.new_assistant!(%{content: [reasoning], tool_calls: [tool_call]})
+
+      assert [
+               %{"type" => "reasoning", "id" => "rs_abc123"},
+               %{"type" => "function_call", "call_id" => "call_abc"}
+             ] = ChatOpenAIResponses.for_api(model, message)
+    end
+
+    test "keeps the original ordering of reasoning and native tool calls", %{model: model} do
+      reasoning_one =
+        ContentPart.new!(%{
+          type: :unsupported,
+          options: [id: "rs_one", summary: [], type: "reasoning", encrypted_content: "first"]
+        })
+
+      search =
+        ContentPart.new!(%{
+          type: :unsupported,
+          options: [id: "ws_one", type: "web_search_call", status: "completed"]
+        })
+
+      reasoning_two =
+        ContentPart.new!(%{
+          type: :unsupported,
+          options: [id: "rs_two", summary: [], type: "reasoning", encrypted_content: "second"]
+        })
+
+      message =
+        Message.new_assistant!(%{content: [reasoning_one, search, reasoning_two]})
+
+      assert [
+               %{"type" => "reasoning", "id" => "rs_one"},
+               %{type: "web_search_call", id: "ws_one"},
+               %{"type" => "reasoning", "id" => "rs_two"}
+             ] = ChatOpenAIResponses.for_api(model, message)
+    end
+
+    test "carries a streamed reasoning item through merge and back to the API", %{model: model} do
+      events = [
+        %{
+          "type" => "response.output_item.added",
+          "output_index" => 0,
+          "item" => %{"type" => "reasoning", "id" => "rs_stream1"}
+        },
+        %{
+          "type" => "response.output_item.done",
+          "output_index" => 0,
+          "item" => %{
+            "type" => "reasoning",
+            "id" => "rs_stream1",
+            "summary" => [],
+            "encrypted_content" => "gAAAAAB-streamed-payload"
+          }
+        }
+      ]
+
+      assert %LangChain.MessageDelta{} =
+               merged =
+               events
+               |> Enum.map(&ChatOpenAIResponses.do_process_response(model, &1))
+               |> LangChain.MessageDelta.merge_deltas()
+
+      assert {:ok, %LangChain.Message{} = message} =
+               LangChain.MessageDelta.to_message(%LangChain.MessageDelta{
+                 merged
+                 | status: :complete
+               })
+
+      assert [
+               %{
+                 "type" => "reasoning",
+                 "id" => "rs_stream1",
+                 "encrypted_content" => "gAAAAAB-streamed-payload"
+               }
+             ] = ChatOpenAIResponses.for_api(model, message)
+    end
+
+    test "round trips a reasoning item through a tool loop", %{model: model} do
+      response = %{
+        "status" => "completed",
+        "output" => [
+          %{
+            "type" => "reasoning",
+            "id" => "rs_loop",
+            "summary" => [],
+            "encrypted_content" => "gAAAAAB-loop"
+          },
+          %{
+            "type" => "function_call",
+            "call_id" => "call_loop",
+            "name" => "get_weather",
+            "arguments" => ~s({"city":"NYC"})
+          }
+        ]
+      }
+
+      assert %LangChain.Message{} =
+               message = ChatOpenAIResponses.do_process_response(model, response)
+
+      assert [
+               %{
+                 "type" => "reasoning",
+                 "id" => "rs_loop",
+                 "encrypted_content" => "gAAAAAB-loop"
+               },
+               %{"type" => "function_call", "call_id" => "call_loop"}
+             ] = ChatOpenAIResponses.for_api(model, message)
+    end
+  end
+
+  describe "for_api/3 verbosity" do
+    test "includes verbosity when set" do
+      openai =
+        ChatOpenAIResponses.new!(%{"model" => @test_model, "verbosity" => "low"})
+
+      data = ChatOpenAIResponses.for_api(openai, [], [])
+      assert data.text["verbosity"] == "low"
+    end
+
+    test "omits verbosity when nil" do
+      openai = ChatOpenAIResponses.new!(%{"model" => @test_model})
+
+      data = ChatOpenAIResponses.for_api(openai, [], [])
+      refute match?(%{text: %{"verbosity" => _}}, data)
+    end
+  end
+
+  describe "for_api/1 content parts" do
+    test "converts text content part to input_text" do
+      model = ChatOpenAIResponses.new!(%{"model" => @test_model})
+      msg = LangChain.Message.new_user!([LangChain.Message.ContentPart.text!("Hello")])
+
+      api = ChatOpenAIResponses.for_api(model, msg)
+      assert api["role"] == "user"
+      assert api["type"] == "message"
+      [part] = api["content"]
+      assert part == %{"type" => "input_text", "text" => "Hello"}
+    end
+
+    test "converts image content to input_image with detail and media" do
+      model = ChatOpenAIResponses.new!(%{"model" => @test_model})
+      img = LangChain.Message.ContentPart.image!("BASE64DATA", media: :png, detail: "low")
+      msg = LangChain.Message.new_user!([img])
+
+      api = ChatOpenAIResponses.for_api(model, msg)
+      [part] = api["content"]
+      assert part["type"] == "input_image"
+      assert String.starts_with?(part["image_url"], "data:image/png;base64,")
+      assert part["detail"] == "low"
+    end
+
+    test "converts file_id to input_image" do
+      model = ChatOpenAIResponses.new!(%{"model" => @test_model})
+      file = LangChain.Message.ContentPart.image!("file-123", type: :file_id)
+      msg = LangChain.Message.new_user!([file])
+
+      api = ChatOpenAIResponses.for_api(model, msg)
+      [part] = api["content"]
+      assert part["type"] == "input_image"
+      assert part["file_id"] == "file-123"
+    end
+
+    test "converts file base64 to input_file with filename" do
+      model = ChatOpenAIResponses.new!(%{"model" => @test_model})
+      file = LangChain.Message.ContentPart.file!("PDF_BASE64", type: :base64, filename: "a.pdf")
+      msg = LangChain.Message.new_user!([file])
+
+      api = ChatOpenAIResponses.for_api(model, msg)
+      [part] = api["content"]
+      assert part["type"] == "input_file"
+      assert part["filename"] == "a.pdf"
+      assert String.starts_with?(part["file_data"], "data:application/pdf;base64,")
+    end
+
+    test "converts file_id to input_file" do
+      model = ChatOpenAIResponses.new!(%{"model" => @test_model})
+      file = LangChain.Message.ContentPart.file!("file-123", type: :file_id)
+      msg = LangChain.Message.new_user!([file])
+
+      api = ChatOpenAIResponses.for_api(model, msg)
+      [part] = api["content"]
+      assert part["type"] == "input_file"
+      assert part["file_id"] == "file-123"
+    end
+
+    test "converts file_url to input_file" do
+      model = ChatOpenAIResponses.new!(%{"model" => @test_model})
+
+      file_url =
+        LangChain.Message.ContentPart.new!(%{
+          type: :file_url,
+          content: "https://example.com/document.pdf"
+        })
+
+      msg = LangChain.Message.new_user!([file_url])
+
+      api = ChatOpenAIResponses.for_api(model, msg)
+      [part] = api["content"]
+      assert part["type"] == "input_file"
+      assert part["file_url"] == "https://example.com/document.pdf"
+    end
+
+    test "omits thinking content parts when converting to API format" do
+      model = ChatOpenAIResponses.new!(%{"model" => @test_model})
+
+      # Create a message with thinking content (e.g., from a previous assistant response)
+      thinking_part =
+        LangChain.Message.ContentPart.new!(%{type: :thinking, content: "Some reasoning"})
+
+      text_part = LangChain.Message.ContentPart.text!("Here's my answer")
+
+      msg = LangChain.Message.new_assistant!([thinking_part, text_part])
+
+      api = ChatOpenAIResponses.for_api(model, msg)
+
+      # The result should be a list with the message and no tool calls
+      assert is_list(api)
+      [message_api] = api
+      assert message_api["type"] == "message"
+
+      # Content should only include the text part, not the thinking part
+      [content_part] = message_api["content"]
+      assert content_part["type"] == "output_text"
+      assert content_part["text"] == "Here's my answer"
+    end
+  end
+
+  describe "for_api/1 tool calls and results" do
+    test "turns a tool_call into expected JSON format" do
+      tool_call =
+        LangChain.Message.ToolCall.new!(%{
+          call_id: "call_abc123",
+          name: "hello_world",
+          arguments: %{}
+        })
+
+      json = ChatOpenAIResponses.for_api(ChatOpenAIResponses.new!(), tool_call)
+
+      assert json == %{
+               "call_id" => "call_abc123",
+               "type" => "function_call",
+               "name" => "hello_world",
+               "arguments" => "{}",
+               "status" => "completed"
+             }
+    end
+
+    test "turns an assistant tool_call into expected JSON format with arguments" do
+      msg =
+        LangChain.Message.new_assistant!(%{
+          tool_calls: [
+            LangChain.Message.ToolCall.new!(%{
+              call_id: "call_abc123",
+              name: "calculator",
+              arguments: %{expression: "11 + 10"}
+            })
+          ]
+        })
+
+      result = ChatOpenAIResponses.for_api(ChatOpenAIResponses.new!(), msg)
+
+      assert is_list(result)
+      assert length(result) == 1
+      [tool_call] = result
+      assert tool_call["type"] == "function_call"
+      assert tool_call["call_id"] == "call_abc123"
+      assert tool_call["name"] == "calculator"
+    end
+
+    test "converts tool result to function_call_output" do
+      tool_result =
+        LangChain.Message.ToolResult.new!(%{
+          tool_call_id: "call_123",
+          content: [LangChain.Message.ContentPart.text!("Result: 42")]
+        })
+
+      msg = LangChain.Message.new_tool_result!(%{tool_results: [tool_result]})
+      result = ChatOpenAIResponses.for_api(ChatOpenAIResponses.new!(), msg)
+
+      assert is_list(result)
+      [output] = result
+      assert output["type"] == "function_call_output"
+      assert output["call_id"] == "call_123"
+      assert output["output"] == "Result: 42"
+    end
+
+    test "handles assistant message with both content and tool calls" do
+      msg =
+        LangChain.Message.new_assistant!(%{
+          content: [LangChain.Message.ContentPart.text!("Let me calculate that")],
+          tool_calls: [
+            LangChain.Message.ToolCall.new!(%{
+              call_id: "call_123",
+              name: "calculator",
+              arguments: %{expr: "2+2"}
+            })
+          ]
+        })
+
+      result = ChatOpenAIResponses.for_api(ChatOpenAIResponses.new!(), msg)
+
+      # Should return a list with message and tool call
+      assert is_list(result)
+      assert length(result) == 2
+
+      [message, tool_call] = result
+      assert message["type"] == "message"
+      assert message["role"] == "assistant"
+      assert tool_call["type"] == "function_call"
+    end
+
+    test "handles multiple tool results" do
+      tool_result1 =
+        LangChain.Message.ToolResult.new!(%{
+          tool_call_id: "call_1",
+          content: [LangChain.Message.ContentPart.text!("Result 1")]
+        })
+
+      tool_result2 =
+        LangChain.Message.ToolResult.new!(%{
+          tool_call_id: "call_2",
+          content: [LangChain.Message.ContentPart.text!("Result 2")]
+        })
+
+      msg = LangChain.Message.new_tool_result!(%{tool_results: [tool_result1, tool_result2]})
+      result = ChatOpenAIResponses.for_api(ChatOpenAIResponses.new!(), msg)
+
+      assert is_list(result)
+      assert length(result) == 2
+
+      [output1, output2] = result
+      assert output1["type"] == "function_call_output"
+      assert output1["call_id"] == "call_1"
+      assert output2["call_id"] == "call_2"
+    end
+  end
+
+  describe "do_process_response non-streaming" do
+    setup do
+      %{model: ChatOpenAIResponses.new!(%{"model" => @test_model})}
+    end
+
+    test "handles completed response with text output", %{model: model} do
+      response = %{
+        "status" => "completed",
+        "output" => [
+          %{
+            "type" => "message",
+            "content" => [
+              %{"type" => "output_text", "text" => "Hello, world!"}
+            ]
+          }
+        ]
+      }
+
+      result = ChatOpenAIResponses.do_process_response(model, response)
+      assert %LangChain.Message{} = result
+      assert result.role == :assistant
+      assert result.status == :complete
+      [content_part] = result.content
+      assert content_part.type == :text
+      assert content_part.content == "Hello, world!"
+    end
+
+    test "handles completed response with function call", %{model: model} do
+      response = %{
+        "status" => "completed",
+        "output" => [
+          %{
+            "type" => "function_call",
+            "call_id" => "call_123",
+            "name" => "get_weather",
+            "arguments" => ~s({"city":"NYC"})
+          }
+        ]
+      }
+
+      result = ChatOpenAIResponses.do_process_response(model, response)
+      assert %LangChain.Message{} = result
+      assert result.role == :assistant
+      assert length(result.tool_calls) == 1
+      [tool_call] = result.tool_calls
+      assert tool_call.call_id == "call_123"
+      assert tool_call.name == "get_weather"
+      assert tool_call.arguments == %{"city" => "NYC"}
+    end
+
+    test "handles completed response with multiple outputs", %{model: model} do
+      response = %{
+        "status" => "completed",
+        "output" => [
+          %{
+            "type" => "message",
+            "content" => [%{"type" => "output_text", "text" => "I'll check the weather."}]
+          },
+          %{
+            "type" => "function_call",
+            "call_id" => "call_456",
+            "name" => "get_weather",
+            "arguments" => "{}"
+          }
+        ]
+      }
+
+      result = ChatOpenAIResponses.do_process_response(model, response)
+      assert %LangChain.Message{} = result
+      assert result.role == :assistant
+      assert length(result.content) == 1
+      assert length(result.tool_calls) == 1
+    end
+
+    test "handles completed response with usage metadata", %{model: model} do
+      response = %{
+        "status" => "completed",
+        "output" => [
+          %{
+            "content" => [
+              %{
+                "annotations" => [],
+                "logprobs" => [],
+                "text" => "hello",
+                "type" => "output_text"
+              }
+            ],
+            "role" => "assistant",
+            "status" => "completed",
+            "type" => "message"
+          }
+        ],
+        "usage" => %{
+          "input_tokens" => 27,
+          "input_tokens_details" => %{"cached_tokens" => 0},
+          "output_tokens" => 115,
+          "output_tokens_details" => %{"reasoning_tokens" => 0},
+          "total_tokens" => 142
+        }
+      }
+
+      result = ChatOpenAIResponses.do_process_response(model, response)
+      assert %LangChain.Message{} = result
+      assert %{usage: %LangChain.TokenUsage{} = usage} = result.metadata
+      assert %LangChain.TokenUsage{input: 27, output: 115} = usage
+    end
+
+    test "handles completed response with file_search results", %{model: model} do
+      response = %{
+        "status" => "completed",
+        "output" => [
+          %{
+            "id" => "fs_0d1b1549e16f51d20168e6af70c7b8819fae111b23577a202d",
+            "queries" => ["What is the meaning of life?"],
+            "results" => [
+              %{
+                "attributes" => %{},
+                "file_id" => "file-yTrvU63VL1AgEyFqtUYzfVT3",
+                "filename" => "Enreach_Contact.pdf",
+                "score" => 0.0059,
+                "text" => "text part 1",
+                "vector_store_id" => "vs_1"
+              },
+              %{
+                "attributes" => %{},
+                "file_id" => "file-yTrvU63VL1AgEyFqtUYzfVT3",
+                "filename" => "Enreach_Contact.pdf",
+                "score" => 0.0037,
+                "text" => "text part 2",
+                "vector_store_id" => "vs_2"
+              }
+            ],
+            "status" => "completed",
+            "type" => "file_search_call"
+          }
+        ]
+      }
+
+      result = ChatOpenAIResponses.do_process_response(model, response)
+      assert %LangChain.Message{} = result
+      assert result.role == :assistant
+      assert result.status == :complete
+      [content_part] = result.content
+      assert content_part.type == :unsupported
+      assert [_, _] = content_part.options[:results]
+      assert [_] = content_part.options[:queries]
+      assert content_part.options[:type] == "file_search_call"
+    end
+
+    test "handles error responses", %{model: model} do
+      response = %{"error" => %{"message" => "API key invalid"}}
+
+      assert {:error, %LangChain.LangChainError{} = error} =
+               ChatOpenAIResponses.do_process_response(model, response)
+
+      assert error.message == "API key invalid"
+    end
+
+    test "handles failed response status", %{model: model} do
+      response = %{
+        "response" => %{
+          "status" => "failed",
+          "error" => %{
+            "code" => "server_error",
+            "message" => "The server had an error processing your request"
+          }
+        }
+      }
+
+      assert {:error, %LangChain.LangChainError{} = error} =
+               ChatOpenAIResponses.do_process_response(model, response)
+
+      # Uses actual error code from response for better error categorization
+      assert error.type == "server_error"
+      assert error.message =~ "The server had an error processing your request"
+    end
+
+    test "handles failed response status without error details", %{model: model} do
+      response = %{
+        "response" => %{
+          "status" => "failed"
+        }
+      }
+
+      assert {:error, %LangChain.LangChainError{} = error} =
+               ChatOpenAIResponses.do_process_response(model, response)
+
+      # Falls back to "api_error" when no error code provided
+      assert error.type == "api_error"
+      assert error.message =~ "failed"
+    end
+
+    test "handles failed response status with string error", %{model: model} do
+      response = %{
+        "response" => %{
+          "status" => "failed",
+          "error" => "Something went wrong"
+        }
+      }
+
+      assert {:error, %LangChain.LangChainError{} = error} =
+               ChatOpenAIResponses.do_process_response(model, response)
+
+      # Handles string error format defensively
+      assert error.type == "api_error"
+      assert error.message =~ "Something went wrong"
+    end
+  end
+
+  describe "do_process_response streaming events" do
+    setup do
+      %{model: ChatOpenAIResponses.new!(%{"model" => @test_model})}
+    end
+
+    test "parses response.output_text.delta", %{model: model} do
+      delta = %{"type" => "response.output_text.delta", "delta" => "Hi"}
+
+      assert %LangChain.MessageDelta{content: "Hi", status: :incomplete, role: :assistant} =
+               ChatOpenAIResponses.do_process_response(model, delta)
+    end
+
+    test "parses response.output_text.done", %{model: model} do
+      done = %{"type" => "response.output_text.done"}
+
+      assert %LangChain.MessageDelta{status: :complete, role: :assistant} =
+               ChatOpenAIResponses.do_process_response(model, done)
+    end
+
+    test "parses function call added/delta/done sequence", %{model: model} do
+      added = %{
+        "type" => "response.output_item.added",
+        "output_index" => 0,
+        "item" => %{
+          "type" => "function_call",
+          "call_id" => "call_1",
+          "name" => "calc",
+          "arguments" => ""
+        }
+      }
+
+      %LangChain.MessageDelta{tool_calls: [call1]} =
+        ChatOpenAIResponses.do_process_response(model, added)
+
+      assert call1.type == :function
+      assert call1.name == "calc"
+      assert call1.call_id == "call_1"
+
+      arg_delta = %{
+        "type" => "response.function_call_arguments.delta",
+        "output_index" => 0,
+        "delta" => "{\"expression\": \"1+1\"}"
+      }
+
+      %LangChain.MessageDelta{tool_calls: [call2]} =
+        ChatOpenAIResponses.do_process_response(model, arg_delta)
+
+      assert call2.arguments == "{\"expression\": \"1+1\"}"
+
+      done = %{
+        "type" => "response.output_item.done",
+        "output_index" => 0,
+        "item" => %{
+          "type" => "function_call",
+          "call_id" => "call_1",
+          "name" => "calc",
+          "arguments" => "{\"expression\":\"1+1\"}"
+        }
+      }
+
+      %LangChain.MessageDelta{status: :complete, tool_calls: [call3]} =
+        ChatOpenAIResponses.do_process_response(model, done)
+
+      assert call3.status == :complete
+      assert call3.name == "calc"
+      assert call3.arguments == %{"expression" => "1+1"}
+    end
+
+    test "parses reasoning output_item.added event", %{model: model} do
+      event = %{
+        "type" => "response.output_item.added",
+        "sequence_number" => 2,
+        "output_index" => 0,
+        "item" => %{
+          "id" => "rs_077ecb7bd77f1554016940159a98d081909d82480668e57471",
+          "type" => "reasoning",
+          "summary" => []
+        }
+      }
+
+      result = ChatOpenAIResponses.do_process_response(model, event)
+      assert %LangChain.MessageDelta{} = result
+      assert result.status == :incomplete
+      assert result.role == :assistant
+      assert result.index == 0
+      assert %LangChain.Message.ContentPart{type: :thinking, content: ""} = result.content
+    end
+
+    test "parses response.reasoning.delta event", %{model: model} do
+      event = %{
+        "type" => "response.reasoning.delta",
+        "output_index" => 0,
+        "delta" => "Let me think about this problem..."
+      }
+
+      result = ChatOpenAIResponses.do_process_response(model, event)
+      assert %LangChain.MessageDelta{} = result
+      assert result.status == :incomplete
+      assert result.role == :assistant
+      assert result.index == 0
+
+      assert %LangChain.Message.ContentPart{
+               type: :thinking,
+               content: "Let me think about this problem..."
+             } = result.content
+    end
+
+    test "parses response.reasoning_text.delta event", %{model: model} do
+      event = %{
+        "type" => "response.reasoning_text.delta",
+        "output_index" => 0,
+        "content_index" => 0,
+        "item_id" => "msg_9804260c7f3d65a6",
+        "sequence_number" => 4,
+        "delta" => "We need to reason about this..."
+      }
+
+      result = ChatOpenAIResponses.do_process_response(model, event)
+      assert %LangChain.MessageDelta{} = result
+      assert result.status == :incomplete
+      assert result.role == :assistant
+      assert result.index == 0
+
+      assert %LangChain.Message.ContentPart{
+               type: :thinking,
+               content: "We need to reason about this..."
+             } = result.content
+    end
+
+    test "skips raw reasoning-text structural events", %{model: model} do
+      events = [
+        %{
+          "type" => "response.reasoning_part.added",
+          "output_index" => 0,
+          "content_index" => 0,
+          "item_id" => "msg_9804260c7f3d65a6",
+          "sequence_number" => 3,
+          "part" => %{"text" => "", "type" => "reasoning_text"}
+        },
+        %{"type" => "response.reasoning_text.done", "text" => "full reasoning"},
+        %{"type" => "response.reasoning_part.done"}
+      ]
+
+      for event <- events do
+        assert :skip == ChatOpenAIResponses.do_process_response(model, event)
+      end
+    end
+
+    test "parses reasoning output_item.done event", %{model: model} do
+      event = %{
+        "type" => "response.output_item.done",
+        "sequence_number" => 3,
+        "output_index" => 0,
+        "item" => %{
+          "id" => "rs_063b9657f7c2e68601694016d7008881909a128744538cebec",
+          "type" => "reasoning",
+          "summary" => []
+        }
+      }
+
+      result = ChatOpenAIResponses.do_process_response(model, event)
+      assert %LangChain.MessageDelta{} = result
+      assert result.status == :complete
+      assert result.role == :assistant
+      assert result.index == 0
+      assert %LangChain.Message.ContentPart{type: :thinking, content: ""} = result.content
+    end
+
+    test "parses response.output_text.delta with output_index", %{model: model} do
+      delta = %{
+        "type" => "response.output_text.delta",
+        "output_index" => 1,
+        "delta" => "Hello"
+      }
+
+      result = ChatOpenAIResponses.do_process_response(model, delta)
+
+      assert %LangChain.MessageDelta{
+               content: "Hello",
+               status: :incomplete,
+               role: :assistant,
+               index: 1
+             } = result
+    end
+
+    test "parses response.completed with token usage", %{model: model} do
+      completed = %{
+        "type" => "response.completed",
+        "response" => %{"usage" => %{"input_tokens" => 5, "output_tokens" => 2}}
+      }
+
+      %LangChain.MessageDelta{metadata: %{usage: %LangChain.TokenUsage{input: 5, output: 2}}} =
+        ChatOpenAIResponses.do_process_response(model, completed)
+    end
+
+    test "handles response.failed streaming event", %{model: model} do
+      failed_event = %{
+        "type" => "response.failed",
+        "response" => %{
+          "status" => "failed",
+          "error" => %{
+            "code" => "timeout",
+            "message" => "Request timed out"
+          }
+        }
+      }
+
+      assert {:error, %LangChain.LangChainError{} = error} =
+               ChatOpenAIResponses.do_process_response(model, failed_event)
+
+      # Uses actual error code from response for better error categorization
+      assert error.type == "timeout"
+      assert error.message =~ "Request timed out"
+    end
+
+    test "fires on_llm_reasoning_delta callback for reasoning_summary_text.delta", %{model: model} do
+      test_pid = self()
+
+      model_with_callback = %{
+        model
+        | callbacks: [
+            %{on_llm_reasoning_delta: fn delta -> send(test_pid, {:reasoning_delta, delta}) end}
+          ]
+      }
+
+      event = %{
+        "type" => "response.reasoning_summary_text.delta",
+        "delta" => "Let me think..."
+      }
+
+      assert :skip == ChatOpenAIResponses.do_process_response(model_with_callback, event)
+      assert_received {:reasoning_delta, "Let me think..."}
+    end
+
+    test "fires on_llm_reasoning_delta callback for reasoning_summary.delta", %{model: model} do
+      test_pid = self()
+
+      model_with_callback = %{
+        model
+        | callbacks: [
+            %{on_llm_reasoning_delta: fn delta -> send(test_pid, {:reasoning_delta, delta}) end}
+          ]
+      }
+
+      event = %{
+        "type" => "response.reasoning_summary.delta",
+        "delta" => "Reasoning step..."
+      }
+
+      assert :skip == ChatOpenAIResponses.do_process_response(model_with_callback, event)
+      assert_received {:reasoning_delta, "Reasoning step..."}
+    end
+
+    test "skips reasoning summary non-delta events without callback", %{model: model} do
+      events = [
+        %{"type" => "response.reasoning_summary_text.done"},
+        %{"type" => "response.reasoning_summary_part.added"},
+        %{"type" => "response.reasoning_summary_part.done"},
+        %{"type" => "response.reasoning_summary.done"}
+      ]
+
+      for event <- events do
+        assert :skip == ChatOpenAIResponses.do_process_response(model, event)
+      end
+    end
+
+    test "skips expected streaming events", %{model: model} do
+      events_to_skip = [
+        %{"type" => "response.created"},
+        %{"type" => "response.in_progress"},
+        %{"type" => "response.content_part.added"},
+        %{"type" => "response.content_part.done"},
+        %{"type" => "response.function_call_arguments.done"},
+        %{"type" => "response.queued"}
+      ]
+
+      for event <- events_to_skip do
+        assert :skip == ChatOpenAIResponses.do_process_response(model, event)
+      end
+    end
+
+    test "skips Azure keepalive events", %{model: model} do
+      event = %{"type" => "keepalive", "sequence_number" => 3}
+      assert :skip == ChatOpenAIResponses.do_process_response(model, event)
+    end
+
+    test "handles list of streaming events", %{model: model} do
+      events = [
+        %{"type" => "response.output_text.delta", "delta" => "Hello"},
+        %{"type" => "response.output_text.delta", "delta" => " world"},
+        %{"type" => "response.output_text.done"}
+      ]
+
+      results = ChatOpenAIResponses.do_process_response(model, events)
+      assert is_list(results)
+      assert length(results) == 3
+
+      [d1, d2, done] = results
+      assert %LangChain.MessageDelta{content: "Hello", status: :incomplete} = d1
+      assert %LangChain.MessageDelta{content: " world", status: :incomplete} = d2
+      assert %LangChain.MessageDelta{status: :complete} = done
+    end
+  end
+
+  describe "do_process_response non-streaming citations" do
+    setup do
+      %{model: ChatOpenAIResponses.new!(%{"model" => @test_model})}
+    end
+
+    test "parses url_citation annotations from output_text", %{model: model} do
+      response = %{
+        "status" => "completed",
+        "output" => [
+          %{
+            "type" => "message",
+            "content" => [
+              %{
+                "type" => "output_text",
+                "text" => "Spain won the 2024 European Championship.",
+                "annotations" => [
+                  %{
+                    "type" => "url_citation",
+                    "title" => "UEFA Euro 2024",
+                    "url" => "https://example.com/euro2024",
+                    "start_index" => 0,
+                    "end_index" => 41
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+
+      result = ChatOpenAIResponses.do_process_response(model, response)
+      assert %LangChain.Message{} = result
+      assert result.role == :assistant
+      assert result.status == :complete
+
+      [content_part] = result.content
+      assert content_part.type == :text
+      assert content_part.content == "Spain won the 2024 European Championship."
+
+      assert [%LangChain.Message.Citation{} = citation] = content_part.citations
+      assert citation.source.type == :web
+      assert citation.source.title == "UEFA Euro 2024"
+      assert citation.source.url == "https://example.com/euro2024"
+      assert citation.start_index == 0
+      assert citation.end_index == 41
+      assert citation.metadata["provider_type"] == "url_citation"
+    end
+
+    test "parses file_citation annotations from output_text", %{model: model} do
+      response = %{
+        "status" => "completed",
+        "output" => [
+          %{
+            "type" => "message",
+            "content" => [
+              %{
+                "type" => "output_text",
+                "text" => "The quarterly report shows growth.",
+                "annotations" => [
+                  %{
+                    "type" => "file_citation",
+                    "file_id" => "file-abc123",
+                    "filename" => "Q4_Report.pdf",
+                    "start_index" => 0,
+                    "end_index" => 33
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+
+      result = ChatOpenAIResponses.do_process_response(model, response)
+      [content_part] = result.content
+
+      assert [%LangChain.Message.Citation{} = citation] = content_part.citations
+      assert citation.source.type == :document
+      assert citation.source.document_id == "file-abc123"
+      assert citation.source.title == "Q4_Report.pdf"
+      assert citation.source.metadata["filename"] == "Q4_Report.pdf"
+      assert citation.start_index == 0
+      assert citation.end_index == 33
+      assert citation.metadata["provider_type"] == "file_citation"
+    end
+
+    test "handles output_text with no annotations", %{model: model} do
+      response = %{
+        "status" => "completed",
+        "output" => [
+          %{
+            "type" => "message",
+            "content" => [
+              %{"type" => "output_text", "text" => "Hello, world!"}
+            ]
+          }
+        ]
+      }
+
+      result = ChatOpenAIResponses.do_process_response(model, response)
+      [content_part] = result.content
+      assert content_part.content == "Hello, world!"
+      assert content_part.citations == []
+    end
+
+    test "handles output_text with empty annotations list", %{model: model} do
+      response = %{
+        "status" => "completed",
+        "output" => [
+          %{
+            "type" => "message",
+            "content" => [
+              %{
+                "type" => "output_text",
+                "text" => "Hello, world!",
+                "annotations" => []
+              }
+            ]
+          }
+        ]
+      }
+
+      result = ChatOpenAIResponses.do_process_response(model, response)
+      [content_part] = result.content
+      assert content_part.content == "Hello, world!"
+      assert content_part.citations == []
+    end
+
+    test "parses multiple annotations on a single output_text", %{model: model} do
+      response = %{
+        "status" => "completed",
+        "output" => [
+          %{
+            "type" => "message",
+            "content" => [
+              %{
+                "type" => "output_text",
+                "text" => "Spain won Euro 2024. France came second.",
+                "annotations" => [
+                  %{
+                    "type" => "url_citation",
+                    "title" => "Euro 2024 Final",
+                    "url" => "https://example.com/final",
+                    "start_index" => 0,
+                    "end_index" => 20
+                  },
+                  %{
+                    "type" => "url_citation",
+                    "title" => "Euro 2024 Standings",
+                    "url" => "https://example.com/standings",
+                    "start_index" => 21,
+                    "end_index" => 40
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+
+      result = ChatOpenAIResponses.do_process_response(model, response)
+      [content_part] = result.content
+      assert length(content_part.citations) == 2
+
+      [c1, c2] = content_part.citations
+      assert c1.source.url == "https://example.com/final"
+      assert c2.source.url == "https://example.com/standings"
+
+      # Also verify Message.all_citations/1
+      all = LangChain.Message.all_citations(result)
+      assert length(all) == 2
+    end
+  end
+
+  describe "do_process_response streaming citations" do
+    setup do
+      %{model: ChatOpenAIResponses.new!(%{"model" => @test_model})}
+    end
+
+    test "handles annotation.added streaming event", %{model: model} do
+      event = %{
+        "type" => "response.output_text.annotation.added",
+        "annotation" => %{
+          "type" => "url_citation",
+          "title" => "UEFA Euro 2024",
+          "url" => "https://example.com/euro2024",
+          "start_index" => 0,
+          "end_index" => 41
+        },
+        "output_index" => 0,
+        "content_index" => 0
+      }
+
+      result = ChatOpenAIResponses.do_process_response(model, event)
+      assert %LangChain.MessageDelta{} = result
+      assert result.role == :assistant
+      assert result.status == :incomplete
+      assert result.index == 0
+
+      assert %LangChain.Message.ContentPart{} = part = result.content
+      assert part.type == :text
+      assert part.content == nil
+      assert [%LangChain.Message.Citation{} = citation] = part.citations
+      assert citation.source.type == :web
+      assert citation.source.title == "UEFA Euro 2024"
+      assert citation.source.url == "https://example.com/euro2024"
+      assert citation.start_index == 0
+      assert citation.end_index == 41
+      assert citation.metadata["provider_type"] == "url_citation"
+    end
+
+    test "accumulates annotations across streaming deltas", %{model: model} do
+      events = [
+        %{"type" => "response.output_text.delta", "output_index" => 0, "delta" => "Spain won "},
+        %{
+          "type" => "response.output_text.delta",
+          "output_index" => 0,
+          "delta" => "the 2024 European Championship."
+        },
+        %{
+          "type" => "response.output_text.annotation.added",
+          "annotation" => %{
+            "type" => "url_citation",
+            "title" => "Euro 2024",
+            "url" => "https://example.com/euro2024",
+            "start_index" => 0,
+            "end_index" => 41
+          },
+          "output_index" => 0,
+          "content_index" => 0
+        },
+        %{
+          "type" => "response.completed",
+          "response" => %{"usage" => %{"input_tokens" => 10, "output_tokens" => 8}}
+        }
+      ]
+
+      deltas =
+        events
+        |> Enum.map(&ChatOpenAIResponses.do_process_response(model, &1))
+        |> Enum.reject(&(&1 == :skip))
+
+      assert length(deltas) == 4
+
+      {:ok, %LangChain.Message{} = merged} =
+        LangChain.MessageDelta.merge_deltas(deltas) |> LangChain.MessageDelta.to_message()
+
+      assert merged.status == :complete
+      assert merged.role == :assistant
+
+      assert [%LangChain.Message.ContentPart{} = part] = merged.content
+      assert part.content == "Spain won the 2024 European Championship."
+      assert [%LangChain.Message.Citation{} = citation] = part.citations
+      assert citation.source.type == :web
+      assert citation.source.url == "https://example.com/euro2024"
+    end
+
+    test "accumulates multiple annotations in sequence", %{model: model} do
+      events = [
+        %{
+          "type" => "response.output_text.delta",
+          "output_index" => 0,
+          "delta" => "Spain won Euro 2024. France came second."
+        },
+        %{
+          "type" => "response.output_text.annotation.added",
+          "annotation" => %{
+            "type" => "url_citation",
+            "title" => "Euro 2024 Final",
+            "url" => "https://example.com/final",
+            "start_index" => 0,
+            "end_index" => 20
+          },
+          "output_index" => 0,
+          "content_index" => 0
+        },
+        %{
+          "type" => "response.output_text.annotation.added",
+          "annotation" => %{
+            "type" => "url_citation",
+            "title" => "Euro 2024 Standings",
+            "url" => "https://example.com/standings",
+            "start_index" => 21,
+            "end_index" => 40
+          },
+          "output_index" => 0,
+          "content_index" => 0
+        },
+        %{
+          "type" => "response.output_text.annotation.added",
+          "annotation" => %{
+            "type" => "url_citation",
+            "title" => "Euro 2024 Teams",
+            "url" => "https://example.com/teams",
+            "start_index" => 0,
+            "end_index" => 40
+          },
+          "output_index" => 0,
+          "content_index" => 0
+        },
+        %{"type" => "response.output_text.done"},
+        %{
+          "type" => "response.completed",
+          "response" => %{"usage" => %{"input_tokens" => 10, "output_tokens" => 8}}
+        }
+      ]
+
+      deltas =
+        events
+        |> Enum.map(&ChatOpenAIResponses.do_process_response(model, &1))
+        |> Enum.reject(&(&1 == :skip))
+
+      {:ok, %LangChain.Message{} = merged} =
+        LangChain.MessageDelta.merge_deltas(deltas) |> LangChain.MessageDelta.to_message()
+
+      assert [%LangChain.Message.ContentPart{} = part] = merged.content
+      assert part.content == "Spain won Euro 2024. France came second."
+      assert length(part.citations) == 3
+
+      urls = Enum.map(part.citations, & &1.source.url)
+      assert "https://example.com/final" in urls
+      assert "https://example.com/standings" in urls
+      assert "https://example.com/teams" in urls
+    end
+
+    test "annotation.added is no longer skipped", %{model: model} do
+      event = %{
+        "type" => "response.output_text.annotation.added",
+        "annotation" => %{
+          "type" => "url_citation",
+          "title" => "Test",
+          "url" => "https://example.com",
+          "start_index" => 0,
+          "end_index" => 10
+        },
+        "output_index" => 0,
+        "content_index" => 0
+      }
+
+      result = ChatOpenAIResponses.do_process_response(model, event)
+      refute result == :skip
+      assert %LangChain.MessageDelta{} = result
+    end
+  end
+
+  describe "decode_stream/1" do
+    test "decodes event-based streaming format" do
+      raw = "event: response.output_text.delta\ndata: {\"delta\": \"Hi\"}\n\n"
+      {[parsed], buffer} = ChatOpenAIResponses.decode_stream({raw, ""})
+
+      assert parsed == %{"delta" => "Hi"}
+      assert buffer == ""
+    end
+
+    test "handles multiple events in one chunk" do
+      raw =
+        "event: response.output_text.delta\ndata: {\"delta\": \"A\"}\n\nevent: response.output_text.delta\ndata: {\"delta\": \"B\"}\n\n"
+
+      {parsed, buffer} = ChatOpenAIResponses.decode_stream({raw, ""})
+
+      assert length(parsed) == 2
+      assert buffer == ""
+    end
+
+    test "handles incomplete JSON across chunks" do
+      chunk1 = "event: response.output_text.delta\ndata: {\"del"
+      chunk2 = "ta\": \"test\"}\n\n"
+
+      {[], buffer1} = ChatOpenAIResponses.decode_stream({chunk1, ""})
+      assert buffer1 != ""
+
+      {[parsed], buffer2} = ChatOpenAIResponses.decode_stream({chunk2, buffer1})
+      assert parsed == %{"delta" => "test"}
+      assert buffer2 == ""
+    end
+
+    test "handles event line and data line split across chunks" do
+      chunk1 = "event: response.output_text.done\n"
+      chunk2 = "data: {\"type\":\"response.output_text.done\",\"text\":\"Hello\"}\n\n"
+
+      {[], buffer1} = ChatOpenAIResponses.decode_stream({chunk1, ""})
+
+      {[parsed], buffer2} = ChatOpenAIResponses.decode_stream({chunk2, buffer1})
+      assert parsed["type"] == "response.output_text.done"
+      assert parsed["text"] == "Hello"
+      assert buffer2 == ""
+    end
+
+    test "handles multiple complete events followed by more events" do
+      chunk1 =
+        "event: response.created\ndata: {\"type\":\"response.created\"}\n\n" <>
+          "event: response.in_progress\ndata: {\"type\":\"response.in_progress\"}\n\n"
+
+      chunk2 =
+        "event: response.output_text.done\ndata: {\"type\":\"response.output_text.done\",\"text\":\"Hi!\"}\n\n"
+
+      {parsed1, buffer1} = ChatOpenAIResponses.decode_stream({chunk1, ""})
+      assert length(parsed1) == 2
+      assert buffer1 == ""
+
+      {[parsed2], buffer2} = ChatOpenAIResponses.decode_stream({chunk2, buffer1})
+      assert parsed2["text"] == "Hi!"
+      assert buffer2 == ""
+    end
+
+    test "handles data line without space after colon" do
+      raw = "event: response.output_text.delta\ndata:{\"delta\":\"Hi\"}\n\n"
+
+      {[parsed], buffer} = ChatOpenAIResponses.decode_stream({raw, ""})
+      assert parsed == %{"delta" => "Hi"}
+      assert buffer == ""
+    end
+  end
+
+  describe "service_tier" do
+    test "is not sent when not set" do
+      openai = ChatOpenAIResponses.new!(%{"model" => @test_model})
+
+      refute Map.has_key?(ChatOpenAIResponses.for_api(openai, [], []), :service_tier)
+    end
+
+    test "is sent when set" do
+      openai = ChatOpenAIResponses.new!(%{"model" => @test_model, "service_tier" => "flex"})
+
+      assert %{service_tier: "flex"} = ChatOpenAIResponses.for_api(openai, [], [])
+    end
+
+    test "the served tier is kept in the token usage of a completed response" do
+      model = ChatOpenAIResponses.new!(%{"model" => @test_model})
+
+      response = %{
+        "status" => "completed",
+        "service_tier" => "flex",
+        "output" => [
+          %{
+            "type" => "message",
+            "role" => "assistant",
+            "status" => "completed",
+            "content" => [%{"type" => "output_text", "text" => "hello", "annotations" => []}]
+          }
+        ],
+        "usage" => %{"input_tokens" => 27, "output_tokens" => 5, "total_tokens" => 32}
+      }
+
+      assert %Message{metadata: %{usage: %LangChain.TokenUsage{raw: raw}}} =
+               ChatOpenAIResponses.do_process_response(model, response)
+
+      assert raw["service_tier"] == "flex"
+    end
+
+    test "the served tier is kept in the token usage of a streamed response.completed event" do
+      model = ChatOpenAIResponses.new!(%{"model" => @test_model, "stream" => true})
+
+      completed = %{
+        "type" => "response.completed",
+        "response" => %{
+          "service_tier" => "priority",
+          "usage" => %{"input_tokens" => 5, "output_tokens" => 2}
+        }
+      }
+
+      assert %LangChain.MessageDelta{
+               metadata: %{usage: %LangChain.TokenUsage{raw: %{"service_tier" => "priority"}}}
+             } = ChatOpenAIResponses.do_process_response(model, completed)
+    end
+  end
+
+  describe "extra_body" do
+    test "values override computed keys and add new ones" do
+      openai =
+        ChatOpenAIResponses.new!(%{
+          "model" => @test_model,
+          "max_output_tokens" => 1000,
+          "extra_body" => %{"max_output_tokens" => 10, "prompt_cache_key" => "user-123"}
+        })
+
+      data = ChatOpenAIResponses.for_api(openai, [], [])
+      assert data.max_output_tokens == 10
+      refute Map.has_key?(data, "max_output_tokens")
+      assert data["prompt_cache_key"] == "user-123"
+    end
+
+    test "service_tier and extra_body survive a serialize and restore round trip" do
+      original =
+        ChatOpenAIResponses.new!(%{
+          "model" => @test_model,
+          "service_tier" => "flex",
+          "extra_body" => %{"prompt_cache_key" => "user-123"}
+        })
+
+      config = ChatOpenAIResponses.serialize_config(original)
+      assert config["service_tier"] == "flex"
+      assert config["extra_body"] == %{"prompt_cache_key" => "user-123"}
+
+      assert {:ok, restored} = ChatOpenAIResponses.restore_from_map(config)
+
+      assert ChatOpenAIResponses.for_api(restored, [], []) ==
+               ChatOpenAIResponses.for_api(original, [], [])
+    end
+  end
+
+  describe "serialize and restore" do
+    test "serializes and restores config" do
+      original =
+        ChatOpenAIResponses.new!(%{
+          "model" => @test_model,
+          "temperature" => 0.7,
+          "endpoint" => "https://custom.api/v1/responses",
+          "reasoning" => %{"effort" => "high"}
+        })
+
+      config = ChatOpenAIResponses.serialize_config(original)
+      assert config["model"] == @test_model
+      assert config["temperature"] == 0.7
+      assert config["endpoint"] == "https://custom.api/v1/responses"
+      assert config["reasoning"]["effort"] == "high"
+
+      {:ok, restored} = ChatOpenAIResponses.restore_from_map(config)
+      assert restored.model == original.model
+      assert restored.temperature == original.temperature
+      assert restored.endpoint == original.endpoint
+      assert restored.reasoning.effort == original.reasoning.effort
+    end
+
+    test "serializes and restores context management" do
+      original =
+        ChatOpenAIResponses.new!(%{
+          context_management: [%{type: "compaction", compact_threshold: 300_000}]
+        })
+
+      config = ChatOpenAIResponses.serialize_config(original)
+
+      assert config["context_management"] == [
+               %{"type" => "compaction", "compact_threshold" => 300_000}
+             ]
+
+      assert {:ok,
+              %ChatOpenAIResponses{
+                context_management: [
+                  %{"type" => "compaction", "compact_threshold" => 300_000}
+                ]
+              }} = ChatOpenAIResponses.restore_from_map(config)
+    end
+  end
+
+  describe "previous_response_id" do
+    test "accepts previous_response_id in new/1" do
+      {:ok, model} =
+        ChatOpenAIResponses.new(%{
+          "model" => @test_model,
+          "previous_response_id" => "resp_abc123"
+        })
+
+      assert model.previous_response_id == "resp_abc123"
+    end
+
+    test "includes previous_response_id in API request when set" do
+      model =
+        ChatOpenAIResponses.new!(%{
+          "model" => @test_model,
+          "previous_response_id" => "resp_previous_123"
+        })
+
+      api_data = ChatOpenAIResponses.for_api(model, [], [])
+      assert api_data.previous_response_id == "resp_previous_123"
+    end
+
+    test "omits previous_response_id from API request when nil" do
+      model = ChatOpenAIResponses.new!(%{"model" => @test_model})
+
+      api_data = ChatOpenAIResponses.for_api(model, [], [])
+      refute Map.has_key?(api_data, :previous_response_id)
+    end
+
+    test "extracts response_id from completed response and adds to metadata" do
+      model = ChatOpenAIResponses.new!(%{"model" => @test_model})
+
+      response = %{
+        "id" => "resp_new_456",
+        "status" => "completed",
+        "output" => [
+          %{
+            "type" => "message",
+            "content" => [%{"type" => "output_text", "text" => "Hello!"}]
+          }
+        ]
+      }
+
+      result = ChatOpenAIResponses.do_process_response(model, response)
+      assert %LangChain.Message{} = result
+      assert result.metadata.response_id == "resp_new_456"
+    end
+
+    test "extracts response_id from streaming response.completed event" do
+      model = ChatOpenAIResponses.new!(%{"model" => @test_model})
+
+      completed_event = %{
+        "type" => "response.completed",
+        "response" => %{
+          "id" => "resp_stream_789",
+          "usage" => %{"input_tokens" => 10, "output_tokens" => 5}
+        }
+      }
+
+      result = ChatOpenAIResponses.do_process_response(model, completed_event)
+      assert %LangChain.MessageDelta{} = result
+      assert result.metadata.response_id == "resp_stream_789"
+    end
+
+    test "conversation continuity pattern: response_id becomes previous_response_id" do
+      # First call - no previous_response_id
+      model1 = ChatOpenAIResponses.new!(%{"model" => @test_model})
+      api_data1 = ChatOpenAIResponses.for_api(model1, [], [])
+      refute Map.has_key?(api_data1, :previous_response_id)
+
+      # Simulate response with id
+      response1 = %{
+        "id" => "resp_first_call",
+        "status" => "completed",
+        "output" => [
+          %{
+            "type" => "message",
+            "content" => [%{"type" => "output_text", "text" => "First response"}]
+          }
+        ]
+      }
+
+      message1 = ChatOpenAIResponses.do_process_response(model1, response1)
+      assert message1.metadata.response_id == "resp_first_call"
+
+      # Second call - use response_id from first call as previous_response_id
+      model2 =
+        ChatOpenAIResponses.new!(%{
+          "model" => @test_model,
+          "previous_response_id" => message1.metadata.response_id
+        })
+
+      api_data2 = ChatOpenAIResponses.for_api(model2, [], [])
+      assert api_data2.previous_response_id == "resp_first_call"
+    end
+  end
+
+  describe "streaming error handling" do
+    test "returns error when streaming response contains an API error" do
+      expect(Req, :post, fn _req_struct, _opts ->
+        response = %Req.Response{
+          status: 400,
+          body: {:error, LangChain.LangChainError.exception(message: "Unsupported parameter")}
+        }
+
+        {:ok, response}
+      end)
+
+      model =
+        ChatOpenAIResponses.new!(%{stream: true, model: @test_model})
+
+      assert {:error, %LangChain.LangChainError{} = error} =
+               ChatOpenAIResponses.call(model, "prompt", [])
+
+      assert error.message == "Unsupported parameter"
+    end
+  end
+
+  describe "retry_count" do
+    test "defaults to 2" do
+      model = ChatOpenAIResponses.new!(%{model: @test_model})
+      assert model.retry_count == 2
+    end
+
+    test "is configurable via new/1" do
+      model = ChatOpenAIResponses.new!(%{model: @test_model, retry_count: 1})
+      assert model.retry_count == 1
+    end
+
+    test "retry_count controls the number of retries after the initial attempt" do
+      call_count = :counters.new(1, [])
+
+      stub(Req, :post, fn _req_struct ->
+        count = :counters.get(call_count, 1) + 1
+        :counters.put(call_count, 1, count)
+        {:error, %Req.TransportError{reason: :closed}}
+      end)
+
+      # retry_count: 2 = 1 initial attempt + 2 retries = 3 total HTTP requests
+      model = ChatOpenAIResponses.new!(%{stream: false, model: @test_model, retry_count: 2})
+
+      assert {:error, %LangChain.LangChainError{message: "Retries exceeded. Connection failed."}} =
+               ChatOpenAIResponses.call(model, "prompt", [])
+
+      assert :counters.get(call_count, 1) == 3
+    end
+
+    test "retry_count: 0 makes one attempt with no retries" do
+      call_count = :counters.new(1, [])
+
+      stub(Req, :post, fn _req_struct ->
+        count = :counters.get(call_count, 1) + 1
+        :counters.put(call_count, 1, count)
+        {:error, %Req.TransportError{reason: :closed}}
+      end)
+
+      model = ChatOpenAIResponses.new!(%{stream: false, model: @test_model, retry_count: 0})
+
+      assert {:error, %LangChain.LangChainError{message: "Retries exceeded. Connection failed."}} =
+               ChatOpenAIResponses.call(model, "prompt", [])
+
+      # Exactly 1 HTTP request, no retries
+      assert :counters.get(call_count, 1) == 1
+    end
+  end
+
+  describe "req_config" do
+    test "disables Req-level retry by default to avoid compounding with LangChain retries" do
+      expect(Req, :post, fn req_struct ->
+        # Req retry must be disabled by default. LangChain has its own retry on
+        # :closed (stale pooled connections). If Req also retries :closed, 503, and
+        # 429, a single call can produce up to 12 HTTP requests (3 LangChain retries
+        # x 4 Req attempts). Server errors should bubble up to the caller (e.g. Oban)
+        # who has the context for proper backoff. See GitHub issue #503.
+        assert req_struct.options.retry == false
+
+        {:error, RuntimeError.exception("Something went wrong")}
+      end)
+
+      model = ChatOpenAIResponses.new!(%{stream: false, model: @test_model})
+
+      assert {:error, _} = ChatOpenAIResponses.call(model, "prompt", [])
+      verify!()
+    end
+
+    test "merges req_config into the request (non-streaming)" do
+      expect(Req, :post, fn req_struct ->
+        assert req_struct.options.retry == false
+
+        {:error, RuntimeError.exception("Something went wrong")}
+      end)
+
+      model =
+        ChatOpenAIResponses.new!(%{
+          stream: false,
+          model: @test_model,
+          req_config: %{retry: false}
+        })
+
+      assert {:error, _} = ChatOpenAIResponses.call(model, "prompt", [])
+      verify!()
+    end
+
+    test "merges req_config into the request (streaming)" do
+      expect(Req, :post, fn req_struct, _opts ->
+        assert req_struct.options.retry == false
+
+        {:error, RuntimeError.exception("Something went wrong")}
+      end)
+
+      model =
+        ChatOpenAIResponses.new!(%{stream: true, model: @test_model, req_config: %{retry: false}})
+
+      assert {:error, _} = ChatOpenAIResponses.call(model, "prompt", [])
+      verify!()
+    end
+  end
+
+  describe "websocket transport" do
+    test "new/1 accepts websocket option" do
+      fake_pid = spawn(fn -> :ok end)
+
+      assert {:ok, %ChatOpenAIResponses{websocket: ^fake_pid}} =
+               ChatOpenAIResponses.new(%{model: @test_model, websocket: fake_pid})
+    end
+
+    test "new/1 defaults websocket to nil" do
+      assert {:ok, %ChatOpenAIResponses{websocket: nil}} =
+               ChatOpenAIResponses.new(%{model: @test_model})
+    end
+
+    test "do_api_request with websocket wraps shared payload in response.create envelope (non-streaming)" do
+      fake_pid = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(fake_pid, :kill) end)
+
+      completed_response = %{
+        "status" => "completed",
+        "output" => [
+          %{
+            "type" => "message",
+            "role" => "assistant",
+            "content" => [%{"type" => "output_text", "text" => "Hello from WebSocket!"}]
+          }
+        ],
+        "usage" => %{
+          "input_tokens" => 10,
+          "output_tokens" => 5,
+          "total_tokens" => 15
+        },
+        "id" => "resp_ws_123"
+      }
+
+      LangChain.WebSocket
+      |> expect(:send_and_collect, fn ^fake_pid, payload, _done_fn, _opts ->
+        assert is_binary(payload)
+        decoded = Jason.decode!(payload)
+        # Verify the WebSocket envelope format
+        assert decoded["type"] == "response.create"
+        assert decoded["model"] == @test_model
+        assert is_list(decoded["input"])
+
+        assert decoded["context_management"] == [
+                 %{"type" => "compaction", "compact_threshold" => 300_000}
+               ]
+
+        assert decoded["prompt_cache_key"] == "shared-reference-v1"
+        assert decoded["prompt_cache_options"] == %{"mode" => "explicit", "ttl" => "30m"}
+
+        assert [
+                 %{"content" => [%{"prompt_cache_breakpoint" => %{"mode" => "explicit"}}]}
+               ] = decoded["input"]
+
+        # These should be stripped for WebSocket
+        refute Map.has_key?(decoded, "stream")
+        refute Map.has_key?(decoded, "temperature")
+        refute Map.has_key?(decoded, "top_p")
+
+        {:ok,
+         [
+           %{"type" => "response.created"},
+           %{"type" => "response.completed", "response" => completed_response}
+         ]}
+      end)
+
+      model =
+        ChatOpenAIResponses.new!(%{
+          model: @test_model,
+          stream: false,
+          context_management: [%{type: "compaction", compact_threshold: 300_000}],
+          prompt_cache_key: "shared-reference-v1",
+          prompt_cache_options: %{mode: "explicit", ttl: "30m"},
+          websocket: fake_pid
+        })
+
+      message =
+        Message.new_user!([
+          ContentPart.text!("Reference", prompt_cache_breakpoint: %{mode: "explicit"})
+        ])
+
+      assert %Message{role: :assistant, content: content} =
+               ChatOpenAIResponses.do_api_request(model, [message], [])
+
+      assert [%LangChain.Message.ContentPart{type: :text, content: "Hello from WebSocket!"}] =
+               content
+
+      verify!()
+    end
+
+    test "do_api_request with websocket drops transport keys supplied through extra_body" do
+      fake_pid = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(fake_pid, :kill) end)
+
+      completed_response = %{
+        "status" => "completed",
+        "output" => [
+          %{
+            "type" => "message",
+            "role" => "assistant",
+            "content" => [%{"type" => "output_text", "text" => "Hi"}]
+          }
+        ],
+        "usage" => %{"input_tokens" => 3, "output_tokens" => 1, "total_tokens" => 4},
+        "id" => "resp_ws_456"
+      }
+
+      LangChain.WebSocket
+      |> expect(:send_and_collect, fn ^fake_pid, payload, _done_fn, _opts ->
+        decoded = Jason.decode!(payload)
+
+        refute Map.has_key?(decoded, "temperature")
+        refute Map.has_key?(decoded, "top_p")
+        refute Map.has_key?(decoded, "stream")
+        assert decoded["service_tier"] == "flex"
+        assert decoded["prompt_cache_key"] == "user-123"
+
+        {:ok, [%{"type" => "response.completed", "response" => completed_response}]}
+      end)
+
+      model =
+        ChatOpenAIResponses.new!(%{
+          model: @test_model,
+          stream: false,
+          service_tier: "flex",
+          extra_body: %{"temperature" => 0.5, "top_p" => 0.9, "prompt_cache_key" => "user-123"},
+          websocket: fake_pid
+        })
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert %Message{role: :assistant} =
+                   ChatOpenAIResponses.do_api_request(model, [Message.new_user!("Hi")], [])
+        end)
+
+      assert log =~ "dropping :temperature and :top_p"
+      verify!()
+    end
+
+    test "do_api_request with websocket pid delegates to WebSocket (streaming)" do
+      fake_pid = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(fake_pid, :kill) end)
+
+      LangChain.WebSocket
+      |> expect(:send_and_stream, fn ^fake_pid, payload, callback_fn, _done_fn, _opts ->
+        assert is_binary(payload)
+        decoded = Jason.decode!(payload)
+        assert decoded["type"] == "response.create"
+
+        # Simulate streaming events
+        results = [
+          callback_fn.(%{"type" => "response.created"}),
+          callback_fn.(%{
+            "type" => "response.output_text.delta",
+            "output_index" => 0,
+            "delta" => "Hello"
+          }),
+          callback_fn.(%{
+            "type" => "response.output_text.delta",
+            "output_index" => 0,
+            "delta" => " world"
+          }),
+          callback_fn.(%{
+            "type" => "response.completed",
+            "response" => %{
+              "status" => "completed",
+              "usage" => %{
+                "input_tokens" => 10,
+                "output_tokens" => 5,
+                "total_tokens" => 15
+              },
+              "id" => "resp_ws_456"
+            }
+          })
+        ]
+
+        {:ok, results}
+      end)
+
+      model =
+        ChatOpenAIResponses.new!(%{
+          model: @test_model,
+          stream: true,
+          websocket: fake_pid
+        })
+
+      result = ChatOpenAIResponses.do_api_request(model, [Message.new_user!("Hi")], [])
+
+      assert is_list(result)
+      # Should contain MessageDeltas (skipping :skip results)
+      deltas = Enum.filter(result, &match?(%MessageDelta{}, &1))
+      assert length(deltas) > 0
+
+      verify!()
+    end
+
+    test "connect_websocket! sets websocket pid on model" do
+      LangChain.WebSocket
+      |> expect(:start_link, fn opts ->
+        assert opts[:url] == "wss://api.openai.com/v1/responses"
+        assert [{"authorization", "Bearer " <> _}] = opts[:headers]
+        {:ok, spawn(fn -> Process.sleep(:infinity) end)}
+      end)
+
+      model =
+        ChatOpenAIResponses.new!(%{model: @test_model})
+        |> ChatOpenAIResponses.connect_websocket!()
+
+      assert is_pid(model.websocket)
+      on_exit(fn -> Process.exit(model.websocket, :kill) end)
+      verify!()
+    end
+
+    test "connect_websocket! derives the WebSocket scheme from the endpoint" do
+      LangChain.WebSocket
+      |> expect(:start_link, fn opts ->
+        assert opts[:url] == "wss://proxy.internal.example/v1/responses"
+        {:ok, spawn(fn -> Process.sleep(:infinity) end)}
+      end)
+      |> expect(:start_link, fn opts ->
+        assert opts[:url] == "ws://localhost:8080/v1/responses"
+        {:ok, spawn(fn -> Process.sleep(:infinity) end)}
+      end)
+
+      # An https endpoint always upgrades to the TLS-backed wss scheme.
+      secure =
+        ChatOpenAIResponses.new!(%{
+          model: @test_model,
+          endpoint: "https://proxy.internal.example/v1/responses"
+        })
+        |> ChatOpenAIResponses.connect_websocket!()
+
+      # A plaintext endpoint stays plaintext. Rewriting it to wss would make
+      # Mint open a TLS connection to a server that speaks none, so the
+      # connection fails instead of becoming secure.
+      plain =
+        ChatOpenAIResponses.new!(%{
+          model: @test_model,
+          endpoint: "http://localhost:8080/v1/responses"
+        })
+        |> ChatOpenAIResponses.connect_websocket!()
+
+      on_exit(fn ->
+        Process.exit(secure.websocket, :kill)
+        Process.exit(plain.websocket, :kill)
+      end)
+
+      verify!()
+    end
+
+    test "disconnect_websocket! clears websocket and is safe on nil" do
+      model = ChatOpenAIResponses.new!(%{model: @test_model})
+      assert %{websocket: nil} = ChatOpenAIResponses.disconnect_websocket!(model)
+
+      fake_pid = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(fake_pid, :kill) end)
+      model = %{model | websocket: fake_pid}
+
+      LangChain.WebSocket
+      |> expect(:close, fn ^fake_pid -> :ok end)
+
+      assert %{websocket: nil} = ChatOpenAIResponses.disconnect_websocket!(model)
+      verify!()
+    end
+
+    test "do_api_request with websocket returns error on WebSocket failure" do
+      fake_pid = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(fake_pid, :kill) end)
+
+      LangChain.WebSocket
+      |> expect(:send_and_collect, fn ^fake_pid, _payload, _done_fn, _opts ->
+        {:error, :not_connected}
+      end)
+
+      model =
+        ChatOpenAIResponses.new!(%{
+          model: @test_model,
+          stream: false,
+          websocket: fake_pid
+        })
+
+      assert {:error, %LangChain.LangChainError{type: "websocket_error"}} =
+               ChatOpenAIResponses.do_api_request(model, [Message.new_user!("Hi")], [])
+
+      verify!()
+    end
+  end
+end

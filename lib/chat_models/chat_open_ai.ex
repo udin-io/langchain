@@ -9,6 +9,21 @@ defmodule LangChain.ChatModels.ChatOpenAI do
 
   - https://github.com/openai/openai-cookbook/blob/main/examples/How_to_call_functions_with_chat_models.ipynb
 
+  ## OpenAI-compatible services
+
+  This module follows OpenAI's own API, including Azure OpenAI, and adopts
+  OpenAI's changes as they ship. Services that offer an OpenAI-compatible
+  endpoint (Cloudflare Workers AI, Groq, OpenRouter, vLLM, SGLang, Ollama, LM
+  Studio and others) often do not support those changes, and many ignore or
+  silently drop what they do not understand. For example, a system message
+  sent under the `developer` role, as `reasoning_mode` does, never reaches a
+  model served by SGLang or vLLM when the model's chat template has no
+  `developer` branch.
+
+  Use `LangChain.ChatModels.ChatOpenAICompatible` for those services. It sends
+  only the fields you set, always sends system messages as `system`, and never
+  falls back to the global OpenAI API key.
+
   ## ContentPart Types
 
   OpenAI supports several types of content parts that can be combined in a single message:
@@ -66,12 +81,26 @@ defmodule LangChain.ChatModels.ChatOpenAI do
   accessed using the LLM callback `on_llm_ratelimit_info` like this:
 
       handlers = %{
-        on_llm_ratelimit_info: fn _model, headers ->
+        on_llm_ratelimit_info: fn headers ->
           IO.inspect(headers)
         end
       }
 
       {:ok, chat} = ChatOpenAI.new(%{callbacks: [handlers]})
+
+  Handlers assigned to the model are fired by the model itself and receive only
+  the event's argument. Handlers assigned to an `LangChain.Chains.LLMChain`
+  receive the chain as an additional first argument:
+
+      handler = %{
+        on_llm_ratelimit_info: fn _chain, headers ->
+          IO.inspect(headers)
+        end
+      }
+
+      %{llm: ChatOpenAI.new!(%{})}
+      |> LLMChain.new!()
+      |> LLMChain.add_callback(handler)
 
   When a request is received, something similar to the following will be output
   to the console.
@@ -119,6 +148,14 @@ defmodule LangChain.ChatModels.ChatOpenAI do
   By default, the LLM will choose a tool call if a tool is available and it
   determines it is needed. That's the "auto" mode.
 
+  ## Parallel Tool Calls
+
+  By default, OpenAI models may decide to make multiple tool calls at once,
+  including calling the same tool multiple times. You can limit this behavior by
+  setting the `parallel_tool_calls`
+  [option](https://platform.openai.com/docs/api-reference/chat/create#chat_create-parallel_tool_calls)
+  to false.
+
   ### Example
   For the LLM's response to make a tool call of the "get_weather" function.
 
@@ -126,6 +163,69 @@ defmodule LangChain.ChatModels.ChatOpenAI do
         model: "...",
         tool_choice: %{"type" => "function", "function" => %{"name" => "get_weather"}}
       })
+
+  ## Tool Search
+
+  OpenAI's tool search, with deferred functions and namespaces, is a feature
+  of the Responses API. The Chat Completions API rejects the search tool. Use
+  `LangChain.ChatModels.ChatOpenAIResponses` for tool search.
+
+  A chain configured for tool search still runs here, with every tool
+  available from the start: deferred functions are sent as ordinary
+  functions, and the `LangChain.NativeTool.tool_search/1` tool is left out.
+  Search items another model added to the conversation are not sent. Any
+  other `LangChain.NativeTool` is an error.
+
+  ## Log Probabilities
+
+  OpenAI can return log probability information for output tokens, which is
+  useful for evaluating model confidence, building classifiers, or debugging
+  token selection.
+
+  Enable with the `logprobs` option. Optionally set `top_logprobs` to receive
+  the N most likely tokens (0-20) at each position:
+
+      chat = ChatOpenAI.new!(%{
+        model: "gpt-4o",
+        logprobs: true,
+        top_logprobs: 3
+      })
+
+  When enabled, the logprobs data from the API response is placed in the
+  `metadata` field under the `"logprobs"` key. This works for both
+  non-streaming (`LangChain.Message`) and streaming (`LangChain.MessageDelta`)
+  responses:
+
+      # Non-streaming
+      {:ok, [%Message{metadata: %{"logprobs" => logprobs}}]} =
+        ChatOpenAI.call(chat, [message], [])
+
+      # Streaming - logprobs appear on each delta chunk
+      chat = ChatOpenAI.new!(%{model: "gpt-4o", stream: true, logprobs: true})
+      # Each MessageDelta will have metadata: %{"logprobs" => ...}
+
+      # logprobs contains the raw OpenAI response structure:
+      # %{
+      #   "content" => [
+      #     %{
+      #       "token" => "Hello",
+      #       "logprob" => -0.0002,
+      #       "bytes" => [72, 101, 108, 108, 111],
+      #       "top_logprobs" => [
+      #         %{"token" => "Hello", "logprob" => -0.0002, ...},
+      #         %{"token" => "Hi", "logprob" => -8.53, ...},
+      #         ...
+      #       ]
+      #     },
+      #     ...
+      #   ]
+      # }
+
+  When `logprobs` is not enabled or the response contains no logprobs data,
+  `metadata` will be `nil`.
+
+  See the [OpenAI documentation](https://developers.openai.com/api/reference/resources/completions/methods/create)
+  for full details on the response structure.
 
   ## Azure OpenAI Support
 
@@ -162,26 +262,110 @@ defmodule LangChain.ChatModels.ChatOpenAI do
 
   `https://some-subdomain.cognitiveservices.azure.com/openai/deployments/gpt-4o-mini/chat/completions?api-version=2024-08-01-preview"`
 
+  ## Service Tier
+
+  The `service_tier` option asks the provider to serve the request with a
+  particular processing tier, trading cost against latency:
+
+      ChatOpenAI.new!(%{model: "gpt-5", service_tier: "priority"})
+
+  OpenAI accepts values such as `"auto"`, `"default"`, `"flex"`, `"scale"`,
+  `"priority"` and `"fast"`. OpenAI-compatible providers accept their own
+  subset, so the value is passed through without validation.
+
+  The tier that actually served the request can differ from the one requested.
+  When the provider reports it, it is kept in the token usage's `raw` map:
+
+      %Message{metadata: %{usage: %TokenUsage{raw: %{"service_tier" => tier}}}} = message
+
+  When streaming, token usage (and the tier with it) is only reported when
+  `stream_options: %{include_usage: true}` is set. Some providers don't report a
+  tier at all.
+
+  ## Token Limits
+
+  `max_tokens` sets the upper bound on generated tokens. It is sent as
+  `max_completion_tokens`, OpenAI's current name for the limit. OpenAI's
+  reasoning models require that name, and the limit includes reasoning tokens.
+
+      ChatOpenAI.new!(%{model: "gpt-5", max_tokens: 4000})
+
+  Many OpenAI-compatible servers only accept the older `max_tokens` key and
+  ignore `max_completion_tokens`. `LangChain.ChatModels.ChatOpenAICompatible`
+  sends the limit as `max_tokens`.
+
+  ## Additional Request Parameters
+
+  `extra_body` is a map of values merged into the request body last, so they
+  override anything the model computed. It reaches API parameters that
+  `ChatOpenAI` has no field for:
+
+      ChatOpenAI.new!(%{
+        model: "gpt-5",
+        extra_body: %{"store" => true, "metadata" => %{"run" => "eval-42"}}
+      })
+
+  - Keys may be strings or atoms. A key naming one the model already sends
+    replaces that value, so `%{"n" => 2}` overrides the `n` field.
+  - A `nil` value removes the key from the body. `%{"n" => nil}` stops the
+    always-sent `n` from going out.
+  - Nested maps are merged key by key. Any other value replaces the existing
+    one.
+
+  Overriding `stream`, `messages`, `tools` or `model` can break response
+  handling. Headers and transport options belong in `req_config`, not
+  `extra_body`. See `LangChain.Utils.merge_extra_body/2` for the full rules.
+
   ## Reasoning Model Support
 
-  OpenAI made some significant API changes with the introduction of their
-  "reasoning" models. This includes the `o1` and `o1-mini` models.
+  OpenAI's reasoning models (the o-series and the gpt-5 family) take a
+  `reasoning_effort` setting. To send it, set `:reasoning_mode` to `true`:
 
-  To enable this mode, set `:reasoning_mode` to `true`:
+      model = ChatOpenAI.new!(%{model: "gpt-5", reasoning_mode: true, reasoning_effort: "low"})
 
-      model = ChatOpenAI.new!(%{reasoning_mode: true})
+  Setting `reasoning_mode` to `true` does two things:
 
-  Setting `reasoning_mode` to `true` does at least the two following things:
+  - Sends `:reasoning_effort` in the request. It sets how much time, and how
+    many tokens, the model spends reasoning before it answers. OpenAI rejects
+    the setting on models that do not reason. The accepted values depend on
+    the model; across current models they are "none", "minimal", "low",
+    "medium" (the default here), "high" and "xhigh".
+  - Sends system messages under the `:developer` role, OpenAI's convention for
+    reasoning models. OpenAI's API also accepts `:system` on its current
+    reasoning models and treats it as `:developer`.
 
-  - Set `:developer` as the `role` for system messages. The OpenAI documentation
-    says API calls to `o1` and newer models must use the `role: :developer`
-    instead of `role: :system` and errors if not set correctly.
-  - The `:reasoning_effort` option included in LLM requests. This setting is
-    only permitted on a reasoning model. The `:reasoning_effort` values support
-    the "low", "medium" (default), and "high" options specified in the OpenAI
-    documentation. This instructs the LLM on how much time, and tokens, should
-    be spent on thinking through and reasoning about the request and the
-    response.
+  ### Returned Thinking
+
+  OpenAI does not return a reasoning model's thinking on this API. Some
+  OpenAI-compatible services return it in a `reasoning_content` field, which
+  is parsed into a `LangChain.Message.ContentPart` of type `:thinking`. See
+  `LangChain.ChatModels.ChatOpenAICompatible` for those services.
+
+  ## Connection Retry Behavior
+
+  The `retry_count` option controls how many times a request is retried when
+  a pooled HTTP connection turns out to be stale (server closed it between
+  requests). This is a transport-level issue where retrying with a fresh
+  connection is the correct response.
+
+  **Only closed-connection errors are retried.** Timeouts, rate limits (429),
+  overloaded (529), authentication errors, and invalid requests all return
+  immediately -- they are not problems that a simple retry will fix.
+
+  | `retry_count` | Total HTTP requests |
+  |---|---|
+  | `0` | 1 (no retries) |
+  | `1` | 2 (1 initial + 1 retry) |
+  | `2` (default) | 3 (1 initial + 2 retries) |
+
+  Req's built-in HTTP retry is disabled to prevent the two retry layers from
+  compounding. See [GitHub issue #503](https://github.com/brainlid/langchain/issues/503).
+
+  When running LLM calls from a background job queue (e.g., Oban) that has its
+  own retry logic, set `retry_count: 0` so there are no hidden retries:
+
+      ChatOpenAI.new!(%{model: "...", retry_count: 0})
+
   """
   use Ecto.Schema
   require Logger
@@ -189,14 +373,12 @@ defmodule LangChain.ChatModels.ChatOpenAI do
   alias __MODULE__
   alias LangChain.Config
   alias LangChain.ChatModels.ChatModel
-  alias LangChain.PromptTemplate
+  alias LangChain.ChatModels.ChatCompletionsFormat
   alias LangChain.Message
   alias LangChain.Message.ContentPart
   alias LangChain.Message.ToolCall
-  alias LangChain.Message.ToolResult
   alias LangChain.TokenUsage
   alias LangChain.Function
-  alias LangChain.FunctionParam
   alias LangChain.LangChainError
   alias LangChain.Utils
   alias LangChain.MessageDelta
@@ -235,17 +417,29 @@ defmodule LangChain.ChatModels.ChatOpenAI do
     # likelihood to repeat the same line verbatim.
     field :frequency_penalty, :float, default: nil
 
-    # Used when working with a reasoning model like `o1` and newer. This setting
-    # is required when working with those models as the API behavior needs to
-    # change.
+    # Set when using an OpenAI reasoning model (the o-series and the gpt-5
+    # family). Sends `reasoning_effort`, and sends system messages under the
+    # `developer` role.
     field :reasoning_mode, :boolean, default: false
 
-    # o1 models only
-    #
-    # Constrains effort on reasoning for reasoning models. Currently supported
-    # values are `low`, `medium`, and `high`. Reducing reasoning effort can result in
-    # faster responses and fewer tokens used on reasoning in a response.
+    # Sent only when `reasoning_mode` is true. Constrains how much the model
+    # reasons before answering. OpenAI accepts "none", "minimal", "low",
+    # "medium", "high" and "xhigh", with the supported subset depending on the
+    # model. Lower effort gives faster responses and spends fewer tokens on
+    # reasoning.
     field :reasoning_effort, :string, default: "medium"
+
+    # Verbosity level for the response.
+    # https://platform.openai.com/docs/api-reference/chat/create#chat-create-verbosity
+    field :verbosity, :string
+
+    # The processing tier to serve the request with. Known values include
+    # "auto", "default", "flex", "scale", "priority" and "fast"; the set differs
+    # between OpenAI and compatible providers, so it is not validated here. The
+    # tier that actually served the request is reported in the token usage's
+    # `raw` map under "service_tier".
+    # https://platform.openai.com/docs/api-reference/chat/create#chat-create-service_tier
+    field :service_tier, :string
 
     # Duration in seconds for the response to be received. When streaming a very
     # lengthy response, a longer time limit may be required. However, when it
@@ -259,6 +453,8 @@ defmodule LangChain.ChatModels.ChatOpenAI do
     field :json_response, :boolean, default: false
     field :json_schema, :map, default: nil
     field :stream, :boolean, default: false
+    # Upper bound on generated tokens. Sent as `max_completion_tokens`, OpenAI's
+    # current name for the limit, which also counts reasoning tokens.
     field :max_tokens, :integer, default: nil
     # Options for streaming response. Only set this when you set `stream: true`
     # https://platform.openai.com/docs/api-reference/chat/create#chat-create-stream_options
@@ -269,6 +465,17 @@ defmodule LangChain.ChatModels.ChatOpenAI do
 
     # Tool choice option
     field :tool_choice, :map
+
+    field :parallel_tool_calls, :boolean
+
+    # When true, the API returns log probability information for each output
+    # token. Ref: https://platform.openai.com/docs/api-reference/chat/create#chat-create-logprobs
+    field :logprobs, :boolean
+
+    # An integer between 0 and 20 specifying the number of most likely tokens
+    # to return at each position. Requires `logprobs` to be set to `true`.
+    # Ref: https://platform.openai.com/docs/api-reference/chat/create#chat-create-top_logprobs
+    field :top_logprobs, :integer
 
     # A list of maps for callback handlers (treated as internal)
     field :callbacks, {:array, :map}, default: []
@@ -281,6 +488,20 @@ defmodule LangChain.ChatModels.ChatOpenAI do
     # For help with debugging. It outputs the RAW Req response received and the
     # RAW Elixir map being submitted to the API.
     field :verbose_api, :boolean, default: false
+
+    # Number of retries on closed-connection errors (stale pool). The initial
+    # request always runs; this controls additional attempts only.
+    field :retry_count, :integer, default: 2
+
+    # Req options to merge into the request.
+    # Refer to `https://hexdocs.pm/req/Req.html#new/1-options` for
+    # `Req.new` supported set of options.
+    field :req_config, :map, default: %{}
+
+    # Provider-specific values merged into the request body last, overriding
+    # anything the model computed. A `nil` value removes that key from the
+    # body. See `LangChain.Utils.merge_extra_body/2` for the merge rules.
+    field :extra_body, :map, default: nil
   end
 
   @type t :: %ChatOpenAI{}
@@ -297,6 +518,8 @@ defmodule LangChain.ChatModels.ChatOpenAI do
     :stream,
     :reasoning_mode,
     :reasoning_effort,
+    :verbosity,
+    :service_tier,
     :receive_timeout,
     :json_response,
     :json_schema,
@@ -304,7 +527,14 @@ defmodule LangChain.ChatModels.ChatOpenAI do
     :stream_options,
     :user,
     :tool_choice,
-    :verbose_api
+    :parallel_tool_calls,
+    :logprobs,
+    :top_logprobs,
+    :verbose_api,
+    :retry_count,
+    :req_config,
+    :extra_body,
+    :callbacks
   ]
   @required_fields [:endpoint, :model]
 
@@ -355,6 +585,19 @@ defmodule LangChain.ChatModels.ChatOpenAI do
     |> validate_number(:frequency_penalty, greater_than_or_equal_to: -2, less_than_or_equal_to: 2)
     |> validate_number(:n, greater_than_or_equal_to: 1)
     |> validate_number(:receive_timeout, greater_than_or_equal_to: 0)
+    |> validate_number(:top_logprobs, greater_than_or_equal_to: 0, less_than_or_equal_to: 20)
+    |> validate_top_logprobs_requires_logprobs()
+  end
+
+  defp validate_top_logprobs_requires_logprobs(changeset) do
+    top_logprobs = get_field(changeset, :top_logprobs)
+    logprobs = get_field(changeset, :logprobs)
+
+    if top_logprobs && !logprobs do
+      add_error(changeset, :top_logprobs, "requires logprobs to be enabled")
+    else
+      changeset
+    end
   end
 
   @doc """
@@ -369,19 +612,7 @@ defmodule LangChain.ChatModels.ChatOpenAI do
       temperature: openai.temperature,
       n: openai.n,
       stream: openai.stream,
-      # a single ToolResult can expand into multiple tool messages for OpenAI
-      messages:
-        messages
-        |> Enum.reduce([], fn m, acc ->
-          case for_api(openai, m) do
-            %{} = data ->
-              [data | acc]
-
-            data when is_list(data) ->
-              Enum.reverse(data) ++ acc
-          end
-        end)
-        |> Enum.reverse()
+      messages: ChatCompletionsFormat.messages_for_api(messages, system_role: system_role(openai))
     }
     |> Utils.conditionally_add_to_map(:user, openai.user)
     |> Utils.conditionally_add_to_map(:frequency_penalty, openai.frequency_penalty)
@@ -390,23 +621,20 @@ defmodule LangChain.ChatModels.ChatOpenAI do
       :reasoning_effort,
       if(openai.reasoning_mode, do: openai.reasoning_effort, else: nil)
     )
-    |> Utils.conditionally_add_to_map(:max_tokens, openai.max_tokens)
+    |> Utils.conditionally_add_to_map(:verbosity, openai.verbosity)
+    |> Utils.conditionally_add_to_map(:max_completion_tokens, openai.max_tokens)
+    |> Utils.conditionally_add_to_map(:service_tier, openai.service_tier)
     |> Utils.conditionally_add_to_map(:seed, openai.seed)
     |> Utils.conditionally_add_to_map(
       :stream_options,
       get_stream_options_for_api(openai.stream_options)
     )
-    |> Utils.conditionally_add_to_map(:tools, get_tools_for_api(openai, tools))
+    |> Utils.conditionally_add_to_map(:tools, ChatCompletionsFormat.tools_for_api(tools))
     |> Utils.conditionally_add_to_map(:tool_choice, get_tool_choice(openai))
-  end
-
-  defp get_tools_for_api(%_{} = _model, nil), do: []
-
-  defp get_tools_for_api(%_{} = model, tools) do
-    Enum.map(tools, fn
-      %Function{} = function ->
-        %{"type" => "function", "function" => for_api(model, function)}
-    end)
+    |> Utils.conditionally_add_to_map(:parallel_tool_calls, openai.parallel_tool_calls)
+    |> Utils.conditionally_add_to_map(:logprobs, openai.logprobs)
+    |> Utils.conditionally_add_to_map(:top_logprobs, openai.top_logprobs)
+    |> Utils.merge_extra_body(openai.extra_body)
   end
 
   defp get_stream_options_for_api(nil), do: nil
@@ -459,191 +687,43 @@ defmodule LangChain.ChatModels.ChatOpenAI do
   @spec for_api(
           struct(),
           Message.t()
-          | PromptTemplate.t()
+          | LangChain.PromptTemplate.t()
           | ToolCall.t()
-          | ToolResult.t()
+          | LangChain.Message.ToolResult.t()
           | ContentPart.t()
           | Function.t()
         ) ::
           %{String.t() => any()} | [%{String.t() => any()}]
-  def for_api(%_{} = model, %Message{content: content} = msg) when is_list(content) do
-    role = get_message_role(model, msg.role)
-
-    %{
-      "role" => role,
-      "content" => content_parts_for_api(model, content)
-    }
-    |> Utils.conditionally_add_to_map("name", msg.name)
-    |> Utils.conditionally_add_to_map(
-      "tool_calls",
-      Enum.map(msg.tool_calls || [], &for_api(model, &1))
-    )
-  end
-
-  def for_api(%_{} = model, %Message{role: :assistant, tool_calls: tool_calls} = msg)
-      when is_list(tool_calls) do
-    %{
-      "role" => :assistant,
-      "content" => msg.content
-    }
-    |> Utils.conditionally_add_to_map("tool_calls", Enum.map(tool_calls, &for_api(model, &1)))
-  end
-
-  def for_api(%_{} = model, %Message{role: :user, content: content} = msg)
-      when is_list(content) do
-    %{
-      "role" => msg.role,
-      "content" => Enum.map(content, &for_api(model, &1))
-    }
-    |> Utils.conditionally_add_to_map("name", msg.name)
-  end
-
-  def for_api(%_{} = model, %ToolResult{type: :function} = result) do
-    # a ToolResult becomes a stand-alone %Message{role: :tool} response.
-    %{
-      "role" => :tool,
-      "tool_call_id" => result.tool_call_id,
-      "content" => content_parts_for_api(model, result.content)
-    }
-  end
-
-  def for_api(%_{} = model, %Message{role: :tool, tool_results: tool_results} = _msg)
-      when is_list(tool_results) do
-    # ToolResults turn into a list of tool messages for OpenAI
-    Enum.map(tool_results, fn result ->
-      %{
-        "role" => :tool,
-        "tool_call_id" => result.tool_call_id,
-        "content" => content_parts_for_api(model, result.content)
-      }
-    end)
-  end
-
-  # ToolCall support
-  def for_api(%_{} = _model, %ToolCall{type: :function} = fun) do
-    %{
-      "id" => fun.call_id,
-      "type" => "function",
-      "function" => %{
-        "name" => fun.name,
-        "arguments" => Jason.encode!(fun.arguments)
-      }
-    }
-  end
-
-  # Function support
-  def for_api(%_{} = _model, %Function{} = fun) do
-    %{
-      "name" => fun.name,
-      "parameters" => get_parameters(fun)
-    }
-    |> Utils.conditionally_add_to_map("description", fun.description)
-  end
-
-  def for_api(%_{} = _model, %PromptTemplate{} = _template) do
-    raise LangChainError, "PromptTemplates must be converted to messages."
-  end
-
-  # Handle ContentPart structures directly
-  def for_api(%_{} = model, %ContentPart{} = part) do
-    content_part_for_api(model, part)
+  def for_api(%_{} = model, item) do
+    ChatCompletionsFormat.item_for_api(item, system_role: system_role(model))
   end
 
   @doc """
   Convert a list of ContentParts to the expected map of data for the OpenAI API.
+
+  Thinking and unsupported parts are omitted. Both are response-side artifacts
+  with no request representation on this API surface. The omission is
+  unconditional so a conversation presents the same prompt prefix turn after
+  turn, which keeps prompt caching working.
   """
-  def content_parts_for_api(%_{} = model, content_parts) when is_list(content_parts) do
-    Enum.map(content_parts, &content_part_for_api(model, &1))
+  def content_parts_for_api(%_{} = _model, content_parts) when is_list(content_parts) do
+    ChatCompletionsFormat.content_parts_for_api(content_parts)
   end
 
   @doc """
   Convert a ContentPart to the expected map of data for the OpenAI API.
   """
-  def content_part_for_api(%_{} = _model, %ContentPart{type: :text} = part) do
-    %{"type" => "text", "text" => part.content}
-  end
-
-  def content_part_for_api(%_{} = _model, %ContentPart{type: :file, options: opts} = part) do
-    file_params =
-      case Keyword.get(opts, :type, :base64) do
-        :file_id ->
-          %{
-            "file_id" => part.content
-          }
-
-        :base64 ->
-          %{
-            "filename" => Keyword.get(opts, :filename, "file.pdf"),
-            "file_data" => "data:application/pdf;base64," <> part.content
-          }
-      end
-
-    %{
-      "type" => "file",
-      "file" => file_params
-    }
-  end
-
-  def content_part_for_api(%_{} = _model, %ContentPart{type: image} = part)
-      when image in [:image, :image_url] do
-    media_prefix =
-      case Keyword.get(part.options || [], :media, nil) do
-        nil ->
-          ""
-
-        type when is_binary(type) ->
-          "data:#{type};base64,"
-
-        type when type in [:jpeg, :jpg] ->
-          "data:image/jpg;base64,"
-
-        :png ->
-          "data:image/png;base64,"
-
-        :gif ->
-          "data:image/gif;base64,"
-
-        :webp ->
-          "data:image/webp;base64,"
-
-        other ->
-          message = "Received unsupported media type for ContentPart: #{inspect(other)}"
-          Logger.error(message)
-          raise LangChainError, message
-      end
-
-    detail_option = Keyword.get(part.options, :detail, nil)
-
-    %{
-      "type" => "image_url",
-      "image_url" =>
-        %{"url" => media_prefix <> part.content}
-        |> Utils.conditionally_add_to_map("detail", detail_option)
-    }
+  def content_part_for_api(%_{} = _model, %ContentPart{} = part) do
+    ChatCompletionsFormat.content_part_for_api(part)
   end
 
   @doc false
-  def get_parameters(%Function{parameters: [], parameters_schema: nil} = _fun) do
-    %{
-      "type" => "object",
-      "properties" => %{}
-    }
-  end
+  def get_parameters(%Function{} = fun), do: ChatCompletionsFormat.get_parameters(fun)
 
-  def get_parameters(%Function{parameters: [], parameters_schema: schema} = _fun)
-      when is_map(schema) do
-    schema
-  end
-
-  def get_parameters(%Function{parameters: params} = _fun) do
-    FunctionParam.to_parameters_schema(params)
-  end
-
-  # Convert a message role into either `:system` or :developer` based on the
-  # message role and the system config.
-  defp get_message_role(%ChatOpenAI{reasoning_mode: true}, :system), do: :developer
-  defp get_message_role(%ChatOpenAI{}, role), do: role
-  defp get_message_role(_model, role), do: role
+  # OpenAI's reasoning models take system messages under the `:developer`
+  # role. Any other struct reusing these functions sends `:system`.
+  defp system_role(%ChatOpenAI{reasoning_mode: true}), do: :developer
+  defp system_role(_model), do: :system
 
   @doc """
   Calls the OpenAI API passing the ChatOpenAI struct with configuration, plus
@@ -681,11 +761,12 @@ defmodule LangChain.ChatModels.ChatOpenAI do
   def call(%ChatOpenAI{} = openai, messages, tools) when is_list(messages) do
     metadata = %{
       model: openai.model,
+      provider: provider(),
       message_count: length(messages),
       tools_count: length(tools)
     }
 
-    LangChain.Telemetry.span([:langchain, :llm, :call], metadata, fn ->
+    ChatModel.llm_telemetry_span(openai, metadata, fn ->
       try do
         # Track the prompt being sent
         LangChain.Telemetry.llm_prompt(
@@ -733,9 +814,9 @@ defmodule LangChain.ChatModels.ChatOpenAI do
   # structures.
   # Retries the request up to 3 times on transient errors with a 1 second delay
   @doc false
-  @spec do_api_request(t(), [Message.t()], ChatModel.tools(), integer()) ::
+  @spec do_api_request(t(), [Message.t()], ChatModel.tools(), integer() | nil) ::
           list() | struct() | {:error, LangChainError.t()}
-  def do_api_request(openai, messages, tools, retry_count \\ 3)
+  def do_api_request(openai, messages, tools, retry_count \\ nil)
 
   def do_api_request(_openai, _messages, _tools, 0) do
     raise LangChainError, "Retries exceeded. Connection failed."
@@ -747,6 +828,7 @@ defmodule LangChain.ChatModels.ChatOpenAI do
         tools,
         retry_count
       ) do
+    retry_count = retry_count || openai.retry_count + 1
     raw_data = for_api(openai, messages, tools)
 
     if openai.verbose_api do
@@ -764,14 +846,15 @@ defmodule LangChain.ChatModels.ChatOpenAI do
           {"api-key", get_api_key(openai)}
         ],
         receive_timeout: openai.receive_timeout,
-        retry: :transient,
-        max_retries: 3,
-        retry_delay: fn attempt -> 300 * attempt end
+        # Disable Req-level retry to prevent compounding with LangChain's own
+        # :closed retry. See https://github.com/brainlid/langchain/issues/503
+        retry: false
       )
 
     req
     |> maybe_add_org_id_header(openai)
     |> maybe_add_proj_id_header()
+    |> Req.merge(openai.req_config |> Keyword.new())
     |> Req.post()
     # parse the body and return it as parsed structs
     |> case do
@@ -783,7 +866,7 @@ defmodule LangChain.ChatModels.ChatOpenAI do
         Callbacks.fire(openai.callbacks, :on_llm_response_headers, [response.headers])
 
         Callbacks.fire(openai.callbacks, :on_llm_ratelimit_info, [
-          get_ratelimit_info(response.headers)
+          ChatCompletionsFormat.get_ratelimit_info(response.headers)
         ])
 
         case do_process_response(openai, data) do
@@ -816,7 +899,7 @@ defmodule LangChain.ChatModels.ChatOpenAI do
         do_api_request(openai, messages, tools, retry_count - 1)
 
       other ->
-        Logger.error("Unexpected and unhandled API response! #{inspect(other)}")
+        Logger.warning(fn -> "Unexpected and unhandled API response! #{inspect(other)}" end)
         other
     end
   end
@@ -827,6 +910,7 @@ defmodule LangChain.ChatModels.ChatOpenAI do
         tools,
         retry_count
       ) do
+    retry_count = retry_count || openai.retry_count + 1
     raw_data = for_api(openai, messages, tools)
 
     if openai.verbose_api do
@@ -846,6 +930,7 @@ defmodule LangChain.ChatModels.ChatOpenAI do
     )
     |> maybe_add_org_id_header(openai)
     |> maybe_add_proj_id_header()
+    |> Req.merge(openai.req_config |> Keyword.new())
     |> Req.post(
       into:
         Utils.handle_stream_fn(
@@ -859,7 +944,7 @@ defmodule LangChain.ChatModels.ChatOpenAI do
         Callbacks.fire(openai.callbacks, :on_llm_response_headers, [response.headers])
 
         Callbacks.fire(openai.callbacks, :on_llm_ratelimit_info, [
-          get_ratelimit_info(response.headers)
+          ChatCompletionsFormat.get_ratelimit_info(response.headers)
         ])
 
         data
@@ -877,12 +962,16 @@ defmodule LangChain.ChatModels.ChatOpenAI do
         do_api_request(openai, messages, tools, retry_count - 1)
 
       other ->
-        Logger.error(
+        Logger.warning(fn ->
           "Unhandled and unexpected response from streamed post call. #{inspect(other)}"
-        )
+        end)
 
         {:error,
-         LangChainError.exception(type: "unexpected_response", message: "Unexpected response")}
+         LangChainError.exception(
+           type: "unexpected_response",
+           message: "Unexpected response",
+           original: other
+         )}
     end
   end
 
@@ -896,281 +985,23 @@ defmodule LangChain.ChatModels.ChatOpenAI do
   buffer data from a previous call, and assembling it to parse.
   """
   @spec decode_stream({String.t(), String.t()}, list()) ::
-          {%{String.t() => any()}}
+          {[%{String.t() => any()}], String.t()}
   def decode_stream({raw_data, buffer}, done \\ []) do
-    # Data comes back like this:
-    #
-    # "data: {\"id\":\"chatcmpl-7e8yp1xBhriNXiqqZ0xJkgNrmMuGS\",\"object\":\"chat.completion.chunk\",\"created\":1689801995,\"model\":\"gpt-4-0613\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":null,\"function_call\":{\"name\":\"calculator\",\"arguments\":\"\"}},\"finish_reason\":null}]}\n\n
-    #  data: {\"id\":\"chatcmpl-7e8yp1xBhriNXiqqZ0xJkgNrmMuGS\",\"object\":\"chat.completion.chunk\",\"created\":1689801995,\"model\":\"gpt-4-0613\",\"choices\":[{\"index\":0,\"delta\":{\"function_call\":{\"arguments\":\"{\\n\"}},\"finish_reason\":null}]}\n\n"
-    #
-    # In that form, the data is not ready to be interpreted as JSON. Let's clean
-    # it up first.
-
-    # as we start, the initial accumulator is an empty set of parsed results and
-    # any left-over buffer from a previous processing.
-    raw_data
-    |> String.split("data: ")
-    |> Enum.reduce({done, buffer}, fn str, {done, incomplete} = acc ->
-      # auto filter out "" and "[DONE]" by not including the accumulator
-      str
-      |> String.trim()
-      |> case do
-        "" ->
-          acc
-
-        "[DONE]" ->
-          acc
-
-        json ->
-          parse_combined_data(incomplete, json, done)
-      end
-    end)
-  end
-
-  defp parse_combined_data("", json, done) do
-    json
-    |> Jason.decode()
-    |> case do
-      {:ok, parsed} ->
-        {done ++ [parsed], ""}
-
-      {:error, _reason} ->
-        {done, json}
-    end
-  end
-
-  defp parse_combined_data(incomplete, json, done) do
-    # combine with any previous incomplete data
-    starting_json = incomplete <> json
-
-    # recursively call decode_stream so that the combined message data is split on "data: " again.
-    # the combined data may need re-splitting if the last message ended in the middle of the "data: " key.
-    # i.e. incomplete ends with "dat" and the new message starts with "a: {".
-    decode_stream({starting_json, ""}, done)
+    ChatCompletionsFormat.decode_stream({raw_data, buffer}, done)
   end
 
   # Parse a new message response
   @doc false
-  @spec do_process_response(
-          %{:callbacks => [map()]},
-          data :: %{String.t() => any()} | {:error, any()}
-        ) ::
+  @spec do_process_response(any(), data :: any()) ::
           :skip
+          | TokenUsage.t()
           | Message.t()
-          | [Message.t()]
+          | [Message.t() | MessageDelta.t() | TokenUsage.t() | {:error, LangChainError.t()}]
           | MessageDelta.t()
           | [MessageDelta.t()]
-          | {:error, String.t()}
-  def do_process_response(model, %{"choices" => _choices} = data) do
-    token_usage = get_token_usage(data)
-
-    case data do
-      # no choices data but got token usage.
-      %{"choices" => [], "usage" => _usage} ->
-        token_usage
-
-      # no data and no token usage. Skip.
-      %{"choices" => []} ->
-        :skip
-
-      %{"choices" => choices} ->
-        # process each response individually. Return a list of all processed
-        # choices. If we received TokenUsage, attach it to each returned item.
-        # Merging will work out later.
-        choices
-        |> Enum.map(&do_process_response(model, &1))
-        |> Enum.map(&TokenUsage.set(&1, token_usage))
-    end
-  end
-
-  # Full message with tool call
-  def do_process_response(
-        model,
-        %{"finish_reason" => finish_reason, "message" => %{"tool_calls" => calls} = message} =
-          data
-      )
-      when finish_reason in ["tool_calls", "stop"] do
-    case Message.new(%{
-           "role" => "assistant",
-           "content" => message["content"],
-           "complete" => true,
-           "index" => data["index"],
-           "tool_calls" => Enum.map(calls || [], &do_process_response(model, &1))
-         }) do
-      {:ok, message} ->
-        message
-
-      {:error, %Ecto.Changeset{} = changeset} ->
-        {:error, LangChainError.exception(changeset)}
-    end
-  end
-
-  # Delta message tool call
-  def do_process_response(
-        model,
-        %{"delta" => delta_body, "finish_reason" => finish, "index" => index} = _msg
-      ) do
-    status = finish_reason_to_status(finish)
-
-    tool_calls =
-      case delta_body do
-        %{"tool_calls" => tools_data} when is_list(tools_data) ->
-          Enum.map(tools_data, &do_process_response(model, &1))
-
-        _other ->
-          nil
-      end
-
-    # more explicitly interpret the role. We treat a "function_call" as a a role
-    # while OpenAI addresses it as an "assistant". Technically, they are correct
-    # that the assistant is issuing the function_call.
-    role =
-      case delta_body do
-        %{"role" => role} -> role
-        _other -> "unknown"
-      end
-
-    data =
-      delta_body
-      |> Map.put("role", role)
-      |> Map.put("index", index)
-      |> Map.put("status", status)
-      |> Map.put("tool_calls", tool_calls)
-
-    case MessageDelta.new(data) do
-      {:ok, message} ->
-        message
-
-      {:error, %Ecto.Changeset{} = changeset} ->
-        {:error, LangChainError.exception(changeset)}
-    end
-  end
-
-  # Tool call as part of a delta message
-  def do_process_response(_model, %{"function" => func_body, "index" => index} = tool_call) do
-    # function parts may or may not be present on any given delta chunk
-    case ToolCall.new(%{
-           status: :incomplete,
-           type: :function,
-           call_id: tool_call["id"],
-           name: Map.get(func_body, "name", nil),
-           arguments: Map.get(func_body, "arguments", nil),
-           index: index
-         }) do
-      {:ok, %ToolCall{} = call} ->
-        call
-
-      {:error, %Ecto.Changeset{} = changeset} ->
-        reason = Utils.changeset_error_to_string(changeset)
-        Logger.error("Failed to process ToolCall for a function. Reason: #{reason}")
-        {:error, LangChainError.exception(changeset)}
-    end
-  end
-
-  # Tool call from a complete message
-  def do_process_response(_model, %{
-        "function" => %{
-          "arguments" => args,
-          "name" => name
-        },
-        "id" => call_id,
-        "type" => "function"
-      }) do
-    # No "index". It is a complete message.
-    case ToolCall.new(%{
-           type: :function,
-           status: :complete,
-           name: name,
-           arguments: args,
-           call_id: call_id
-         }) do
-      {:ok, %ToolCall{} = call} ->
-        call
-
-      {:error, %Ecto.Changeset{} = changeset} ->
-        reason = Utils.changeset_error_to_string(changeset)
-        Logger.error("Failed to process ToolCall for a function. Reason: #{reason}")
-        {:error, LangChainError.exception(changeset)}
-    end
-  end
-
-  def do_process_response(_model, %{
-        "finish_reason" => finish_reason,
-        "message" => message,
-        "index" => index
-      }) do
-    status = finish_reason_to_status(finish_reason)
-
-    case Message.new(Map.merge(message, %{"status" => status, "index" => index})) do
-      {:ok, message} ->
-        message
-
-      {:error, %Ecto.Changeset{} = changeset} ->
-        {:error, LangChainError.exception(changeset)}
-    end
-  end
-
-  # MS Azure returns numeric error codes. Interpret them when possible to give a computer-friendly reason
-  #
-  # https://learn.microsoft.com/en-us/troubleshoot/azure/azure-kubernetes/create-upgrade-delete/429-too-many-requests-errors
-  def do_process_response(
-        _model,
-        %{
-          "error" => %{"code" => code, "message" => reason} = error_data
-        } = response
-      ) do
-    type =
-      case code do
-        "429" ->
-          "rate_limit_exceeded"
-
-        "unsupported_value" ->
-          if String.contains?(reason, "does not support 'system' with this model") do
-            Logger.error(
-              "This model requires 'reasoning_mode' to be enabled. Reason: #{inspect(reason)}"
-            )
-
-            # return the API error type as the exception type information
-            error_data["type"]
-          end
-
-        _other ->
-          nil
-      end
-
-    Logger.error("Received error from API: #{inspect(reason)}")
-    {:error, LangChainError.exception(type: type, message: reason, original: response)}
-  end
-
-  def do_process_response(_model, %{"error" => %{"message" => reason}} = response) do
-    Logger.error("Received error from API: #{inspect(reason)}")
-    {:error, LangChainError.exception(message: reason, original: response)}
-  end
-
-  def do_process_response(_model, {:error, %Jason.DecodeError{} = response}) do
-    error_message = "Received invalid JSON: #{inspect(response)}"
-    Logger.error(error_message)
-
-    {:error,
-     LangChainError.exception(type: "invalid_json", message: error_message, original: response)}
-  end
-
-  def do_process_response(_model, other) do
-    Logger.error("Trying to process an unexpected response. #{inspect(other)}")
-    {:error, LangChainError.exception(message: "Unexpected response", original: other)}
-  end
-
-  defp finish_reason_to_status(nil), do: :incomplete
-  defp finish_reason_to_status("stop"), do: :complete
-  defp finish_reason_to_status("tool_calls"), do: :complete
-  defp finish_reason_to_status("content_filter"), do: :complete
-  defp finish_reason_to_status("length"), do: :length
-  defp finish_reason_to_status("max_tokens"), do: :length
-
-  defp finish_reason_to_status(other) do
-    Logger.warning("Unsupported finish_reason in message. Reason: #{inspect(other)}")
-    nil
-  end
+          | ToolCall.t()
+          | {:error, LangChainError.t()}
+  def do_process_response(_model, data), do: ChatCompletionsFormat.process_response(data)
 
   defp maybe_add_org_id_header(%Req.Request{} = req, %ChatOpenAI{} = openai) do
     org_id = get_org_id(openai)
@@ -1192,36 +1023,22 @@ defmodule LangChain.ChatModels.ChatOpenAI do
     end
   end
 
-  defp get_ratelimit_info(response_headers) do
-    # extract out all the ratelimit response headers
-    #
-    #  https://platform.openai.com/docs/guides/rate-limits/rate-limits-in-headers
-    {return, _} =
-      Map.split(response_headers, [
-        "x-ratelimit-limit-requests",
-        "x-ratelimit-limit-tokens",
-        "x-ratelimit-remaining-requests",
-        "x-ratelimit-remaining-tokens",
-        "x-ratelimit-reset-requests",
-        "x-ratelimit-reset-tokens",
-        "x-request-id"
-      ])
+  @impl ChatModel
+  def provider, do: "openai"
 
-    return
-  end
-
-  defp get_token_usage(%{"usage" => usage} = _response_body) when is_map(usage) do
-    # extract out the reported response token usage
-    #
-    #  https://platform.openai.com/docs/api-reference/chat/object#chat/object-usage
-    TokenUsage.new!(%{
-      input: Map.get(usage, "prompt_tokens"),
-      output: Map.get(usage, "completion_tokens"),
-      raw: usage
-    })
-  end
-
-  defp get_token_usage(_response_body), do: nil
+  @doc """
+  Determine if an error should be retried. If `true`, a fallback LLM may be
+  used. If `false`, the error is understood to be more fundamental with the
+  request rather than a service issue and it should not be retried or fallback
+  to another service.
+  """
+  @impl ChatModel
+  @spec retry_on_fallback?(LangChainError.t()) :: boolean()
+  def retry_on_fallback?(%LangChainError{type: "rate_limited"}), do: true
+  def retry_on_fallback?(%LangChainError{type: "rate_limit_exceeded"}), do: true
+  def retry_on_fallback?(%LangChainError{type: "timeout"}), do: true
+  def retry_on_fallback?(%LangChainError{type: "too_many_requests"}), do: true
+  def retry_on_fallback?(_), do: false
 
   @doc """
   Generate a config map that can later restore the model's configuration.
@@ -1245,7 +1062,9 @@ defmodule LangChain.ChatModels.ChatOpenAI do
         :json_schema,
         :stream,
         :max_tokens,
-        :stream_options
+        :stream_options,
+        :service_tier,
+        :extra_body
       ],
       @current_config_version
     )

@@ -2,17 +2,23 @@ defmodule LangChain.MixProject do
   use Mix.Project
 
   @source_url "https://github.com/brainlid/langchain"
-  @version "0.4.0-rc.1"
+  @version "0.15.9"
 
   def project do
     [
       app: :langchain,
       version: @version,
-      elixir: "~> 1.16",
+      elixir: "~> 1.17",
       elixirc_paths: elixirc_paths(Mix.env()),
       test_options: [docs: true],
       start_permanent: Mix.env() == :prod,
+      aliases: aliases(),
       deps: deps(),
+      dialyzer: [
+        ignore_warnings: ".dialyzer_ignore.exs",
+        plt_file: {:no_warn, "priv/plts/project.plt"},
+        plt_core_path: "priv/plts"
+      ],
       package: package(),
       docs: &docs/0,
       name: "LangChain",
@@ -30,6 +36,12 @@ defmodule LangChain.MixProject do
     ]
   end
 
+  def cli do
+    [
+      preferred_envs: [precommit: :test]
+    ]
+  end
+
   defp elixirc_paths(:test), do: ["lib", "test/support"]
   defp elixirc_paths(_), do: ["lib"]
 
@@ -37,13 +49,46 @@ defmodule LangChain.MixProject do
   defp deps do
     [
       {:ecto, "~> 3.10 or ~> 3.11"},
-      {:gettext, "~> 0.26"},
-      {:req, ">= 0.5.2"},
+      {:gettext, "~> 0.26.2 or ~> 1.0.0"},
+      {:req, ">= 0.5.3"},
+      {:mint_web_socket, "~> 1.0", optional: true},
       {:nimble_parsec, "~> 1.4", optional: true},
       {:abacus, "~> 2.1.0", optional: true},
       {:nx, ">= 0.7.0", optional: true},
-      {:ex_doc, "~> 0.34", only: :dev, runtime: false},
-      {:mimic, "~> 1.8", only: :test}
+      {:opentelemetry_api, "~> 1.4", optional: true},
+      {:opentelemetry, "~> 1.5", only: :test},
+      {:opentelemetry_exporter, "~> 1.8", only: :test},
+      {:ex_doc, "~> 0.40", only: :dev, runtime: false},
+      {:mimic, "~> 1.8", only: :test},
+      {:dotenvy, "~> 1.1"},
+      # 1.25.0 is the first release that labels each content part, and each
+      # streamed text chunk, with the assistant `phase` of the OpenAI Responses
+      # API message item it belongs to, and sends each part's label back.
+      # `LangChain.ChatModels.ChatReqLLM` reads and writes the narration marker
+      # only through those per-part labels.
+      {:req_llm, ">= 1.29.0", optional: true},
+      {:sobelow, "~> 0.14", only: [:dev, :test], runtime: false, warn_if_outdated: true},
+      {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false},
+      {:mix_audit, "~> 2.1", only: [:dev, :test], runtime: false}
+    ]
+  end
+
+  # Aliases are shortcuts or tasks specific to the current project.
+  # For example, before performing a commit, run the following checks:
+  #
+  #     $ mix precommit
+  #
+  # See the documentation for `Mix` for more info on aliases.
+  defp aliases do
+    [
+      precommit: [
+        "compile --warnings-as-errors",
+        "deps.unlock --unused",
+        "format",
+        "sobelow",
+        "deps.audit",
+        "test"
+      ]
     ]
   end
 
@@ -58,12 +103,17 @@ defmodule LangChain.MixProject do
       extra_section: "Guides",
       extras: extras(),
       groups_for_extras: [
+        Guides: ["guides/evaluation.md", "guides/observability.md"],
         Notebooks: Path.wildcard("notebooks/*.livemd")
       ],
       groups_for_modules: [
         "Chat Models": [
+          LangChain.ChatModels.ChatModel,
           LangChain.ChatModels.ChatOpenAI,
+          LangChain.ChatModels.ChatOpenAICompatible,
+          LangChain.ChatModels.ChatOpenAIResponses,
           LangChain.ChatModels.ChatAnthropic,
+          LangChain.ChatModels.ChatAwsMantle,
           LangChain.ChatModels.ChatBumblebee,
           LangChain.ChatModels.ChatGoogleAI,
           LangChain.ChatModels.ChatVertexAI,
@@ -71,13 +121,22 @@ defmodule LangChain.MixProject do
           LangChain.ChatModels.ChatOllamaAI,
           LangChain.ChatModels.ChatPerplexity,
           LangChain.ChatModels.ChatGrok,
-          LangChain.ChatModels.ChatModel
+          LangChain.ChatModels.ChatDeepSeek,
+          LangChain.ChatModels.ChatReqLLM
         ],
         Chains: [
           LangChain.Chains.LLMChain,
           LangChain.Chains.TextToTitleChain,
           LangChain.Chains.SummarizeConversationChain,
           LangChain.Chains.DataExtractionChain
+        ],
+        "Run Modes": [
+          LangChain.Chains.LLMChain.Mode,
+          LangChain.Chains.LLMChain.Mode.Steps,
+          LangChain.Chains.LLMChain.Modes.WhileNeedsResponse,
+          LangChain.Chains.LLMChain.Modes.UntilSuccess,
+          LangChain.Chains.LLMChain.Modes.Step,
+          LangChain.Chains.LLMChain.Modes.UntilToolUsed
         ],
         Messages: [
           LangChain.Message,
@@ -102,6 +161,13 @@ defmodule LangChain.MixProject do
           LangChain.Chains.RoutingChain,
           LangChain.Routing.PromptRoute
         ],
+        "File Uploaders": [
+          LangChain.FileUploader,
+          LangChain.FileUploader.FileOpenAI,
+          LangChain.FileUploader.FileAnthropic,
+          LangChain.FileUploader.FileGoogle,
+          LangChain.FileUploader.FileResult
+        ],
         Images: [
           LangChain.Images,
           LangChain.Images.OpenAIImage,
@@ -113,7 +179,29 @@ defmodule LangChain.MixProject do
           LangChain.TextSplitter.LanguageSeparators
         ],
         Tools: [
-          LangChain.Tools.Calculator
+          LangChain.Tools.Calculator,
+          LangChain.Tools.DeepResearch,
+          LangChain.Tools.DeepResearchClient,
+          LangChain.Tools.DeepResearch.ResearchRequest,
+          LangChain.Tools.DeepResearch.ResearchStatus,
+          LangChain.Tools.DeepResearch.ResearchResult
+        ],
+        Observability: [
+          LangChain.Telemetry,
+          LangChain.OpenTelemetry,
+          LangChain.OpenTelemetry.Config,
+          LangChain.OpenTelemetry.Enrich,
+          LangChain.OpenTelemetry.SpanHandler,
+          LangChain.OpenTelemetry.MetricsHandler,
+          LangChain.OpenTelemetry.Attributes,
+          LangChain.OpenTelemetry.ProviderMapping
+        ],
+        WebSocket: [
+          LangChain.WebSocket
+        ],
+        Evaluation: [
+          LangChain.Trajectory,
+          LangChain.Trajectory.Assertions
         ],
         Utils: [
           LangChain.Utils,
@@ -123,7 +211,9 @@ defmodule LangChain.MixProject do
           LangChain.Config,
           LangChain.Gettext
         ]
-      ]
+      ],
+      before_closing_head_tag: &before_closing_head_tag/1,
+      before_closing_body_tag: &before_closing_body_tag/1
     ]
   end
 
@@ -131,9 +221,12 @@ defmodule LangChain.MixProject do
     [
       "README.md",
       "CHANGELOG.md",
+      "guides/evaluation.md",
+      "guides/observability.md",
       "notebooks/getting_started.livemd",
       "notebooks/custom_functions.livemd",
-      "notebooks/context-specific-image-descriptions.livemd"
+      "notebooks/context-specific-image-descriptions.livemd",
+      "notebooks/observability_tutorial.livemd"
     ]
   end
 
@@ -147,4 +240,47 @@ defmodule LangChain.MixProject do
       links: %{"GitHub" => @source_url}
     ]
   end
+
+  defp before_closing_head_tag(:html) do
+    """
+    <!-- HTML injected at the end of the <head> element -->
+    """
+  end
+
+  defp before_closing_head_tag(:epub), do: ""
+
+  defp before_closing_body_tag(:html) do
+    """
+    <script defer src="https://cdn.jsdelivr.net/npm/mermaid@10.2.3/dist/mermaid.min.js"></script>
+    <script>
+      let initialized = false;
+
+      window.addEventListener("exdoc:loaded", () => {
+        if (!initialized) {
+          mermaid.initialize({
+            startOnLoad: false,
+            theme: document.body.className.includes("dark") ? "dark" : "default"
+          });
+          initialized = true;
+        }
+
+        let id = 0;
+        for (const codeEl of document.querySelectorAll("pre code.mermaid")) {
+          const preEl = codeEl.parentElement;
+          const graphDefinition = codeEl.textContent;
+          const graphEl = document.createElement("div");
+          const graphId = "mermaid-graph-" + id++;
+          mermaid.render(graphId, graphDefinition).then(({svg, bindFunctions}) => {
+            graphEl.innerHTML = svg;
+            bindFunctions?.(graphEl);
+            preEl.insertAdjacentElement("afterend", graphEl);
+            preEl.remove();
+          });
+        }
+      });
+    </script>
+    """
+  end
+
+  defp before_closing_body_tag(:epub), do: ""
 end

@@ -96,7 +96,6 @@ defmodule LangChain.ChatModels.ChatBumblebee do
         recompile; MyApp.BumblebeeChat.run_chat
   """
   use Ecto.Schema
-  require Logger
   import Ecto.Changeset
   alias __MODULE__
   alias LangChain.ChatModels.ChatModel
@@ -111,6 +110,11 @@ defmodule LangChain.ChatModels.ChatBumblebee do
   alias LangChain.Message.ToolCall
   alias LangChain.Utils.Parser.LLAMA_3_1_CustomToolParser
   alias LangChain.Utils.Parser.LLAMA_3_2_CustomToolParser
+
+  # Suppress warnings for optional dependencies
+  @compile {:no_warn_undefined, [Nx.Serving]}
+  @compile {:no_warn_undefined, [LangChain.Utils.Parser.LLAMA_3_1_CustomToolParser]}
+  @compile {:no_warn_undefined, [LangChain.Utils.Parser.LLAMA_3_2_CustomToolParser]}
 
   @behaviour ChatModel
 
@@ -167,7 +171,8 @@ defmodule LangChain.ChatModels.ChatBumblebee do
     # :temperature,
     :seed,
     :template_format,
-    :stream
+    :stream,
+    :callbacks
   ]
   @required_fields [:serving]
 
@@ -231,14 +236,17 @@ defmodule LangChain.ChatModels.ChatBumblebee do
   end
 
   def call(%ChatBumblebee{} = model, messages, functions) when is_list(messages) do
+    functions = LangChain.NativeTool.drop_tool_search(functions)
+
     metadata = %{
       model: inspect(model.serving),
+      provider: provider(),
       template_format: model.template_format,
       message_count: length(messages),
       tools_count: length(functions)
     }
 
-    LangChain.Telemetry.span([:langchain, :llm, :call], metadata, fn ->
+    ChatModel.llm_telemetry_span(model, metadata, fn ->
       try do
         # Track the prompt being sent
         LangChain.Telemetry.llm_prompt(
@@ -354,10 +362,8 @@ defmodule LangChain.ChatModels.ChatBumblebee do
             # return a list of the complete message. As a list for compatibility.
             [message]
 
-          {:error, changeset} ->
-            reason = Utils.changeset_error_to_string(changeset)
-            Logger.error("Failed to create non-streamed full message: #{inspect(reason)}")
-            {:error, reason}
+          {:error, _changeset} ->
+            {:error, "Failed to create non-streamed full message"}
         end
 
       {:error, _} ->
@@ -368,10 +374,8 @@ defmodule LangChain.ChatModels.ChatBumblebee do
             # return a list of the complete message. As a list for compatibility.
             [message]
 
-          {:error, changeset} ->
-            reason = Utils.changeset_error_to_string(changeset)
-            Logger.error("Failed to create non-streamed full message: #{inspect(reason)}")
-            {:error, reason}
+          {:error, _changeset} ->
+            {:error, "Failed to create non-streamed full message"}
         end
     end
   end
@@ -405,10 +409,8 @@ defmodule LangChain.ChatModels.ChatBumblebee do
             # return a list of the complete message. As a list for compatibility.
             [message]
 
-          {:error, changeset} ->
-            reason = Utils.changeset_error_to_string(changeset)
-            Logger.error("Failed to create non-streamed full message: #{inspect(reason)}")
-            {:error, reason}
+          {:error, _changeset} ->
+            {:error, "Failed to create non-streamed full message"}
         end
 
       {:error, _} ->
@@ -419,10 +421,8 @@ defmodule LangChain.ChatModels.ChatBumblebee do
             # return a list of the complete message. As a list for compatibility.
             [message]
 
-          {:error, changeset} ->
-            reason = Utils.changeset_error_to_string(changeset)
-            Logger.error("Failed to create non-streamed full message: #{inspect(reason)}")
-            {:error, reason}
+          {:error, _changeset} ->
+            {:error, "Failed to create non-streamed full message"}
         end
     end
   end
@@ -453,10 +453,8 @@ defmodule LangChain.ChatModels.ChatBumblebee do
             # return a list of the complete message. As a list for compatibility.
             [message]
 
-          {:error, changeset} ->
-            reason = Utils.changeset_error_to_string(changeset)
-            Logger.error("Failed to create non-streamed full message: #{inspect(reason)}")
-            {:error, reason}
+          {:error, _changeset} ->
+            {:error, "Failed to create non-streamed full message"}
         end
 
       {:error, _} ->
@@ -467,10 +465,8 @@ defmodule LangChain.ChatModels.ChatBumblebee do
             # return a list of the complete message. As a list for compatibility.
             [message]
 
-          {:error, changeset} ->
-            reason = Utils.changeset_error_to_string(changeset)
-            Logger.error("Failed to create non-streamed full message: #{inspect(reason)}")
-            {:error, reason}
+          {:error, _changeset} ->
+            {:error, "Failed to create non-streamed full message"}
         end
     end
   end
@@ -500,8 +496,6 @@ defmodule LangChain.ChatModels.ChatBumblebee do
         [message]
 
       {:error, %Ecto.Changeset{} = changeset} ->
-        reason = Utils.changeset_error_to_string(changeset)
-        Logger.error("Failed to create non-streamed full message: #{inspect(reason)}")
         {:error, LangChainError.exception(changeset)}
     end
   end
@@ -528,7 +522,7 @@ defmodule LangChain.ChatModels.ChatBumblebee do
 
         # Track stream completion
         LangChain.Telemetry.emit_event(
-          [:langchain, :llm, :response, streaming: true],
+          [:langchain, :llm, :response, :streaming],
           %{system_time: System.system_time()},
           %{model: inspect(model.serving)}
         )
@@ -544,12 +538,6 @@ defmodule LangChain.ChatModels.ChatBumblebee do
             delta
 
           {:error, %Ecto.Changeset{} = changeset} ->
-            reason = Utils.changeset_error_to_string(changeset)
-
-            Logger.error(
-              "Failed to process received model's MessageDelta data: #{inspect(reason)}"
-            )
-
             raise LangChainError.exception(changeset)
         end
     end
@@ -570,6 +558,19 @@ defmodule LangChain.ChatModels.ChatBumblebee do
   end
 
   defp fire_token_usage_callback(_model, _token_summary), do: :ok
+
+  @impl ChatModel
+  def provider, do: "bumblebee"
+
+  @doc """
+  Determine if an error should be retried. If `true`, a fallback LLM may be
+  used. If `false`, the error is understood to be more fundamental with the
+  request rather than a service issue and it should not be retried or fallback
+  to another service.
+  """
+  @impl ChatModel
+  @spec retry_on_fallback?(LangChainError.t()) :: boolean()
+  def retry_on_fallback?(_), do: true
 
   @doc """
   Generate a config map that can later restore the model's configuration.

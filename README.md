@@ -6,27 +6,23 @@
 
 Elixir LangChain enables Elixir applications to integrate AI services and self-hosted models into an application.
 
-**Currently supported AI services:**
+**Supported chat models:**
 
-| Model | v0.3.x | v0.4.x |
-|-------|---------|---------|
-| OpenAI ChatGPT | ✓ | ✓ |
-| OpenAI DALL-e 2 (image generation) | ✓ | ? |
-| Anthropic Claude | ✓ | ✓ |
-| Anthropic Claude (thinking) | X | ✓ |
-| xAI Grok | X | ✓ |
-| Google Gemini | ✓ | X |
-| Google Vertex AI* | ✓ | X |
-| Ollama | ✓ | ? |
-| Mistral | ✓ | X |
-| Bumblebee self-hosted models** | ✓ | ? |
-| LMStudio*** | ✓ | ? |
-| Perplexity | ✓ | ? |
-
-- *Google Vertex AI is Google's enterprise offering
-- **Bumblebee self-hosted models - including Llama, Mistral and Zephyr
-- ***[LMStudio](https://lmstudio.ai/docs/api/endpoints/openai) via their OpenAI compatibility API
-- ****xAI Grok models including Grok-4, Grok-3-mini, Grok-4 Heavy (multi-agent)
+- **Anthropic Claude** - Claude models including extended thinking support and AWS Bedrock
+- **AWS Bedrock Mantle** - OpenAI-compatible gateway for third-party models hosted on Bedrock (Moonshot Kimi K2 family, OpenAI gpt-oss, and many others)
+- **OpenAI ChatGPT** - GPT models via the Chat Completions API
+- **OpenAI Responses API** - OpenAI's newer Responses API with WebSocket transport support
+- **OpenAI-compatible services** - Cloudflare Workers AI, Groq, OpenRouter, vLLM, SGLang, LM Studio and others via `ChatOpenAICompatible`
+- **xAI Grok** - Grok-4, Grok-3-mini, Grok-4 Heavy (multi-agent), and more
+- **Google Gemini** - Gemini AI models
+- **Google Vertex AI** - Google's enterprise AI offering
+- **DeepSeek** - DeepSeek models with prompt caching support
+- **Ollama** - Locally hosted open-source models
+- **Mistral** - Mistral AI models
+- **Perplexity** - Perplexity AI models
+- **orq.ai** - orq.ai Deployments API
+- **Bumblebee** - Self-hosted models via Nx (Llama, Mistral, Zephyr)
+- **ReqLLM** - Multi-provider adapter via the `req_llm` library (Anthropic, OpenAI, Gemini, Groq, Ollama, AWS Bedrock, etc.)
 
 **LangChain** is short for Language Chain. An LLM, or Large Language Model, is the "Language" part. This library makes it easier for Elixir applications to "chain" or connect different processes, integrations, libraries, services, or functionality together with an LLM.
 
@@ -71,13 +67,15 @@ This library was heavily inspired by, and based on, the way the JavaScript libra
 
 ## Installation
 
+**Requirements:** Elixir 1.17 or higher
+
 The package can be installed by adding `langchain` to your list of dependencies
 in `mix.exs`:
 
 ```elixir
 def deps do
   [
-    {:langchain, "0.4.0-rc.1"}
+    {:langchain, "~> 0.9.0"}
   ]
 end
 ```
@@ -132,10 +130,11 @@ A list of models to use:
 
 ## Prompt caching
 
-ChatGPT and Claude both offer prefix-based prompt caching, which can offer cost and performance benefits for longer prompts. Gemini offers context caching, which is similar.
+ChatGPT, Claude, and DeepSeek all offer prefix-based prompt caching, which can offer cost and performance benefits for longer prompts. Gemini offers context caching, which is similar.
 
 - [ChatGPT's prompt caching](https://openai.com/index/api-prompt-caching/) is automatic for prompts longer than 1024 tokens, caching the longest common prefix.
 - [Claude's prompt caching](https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching) is not automatic. It's prefixing processes tools, system, and then messages, in that order, up to and including the block designated with {"cache_control": {"type": "ephemeral"}} . See LangChain.ChatModels.ChatAnthropicTest and for an example.
+- [DeepSeek's prompt caching](https://api-docs.deepseek.com/guides/kv_cache) provides automatic caching for repeated prompts and system messages, helping reduce costs and improve response times for longer conversations.
 - [Gemini's context caching]((https://ai.google.dev/gemini-api/docs/caching?lang=python)) requires a separate call which is not supported by Langchain.
 
 ## Usage
@@ -169,6 +168,43 @@ Grok models offer unique capabilities:
 - **Advanced reasoning mode** with first-principles thinking
 - **Specialized coding support** (Grok-4 Code)
 - **Multimodal capabilities** including vision and image analysis
+
+### AWS Bedrock Mantle Support
+
+LangChain supports AWS Bedrock's **Mantle** endpoint, an OpenAI-compatible gateway for third-party models hosted on Bedrock. A single `ChatAwsMantle` module covers the entire Mantle catalog, including Moonshot's Kimi K2 family (`moonshotai.kimi-k2-thinking`, `moonshotai.kimi-k2.5`) and OpenAI's gpt-oss series (`openai.gpt-oss-120b`), with new models becoming available as AWS adds them.
+
+```elixir
+alias LangChain.ChatModels.ChatAwsMantle
+alias LangChain.Chains.LLMChain
+alias LangChain.Message
+
+# Bearer auth with a Bedrock API key
+{:ok, mantle} = ChatAwsMantle.new(%{
+  model: "moonshotai.kimi-k2.5",
+  region: "us-east-1",
+  api_key: System.fetch_env!("AWS_BEARER_TOKEN_BEDROCK")
+})
+
+{:ok, chain} =
+  LLMChain.new!(%{llm: mantle})
+  |> LLMChain.add_message(Message.new_user!("Summarize Elixir's actor model"))
+  |> LLMChain.run()
+```
+
+Two authentication modes are supported:
+
+- **Bearer token** (simplest): pass `:api_key` with a long-term Bedrock API key.
+- **AWS SigV4** (IAM-friendly): pass `:credentials` as a zero-arity function returning IAM credentials (e.g. from `ExAws.Config`). Useful when the host already has IAM-based auth configured.
+
+Key capabilities:
+
+- **Reasoning extraction**: models that produce chain-of-thought (Kimi K2 Thinking always, K2.5 via `reasoning_effort: "high"`) surface their reasoning as a `ContentPart` of type `:thinking` on the assistant message, so downstream UIs can render thinking the same way as Anthropic extended thinking.
+- **Multimodal (K2.5)**: send images using the standard `ContentPart.image!/2` helper; Mantle accepts the OpenAI-shaped `image_url` wire format.
+- **Streaming** with per-chunk `MessageDelta` updates, including separate deltas for reasoning and content.
+- **Tool calling** via the standard OpenAI `tool_calls` shape.
+- **Region-aware URL building**: set `:region` and the endpoint is derived as `https://bedrock-mantle.{region}.api.aws/v1/chat/completions`.
+
+See the `LangChain.ChatModels.ChatAwsMantle` module documentation for the full list of tested models, per-model quirks, sampling controls (`:temperature`, `:top_p`, `:frequency_penalty`, `:presence_penalty`), and usage notes.
 
 ### Exposing a custom Elixir function to ChatGPT
 
@@ -235,20 +271,74 @@ IO.puts(ChainResult.to_string!(updated_chain))
 # => "The hairbrush is located in the drawer."
 ```
 
-### Alternative OpenAI compatible APIs
+### OpenAI-compatible services
 
-There are several services or self-hosted applications that provide an OpenAI compatible API for ChatGPT-like behavior. To use a service like that, the `endpoint` of the `ChatOpenAI` struct can be pointed to an API compatible `endpoint` for chats.
+Many services and self-hosted servers expose an OpenAI-compatible Chat Completions endpoint: Cloudflare Workers AI, Groq, OpenRouter, Together, vLLM, SGLang, Ollama, LM Studio and others. Use `ChatOpenAICompatible` for them.
 
-For example, if a locally running service provided that feature, the following code could connect to the service:
+`ChatOpenAI` follows OpenAI's own API, including changes these services often do not support, such as sending the token limit as `max_completion_tokens` or sending system messages under the `developer` role. `ChatOpenAICompatible` sends only the fields you set, always sends system messages as `system`, sends the token limit as `max_tokens`, and never falls back to the global OpenAI API key.
+
+For example, a locally running server needs only its endpoint and a model name:
 
 ```elixir
+alias LangChain.ChatModels.ChatOpenAICompatible
+
 {:ok, updated_chain} =
   LLMChain.new!(%{
-    llm: ChatOpenAI.new!(%{endpoint: "http://localhost:1234/v1/chat/completions"}),
+    llm:
+      ChatOpenAICompatible.new!(%{
+        endpoint: "http://localhost:1234/v1/chat/completions",
+        model: "qwen3-8b"
+      })
   })
   |> LLMChain.add_message(Message.new_user!("Hello!"))
   |> LLMChain.run()
 ```
+
+Service-specific parameters go in `extra_body`, and extra headers in `req_config`. A reasoning model's thinking, returned by many of these services in a `reasoning_content` field, arrives as a `:thinking` content part ahead of the answer.
+
+### Cloudflare Workers AI
+
+Cloudflare Workers AI is reached through `ChatOpenAICompatible` with the account's endpoint and a Workers AI API token. Any model in the Workers AI catalog (e.g. `@cf/zai-org/glm-5.3-flash` or `@cf/moonshotai/kimi-k2.6`) can be used this way, including with streaming and tool calling.
+
+```elixir
+alias LangChain.ChatModels.ChatOpenAICompatible
+alias LangChain.Chains.LLMChain
+alias LangChain.Message
+
+account_id = System.fetch_env!("CLOUDFLARE_ACCOUNT_ID")
+# Any id shared by requests that reuse the same system prompt.
+conversation_id = "conversation-123"
+
+{:ok, chat} =
+  ChatOpenAICompatible.new(%{
+    endpoint:
+      "https://api.cloudflare.com/client/v4/accounts/#{account_id}/ai/v1/chat/completions",
+    api_key: System.fetch_env!("CLOUDFLARE_AI_API_TOKEN"),
+    model: "@cf/zai-org/glm-5.3-flash",
+    reasoning_effort: "low",
+    req_config: %{
+      headers: [
+        {"cf-aig-gateway-id", System.fetch_env!("CLOUDFLARE_AI_GATEWAY_ID")},
+        {"x-session-affinity", conversation_id}
+      ]
+    }
+  })
+
+{:ok, updated_chain} =
+  %{llm: chat}
+  |> LLMChain.new!()
+  |> LLMChain.add_messages([
+    Message.new_system!("You answer with a single word."),
+    Message.new_user!("Reply with the single word: PONG")
+  ])
+  |> LLMChain.run()
+```
+
+- `cf-aig-gateway-id` routes the call through a named AI Gateway. On the Workers Free plan some models are reachable only this way.
+- `x-session-affinity` sends requests that share an id to the same replica, so a repeated prompt prefix is served from the prompt cache. Without it, repeated prefixes are not cached.
+- `reasoning_effort` controls how long a reasoning model thinks, which affects latency and output tokens.
+
+Streaming and tool calling work as with any other chat model: set `stream: true` and add tools via `LLMChain.add_tools/2`.
 
 ### Bumblebee Chat Support
 
@@ -270,15 +360,14 @@ See the [`LangChain.ChatModels.ChatBumblebee` documentation](https://hexdocs.pm/
 
 ## Testing
 
-Before you can run the tests, make sure you have the environment variables set.
-
-You can do this by running:
+Before you can run live API tests, you need to provide your API keys. Copy the example file and populate it with your values:
 
 ```
-source .envrc_template
+cp .env.example .env
+# Edit .env with your private API keys
 ```
 
-Or you can copy it to `.envrc` and populate it with your private API values.
+The `.env` file is gitignored and is loaded automatically by the test suite via [dotenvy](https://hex.pm/packages/dotenvy) — no shell setup or external tools required.
 
 To run all the tests including the ones that perform live calls against the OpenAI API, use the following command:
 
@@ -287,6 +376,7 @@ mix test --include live_call
 mix test --include live_open_ai
 mix test --include live_ollama_ai
 mix test --include live_anthropic
+mix test --include live_aws_mantle
 mix test --include live_mistral_ai
 mix test --include live_grok
 mix test --include live_vertex_ai
@@ -303,10 +393,143 @@ mix test
 
 Executing a specific test, whether it is a `live_call` or not, will execute it creating a potentially billable event.
 
-When doing local development on the `LangChain` library itself, rename the `.envrc_template` to `.envrc` and populate it with your private API values. This is only used when running live test when explicitly requested.
-
-Use a tool like [Direnv](https://direnv.net/) or [Dotenv](https://github.com/motdotla/dotenv) to load the API values into the ENV when using the library locally.
-
 **Multi-modal support:**
 
 LangChain now supports multi-modal messages and tool results. This means you can include text, images, files, and even "thinking" blocks in a single message using ContentParts. See module docs for details. Support for this depends on the LLM and service. Not all models may yet support all modalities.
+
+## Evaluating Agent Behavior
+
+When building agent systems, the final answer is only part of the story. Two agents can produce the same answer through very different reasoning paths — one might make a single efficient tool call while another makes five redundant ones. LangChain provides `LangChain.Trajectory` to evaluate the *process*, not just the outcome.
+
+A trajectory captures the structured sequence of tool calls produced during an `LLMChain` run, enabling regression testing, cost control, safety verification, and debugging of agent workflows.
+
+### Capturing a Trajectory
+
+After running a chain, extract its trajectory:
+
+```elixir
+alias LangChain.Trajectory
+
+{:ok, chain} =
+  LLMChain.new!(%{llm: llm})
+  |> LLMChain.add_tools(my_tools)
+  |> LLMChain.add_message(Message.new_user!("What's the weather in Paris?"))
+  |> LLMChain.run(mode: :while_needs_response)
+
+trajectory = Trajectory.from_chain(chain)
+trajectory.tool_calls
+#=> [%{name: "search", arguments: %{"query" => "weather paris"}},
+#    %{name: "get_forecast", arguments: %{"city" => "Paris"}}]
+```
+
+### Matching Tool Call Sequences
+
+Use `Trajectory.matches?/3` to compare actual tool calls against expected patterns:
+
+```elixir
+# Strict: exact order and arguments
+Trajectory.matches?(trajectory, [
+  %{name: "search", arguments: %{"query" => "weather paris"}},
+  %{name: "get_forecast", arguments: %{"city" => "Paris"}}
+])
+
+# Wildcard arguments: pass nil to match any arguments
+Trajectory.matches?(trajectory, [
+  %{name: "search", arguments: nil},
+  %{name: "get_forecast", arguments: nil}
+])
+
+# Unordered: same calls in any order
+Trajectory.matches?(trajectory, expected, mode: :unordered)
+
+# Superset: actual contains at least all expected calls
+Trajectory.matches?(trajectory, [%{name: "search", arguments: nil}], mode: :superset)
+
+# Subset args: expected arguments are a subset of actual
+Trajectory.matches?(trajectory, expected, args: :subset)
+```
+
+### ExUnit Assertions
+
+`LangChain.Trajectory.Assertions` provides `assert_trajectory` and `refute_trajectory` macros with informative failure diffs:
+
+```elixir
+use LangChain.Trajectory.Assertions
+
+test "agent calls the right tools in order" do
+  trajectory = Trajectory.from_chain(chain)
+
+  assert_trajectory trajectory, [
+    %{name: "search", arguments: %{"query" => "weather"}},
+    %{name: "get_forecast", arguments: nil}
+  ]
+end
+
+test "agent does not call dangerous tools" do
+  trajectory = Trajectory.from_chain(chain)
+
+  refute_trajectory trajectory, [
+    %{name: "delete_all", arguments: nil}
+  ], mode: :superset
+end
+```
+
+Both macros also accept an `LLMChain` directly, extracting the trajectory automatically.
+
+### Golden-File Testing
+
+Save a known-good trajectory and compare future runs against it to catch regressions:
+
+```elixir
+# Save the golden file
+golden = chain |> Trajectory.from_chain() |> Trajectory.to_map()
+File.write!("test/fixtures/weather_agent.json", Jason.encode!(golden))
+
+# In your test
+golden_map = "test/fixtures/weather_agent.json" |> File.read!() |> Jason.decode!()
+expected = Trajectory.from_map(golden_map)
+actual = Trajectory.from_chain(chain)
+
+assert_trajectory actual, expected
+```
+
+### Inspecting Trajectories
+
+Filter and group tool calls for deeper analysis:
+
+```elixir
+# All calls to a specific tool
+Trajectory.calls_by_name(trajectory, "search")
+
+# Group calls by conversation turn
+Trajectory.calls_by_turn(trajectory)
+#=> [{0, [%{name: "search", ...}]}, {1, [%{name: "get_forecast", ...}]}]
+
+# Check aggregated token usage
+trajectory.token_usage
+#=> %TokenUsage{input: 150, output: 45}
+
+# Check metadata
+trajectory.metadata
+#=> %{model: "gpt-4", llm_module: LangChain.ChatModels.ChatOpenAI}
+```
+
+See `LangChain.Trajectory` and `LangChain.Trajectory.Assertions` module docs for the full API reference.
+
+## Observability
+
+LangChain emits [`:telemetry`](https://hexdocs.pm/telemetry) events for every LLM call, chain execution, and tool call — with provider, model, duration, and token usage — so you can plug them into `Telemetry.Metrics`, PromEx, `Logger`, or your own handlers with no extra dependencies.
+
+For distributed tracing, an optional built-in [OpenTelemetry](https://opentelemetry.io/) integration turns those events into GenAI-semantic-convention spans and metrics, ready to export to [Langfuse](https://langfuse.com/), Honeycomb, Grafana Tempo, Jaeger, or any OTLP collector. Add the optional OTel dependencies and call `setup/1` once at startup:
+
+```elixir
+# mix.exs — optional, only needed for the OpenTelemetry integration
+{:opentelemetry_api, "~> 1.4"},
+{:opentelemetry, "~> 1.5"},
+{:opentelemetry_exporter, "~> 1.8"}
+
+# application startup
+LangChain.OpenTelemetry.setup()
+```
+
+Message and tool-content capture is off by default (to avoid exposing PII) and enabled per-flag when you need it. See the [Observability guide](guides/observability.md) for span mappings, metrics wiring, Langfuse setup, and configuration, plus the `LangChain.Telemetry` and `LangChain.OpenTelemetry` module docs.

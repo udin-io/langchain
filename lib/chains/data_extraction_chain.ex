@@ -6,6 +6,10 @@ defmodule LangChain.Chains.DataExtractionChain do
   though there are 0 to many instances of the data structure being described so
   information is returned as an array.
 
+  The result is always a list. If the LLM returns a single map instead of an
+  array, it is automatically wrapped in a list so callers can rely on a
+  consistent return type.
+
   Originally based on:
   - https://github.com/langchain-ai/langchainjs/blob/main/langchain/src/chains/openai_functions/extraction.ts#L43
 
@@ -52,6 +56,43 @@ defmodule LangChain.Chains.DataExtractionChain do
         }
       ]
 
+  If the LLM returns a single map (e.g. when only one entity is found), it is
+  wrapped in a list automatically:
+
+      # Single-entity result normalised to a list
+      [
+        %{
+          "person_name" => "Alex",
+          "person_age" => nil,
+          ...
+        }
+      ]
+
+  ## Accessing the LLMChain
+
+  `run/4` returns only the extracted data. When more than the data is needed,
+  for instance to log or report the token usage of the extraction, use
+  `run_chain/4` to get the executed `LangChain.Chains.LLMChain` and
+  `extract_result/1` to pull the data out of it:
+
+      {:ok, chain} = LangChain.Chains.DataExtractionChain.run_chain(chat, schema_parameters, data_prompt)
+
+      usage = LangChain.TokenUsage.get(chain.last_message)
+      {:ok, result} = LangChain.Chains.DataExtractionChain.extract_result(chain)
+
+  ## Callbacks
+
+  The `LLMChain` used for the extraction is built internally, so handlers
+  registered on the `llm` itself are not used. Pass `:callbacks` to observe the
+  run as it happens, which is the only way to see streamed deltas:
+
+      LangChain.Chains.DataExtractionChain.run(chat, schema_parameters, data_prompt,
+        callbacks: [%{on_llm_token_usage: fn _chain, usage -> log_usage(usage) end}]
+      )
+
+  Handlers are registered on the internally run `LLMChain`, so the full set of
+  `LangChain.Chains.ChainCallbacks` events is available.
+
   The `schema_parameters` in the previous example can also be expressed using a
   list of `LangChain.FunctionParam` structs. An equivalent version looks like
   this:
@@ -84,44 +125,109 @@ Passage:
 <%= @input %>"
 
   @doc """
-  Run the data extraction chain.
+  Coerces the extraction tool's `info` argument to a list of rows.
+
+  Models sometimes return one JSON object instead of a one-element array; `run/4`
+  uses this so callers always get `{:ok, list}`.
+  """
+  @spec normalize_extraction_info(term()) :: {:ok, [any()]} | {:error, LangChainError.t()}
+  def normalize_extraction_info(info) when is_list(info), do: {:ok, info}
+
+  def normalize_extraction_info(info) when is_map(info), do: {:ok, [info]}
+
+  def normalize_extraction_info(other) do
+    {:error,
+     LangChainError.exception("Extracted data must be a list or map, got: #{inspect(other)}")}
+  end
+
+  @doc """
+  Run the data extraction chain and return the executed `LangChain.Chains.LLMChain`.
+
+  Use this instead of `run/4` when the chain itself is needed and not just the
+  extracted data. The chain gives access to the returned messages, token usage,
+  and everything else recorded during execution.
+
+      {:ok, chain} = DataExtractionChain.run_chain(chat, schema_parameters, data_prompt)
+
+      # inspect the token usage of the extraction
+      usage = LangChain.TokenUsage.get(chain.last_message)
+
+      # get the extracted data from the chain
+      {:ok, result} = DataExtractionChain.extract_result(chain)
+
+  Follows the same return pattern as `LangChain.Chains.LLMChain.run/2`.
+
+  ## Options
+
+  - `:verbose` - when `true`, enables verbose logging on the internally run
+    `LLMChain`. Defaults to `false`.
+  - `:callbacks` - a list of callback handler maps to register on the
+    internally run `LLMChain`. See `LangChain.Chains.ChainCallbacks` for the
+    available events. Defaults to `[]`.
+  """
+  @spec run_chain(ChatOpenAI.t(), json_schema :: map(), prompt :: [any()], opts :: Keyword.t()) ::
+          {:ok, LLMChain.t()} | {:error, LLMChain.t(), LangChainError.t()}
+  def run_chain(llm, json_schema, prompt, opts \\ []) do
+    verbose = Keyword.get(opts, :verbose, false)
+    callbacks = Keyword.get(opts, :callbacks, [])
+
+    messages =
+      [
+        Message.new_system!(
+          "You are a helpful assistant that extracts structured data from text passages. Only use the functions you have been provided with. Extract the data in a single tool use."
+        ),
+        PromptTemplate.new!(%{role: :user, text: @extraction_template})
+      ]
+      |> PromptTemplate.to_messages!(%{input: prompt})
+
+    %{llm: llm, verbose: verbose, callbacks: callbacks}
+    |> LLMChain.new!()
+    |> LLMChain.add_tools(build_extract_function(json_schema))
+    |> LLMChain.add_messages(messages)
+    |> LLMChain.run()
+  end
+
+  @doc """
+  Return the extracted data from an executed `LangChain.Chains.LLMChain` that
+  was run by `run_chain/4`.
+
+  Returns an error when the LLM did not respond with the expected extraction
+  tool call.
+  """
+  @spec extract_result(LLMChain.t()) :: {:ok, result :: [any()]} | {:error, LangChainError.t()}
+  def extract_result(%LLMChain{
+        last_message: %Message{
+          role: :assistant,
+          tool_calls: [
+            %ToolCall{
+              name: @function_name,
+              arguments: %{"info" => info}
+            }
+          ]
+        }
+      }) do
+    normalize_extraction_info(info)
+  end
+
+  def extract_result(%LLMChain{} = chain) do
+    {:error, LangChainError.exception("Unexpected response. #{inspect({:ok, chain})}")}
+  end
+
+  @doc """
+  Run the data extraction chain and return the extracted data.
+
+  When the executed chain is needed as well, for instance to report token usage,
+  use `run_chain/4` with `extract_result/1`.
+
+  Accepts the same options as `run_chain/4`.
   """
   @spec run(ChatOpenAI.t(), json_schema :: map(), prompt :: [any()], opts :: Keyword.t()) ::
           {:ok, result :: [any()]} | {:error, LangChainError.t()}
   def run(llm, json_schema, prompt, opts \\ []) do
-    verbose = Keyword.get(opts, :verbose, false)
-
     try do
-      messages =
-        [
-          Message.new_system!(
-            "You are a helpful assistant that extracts structured data from text passages. Only use the functions you have been provided with. Extract the data in a single tool use."
-          ),
-          PromptTemplate.new!(%{role: :user, text: @extraction_template})
-        ]
-        |> PromptTemplate.to_messages!(%{input: prompt})
-
-      {:ok, chain} = LLMChain.new(%{llm: llm, verbose: verbose})
-
-      chain
-      |> LLMChain.add_tools(build_extract_function(json_schema))
-      |> LLMChain.add_messages(messages)
-      |> LLMChain.run()
-      |> case do
-        {:ok,
-         %LLMChain{
-           last_message: %Message{
-             role: :assistant,
-             tool_calls: [
-               %ToolCall{
-                 name: @function_name,
-                 arguments: %{"info" => info}
-               }
-             ]
-           }
-         }}
-        when is_list(info) ->
-          {:ok, info}
+      case run_chain(llm, json_schema, prompt, opts) do
+        {:ok, %LLMChain{} = chain} ->
+          extract_result(chain)
 
         other ->
           {:error, LangChainError.exception("Unexpected response. #{inspect(other)}")}

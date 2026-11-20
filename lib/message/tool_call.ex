@@ -14,7 +14,6 @@ defmodule LangChain.Message.ToolCall do
   """
   use Ecto.Schema
   import Ecto.Changeset
-  require Logger
   alias __MODULE__
   alias LangChain.LangChainError
 
@@ -28,6 +27,10 @@ defmodule LangChain.Message.ToolCall do
     # when the tool call is incomplete, the index indicates which tool call to
     # update on a ToolCall.
     field :index, :integer
+    # Text to display in a UI for the tool call. Optional.
+    field :display_text, :string
+    # Map of model-specific metadata attributes
+    field :metadata, :map
   end
 
   # https://cookbook.openai.com/examples/how_to_call_functions_with_chat_models
@@ -38,7 +41,7 @@ defmodule LangChain.Message.ToolCall do
 
   @type t :: %ToolCall{}
 
-  @update_fields [:status, :type, :call_id, :name, :arguments, :index]
+  @update_fields [:status, :type, :call_id, :name, :arguments, :index, :display_text, :metadata]
   @create_fields @update_fields
 
   @doc """
@@ -82,6 +85,51 @@ defmodule LangChain.Message.ToolCall do
     |> common_validations()
     |> apply_action(:insert)
   end
+
+  @doc """
+  Return the tool call's `arguments` as a map, suitable for serializing to a
+  provider API that expects a JSON object.
+
+  `arguments` are only parsed from a JSON string into a map by `complete/1` (via
+  `validate_and_parse_arguments/1`), which runs when a tool call reaches
+  `status: :complete`. A tool call that is serialized without going through that
+  path (e.g. a persisted/replayed `:incomplete` call, or one accumulated from a
+  truncated stream) can still hold a raw string. Passing that string to a
+  provider results in an API error like Anthropic's "Input should be an object".
+
+  This normalizes any shape into a map:
+
+    * a map is returned unchanged
+    * a JSON-object string is decoded
+    * `nil`, an empty string, and undecodable/non-object strings become `%{}`
+
+  ## Examples
+
+      iex> LangChain.Message.ToolCall.arguments_as_map(%LangChain.Message.ToolCall{arguments: %{"a" => 1}})
+      %{"a" => 1}
+
+      iex> LangChain.Message.ToolCall.arguments_as_map(%LangChain.Message.ToolCall{arguments: ~s({"a":1})})
+      %{"a" => 1}
+
+      iex> LangChain.Message.ToolCall.arguments_as_map(%LangChain.Message.ToolCall{arguments: ""})
+      %{}
+
+      iex> LangChain.Message.ToolCall.arguments_as_map(%LangChain.Message.ToolCall{arguments: nil})
+      %{}
+  """
+  @spec arguments_as_map(t()) :: map()
+  def arguments_as_map(%ToolCall{arguments: arguments}), do: normalize_arguments(arguments)
+
+  defp normalize_arguments(arguments) when is_map(arguments), do: arguments
+
+  defp normalize_arguments(arguments) when is_binary(arguments) do
+    case Jason.decode(arguments) do
+      {:ok, map} when is_map(map) -> map
+      _ -> %{}
+    end
+  end
+
+  defp normalize_arguments(_arguments), do: %{}
 
   defp common_validations(changeset) do
     case get_field(changeset, :status) do
@@ -151,6 +199,8 @@ defmodule LangChain.Message.ToolCall do
     |> update_call_id(call_part)
     |> update_type(call_part)
     |> update_status(call_part)
+    |> preserve_display_text(call_part)
+    |> preserve_metadata(call_part)
   end
 
   defp append_tool_name(%ToolCall{name: primary_name} = primary, %ToolCall{name: new_name})
@@ -209,16 +259,77 @@ defmodule LangChain.Message.ToolCall do
     primary
   end
 
-  defp append_arguments(%ToolCall{} = primary, %ToolCall{
+  # Preserve display_text: use the delta's value if present, otherwise keep primary's
+  defp preserve_display_text(%ToolCall{} = primary, %ToolCall{display_text: text})
+       when is_binary(text) do
+    %ToolCall{primary | display_text: text}
+  end
+
+  defp preserve_display_text(%ToolCall{} = primary, %ToolCall{}), do: primary
+
+  # Preserve metadata: use the delta's value if present, otherwise keep primary's
+  defp preserve_metadata(%ToolCall{} = primary, %ToolCall{metadata: meta})
+       when is_map(meta) do
+    %ToolCall{primary | metadata: Map.merge(primary.metadata || %{}, meta)}
+  end
+
+  defp preserve_metadata(%ToolCall{} = primary, %ToolCall{}), do: primary
+
+  defp append_arguments(%ToolCall{status: :incomplete} = primary, %ToolCall{
+         status: :complete,
          arguments: new_arguments
        })
-       when is_binary(new_arguments) do
-    %ToolCall{primary | arguments: (primary.arguments || "") <> new_arguments}
+       when is_map(new_arguments) do
+    %ToolCall{primary | arguments: new_arguments}
+  end
+
+  defp append_arguments(%ToolCall{arguments: existing} = primary, %ToolCall{
+         arguments: new_arguments
+       })
+       when is_binary(new_arguments) and (is_binary(existing) or is_nil(existing)) do
+    %ToolCall{primary | arguments: (existing || "") <> new_arguments}
+  end
+
+  # Once a complete delta with map arguments has been merged (via the clause
+  # above), the primary's arguments are a decoded map. Some providers then send
+  # trailing deltas that still carry binary JSON fragments for the same tool
+  # call. Appending a binary to a map would crash with an ArgumentError on <>.
+  # The complete arguments are already present, so the fragment is safely
+  # discarded — there is no meaningful way to merge a partial JSON string into
+  # an already-decoded map.
+  defp append_arguments(%ToolCall{arguments: existing} = primary, %ToolCall{
+         arguments: new_arguments
+       })
+       when is_map(existing) and is_binary(new_arguments) do
+    primary
   end
 
   defp append_arguments(%ToolCall{} = primary, %ToolCall{} = _delta_part) do
     # no arguments to merge
     primary
+  end
+
+  @doc """
+  Get the execution status from a ToolCall's metadata.
+
+  Returns the status string ("identified", "executing", "completed", "failed")
+  or the default value if not set.
+  """
+  @spec execution_status(t(), String.t()) :: String.t()
+  def execution_status(%ToolCall{metadata: metadata}, default \\ "identified") do
+    case metadata do
+      %{"execution_status" => status} -> status
+      _ -> default
+    end
+  end
+
+  @doc """
+  Set the execution status on a ToolCall's metadata.
+  """
+  @spec set_execution_status(t(), String.t()) :: t()
+  def set_execution_status(%ToolCall{} = tool_call, status) when is_binary(status) do
+    metadata = tool_call.metadata || %{}
+    %{tool_call | metadata: Map.put(metadata, "execution_status", status)}
   end
 
   # The contents and arguments get streamed as a string. A tool call may be part of a delta and it

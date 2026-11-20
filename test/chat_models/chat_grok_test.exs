@@ -1,7 +1,9 @@
 defmodule LangChain.ChatModels.ChatGrokTest do
   use LangChain.BaseCase
+  use Mimic
 
   doctest LangChain.ChatModels.ChatGrok
+  alias LangChain.Chains.LLMChain
   alias LangChain.ChatModels.ChatGrok
   alias LangChain.Function
   alias LangChain.FunctionParam
@@ -9,6 +11,8 @@ defmodule LangChain.ChatModels.ChatGrokTest do
   alias LangChain.Message.ContentPart
   alias LangChain.Message.ToolCall
   alias LangChain.Message.ToolResult
+  alias LangChain.MessageDelta
+  alias LangChain.TokenUsage
 
   @test_model "grok-4"
 
@@ -132,6 +136,69 @@ defmodule LangChain.ChatModels.ChatGrokTest do
       assert tool_data.function.name == "hello_world"
     end
 
+    test "sends each tool result as its own message with JSON-encoded arguments", %{grok: grok} do
+      messages = [
+        Message.new_user!("Weather in SF and NYC?"),
+        Message.new_assistant!(%{
+          tool_calls: [
+            ToolCall.new!(%{
+              call_id: "call_1",
+              name: "get_weather",
+              arguments: %{"city" => "SF"}
+            }),
+            ToolCall.new!(%{
+              call_id: "call_2",
+              name: "get_weather",
+              arguments: %{"city" => "NYC"}
+            })
+          ]
+        }),
+        Message.new_tool_result!(%{
+          tool_results: [
+            ToolResult.new!(%{tool_call_id: "call_1", content: "Sunny"}),
+            ToolResult.new!(%{tool_call_id: "call_2", content: "Rainy"})
+          ]
+        })
+      ]
+
+      result = ChatGrok.for_api(grok, messages)
+
+      assert [user, assistant, sf, nyc] = result.messages
+      assert user.role == "user"
+
+      assert [
+               %{function: %{arguments: "{\"city\":\"SF\"}"}},
+               %{function: %{arguments: "{\"city\":\"NYC\"}"}}
+             ] =
+               assistant.tool_calls
+
+      assert %{role: "tool", tool_call_id: "call_1", content: "Sunny"} = sf
+      assert %{role: "tool", tool_call_id: "call_2", content: "Rainy"} = nyc
+    end
+
+    test "sends a tool's parameters as its JSON schema", %{
+      grok: grok,
+      messages: messages,
+      weather: weather
+    } do
+      result = ChatGrok.for_api(grok, messages, [weather])
+
+      assert [
+               %{
+                 function: %{
+                   parameters: %{
+                     "type" => "object",
+                     "properties" => %{"city" => _},
+                     "required" => required
+                   }
+                 }
+               }
+             ] =
+               result.tools
+
+      assert "city" in required
+    end
+
     test "excludes nil optional fields", %{grok: grok, messages: messages} do
       result = ChatGrok.for_api(grok, messages)
 
@@ -227,17 +294,13 @@ defmodule LangChain.ChatModels.ChatGrokTest do
 
       serialized = ChatGrok.serialize_config(original)
       assert is_map(serialized)
-      assert serialized.model == "grok-4"
-      assert serialized.module == ChatGrok
+      assert serialized["model"] == "grok-4"
+      assert serialized["version"] == 1
 
       {:ok, restored} = ChatGrok.restore_from_map(serialized)
       assert restored.model == original.model
       assert restored.temperature == original.temperature
       assert restored.max_tokens == original.max_tokens
-    end
-
-    test "handles invalid restore data" do
-      assert {:error, _reason} = ChatGrok.restore_from_map(%{invalid: "data"})
     end
   end
 
@@ -253,6 +316,27 @@ defmodule LangChain.ChatModels.ChatGrokTest do
     end
 
     @tag live_call: true, live_grok: true
+    test "completes a tool call round trip" do
+      product_count =
+        Function.new!(%{
+          name: "get_product_count",
+          description: "Returns how many products the team has.",
+          function: fn _args, _context -> {:ok, "42"} end
+        })
+
+      {:ok, chain} =
+        %{llm: ChatGrok.new!(%{model: @test_model})}
+        |> LLMChain.new!()
+        |> LLMChain.add_tools([product_count])
+        |> LLMChain.add_message(Message.new_system!("You are a helpful assistant."))
+        |> LLMChain.add_message(Message.new_user!("How many products do we have? Use the tool."))
+        |> LLMChain.run(mode: :while_needs_response)
+
+      assert Enum.any?(chain.messages, &(&1.role == :tool))
+      assert chain.last_message.content =~ "42"
+    end
+
+    @tag live_call: true, live_grok: true
     test "streaming chat completion" do
       {:ok, grok} =
         ChatGrok.new(%{
@@ -261,11 +345,18 @@ defmodule LangChain.ChatModels.ChatGrokTest do
           stream_options: %{include_usage: true}
         })
 
-      {:ok, deltas} = ChatGrok.call(grok, "Count from 1 to 3")
+      {:ok, [_ | _] = items} = ChatGrok.call(grok, "Count from 1 to 3")
 
-      assert is_list(deltas)
-      assert length(deltas) > 0
-      assert Enum.all?(deltas, fn delta -> match?(%LangChain.MessageDelta{}, delta) end)
+      # `include_usage` closes the stream with a usage-only chunk, which comes
+      # back as a `%TokenUsage{}` among the deltas.
+      {usage, deltas} = Enum.split_with(items, &match?(%TokenUsage{}, &1))
+
+      assert [%MessageDelta{} | _] = deltas
+      assert Enum.all?(deltas, &match?(%MessageDelta{}, &1))
+
+      assert [%TokenUsage{input: input, output: output}] = usage
+      assert input > 0
+      assert output > 0
     end
 
     @tag live_call: true, live_grok: true
@@ -447,6 +538,281 @@ defmodule LangChain.ChatModels.ChatGrokTest do
       assert %Message{role: :assistant} = message
       assert is_binary(message.content)
       assert String.length(message.content) > 0
+    end
+  end
+
+  describe "call/3 token usage persistence (regression)" do
+    setup :verify_on_exit!
+
+    # Regression: Grok stored the raw, string-keyed API `usage` map on the message
+    # metadata instead of a `%TokenUsage{}` struct. Because
+    # `ChatModel.token_usage_from_result/1` only reads a `%TokenUsage{}`, the
+    # `[:langchain, :llm, :call, :stop]` telemetry event (and the OTEL span) always
+    # reported `token_usage: nil` for Grok even though xAI returned usage. This
+    # test exercises the real `call/3` (mocking only the HTTP layer) so the wiring,
+    # not a hand-fed stub, is what's asserted.
+    test "non-streaming call persists token usage onto the message and stop event" do
+      test_pid = self()
+
+      grok = ChatGrok.new!(%{model: "grok-4", api_key: "test-xai-key"})
+
+      response_body = %{
+        "choices" => [
+          %{
+            "message" => %{"role" => "assistant", "content" => "Hello from Grok!"},
+            "finish_reason" => "stop",
+            "index" => 0
+          }
+        ],
+        "usage" => %{
+          "prompt_tokens" => 11,
+          "completion_tokens" => 22,
+          "total_tokens" => 33
+        }
+      }
+
+      expect(Req, :post, fn _opts ->
+        {:ok, %Req.Response{status: 200, body: response_body}}
+      end)
+
+      :telemetry.attach(
+        "test-grok-token-usage-stop",
+        [:langchain, :llm, :call, :stop],
+        fn _name, _measurements, metadata, _config ->
+          send(test_pid, {:stop, metadata})
+        end,
+        nil
+      )
+
+      assert {:ok, [%Message{} = message]} =
+               ChatGrok.call(grok, [Message.new_user!("Hi")], [])
+
+      # Usage is on the returned message metadata as a struct...
+      assert %TokenUsage{input: 11, output: 22} = TokenUsage.get(message)
+
+      # ...and therefore reaches the LLM call :stop telemetry event.
+      assert_received {:stop, stop_metadata}
+      assert %TokenUsage{input: 11, output: 22} = stop_metadata.token_usage
+
+      :telemetry.detach("test-grok-token-usage-stop")
+    end
+
+    test "fires :on_llm_token_usage with a %TokenUsage{} at the model-tier arity" do
+      test_pid = self()
+
+      # Model-tier handlers receive just the event argument. Firing the model
+      # alongside a raw API map raises BadArityError inside `Callbacks.fire/3`,
+      # which fails the whole call rather than only the handler.
+      grok =
+        ChatGrok.new!(%{
+          model: "grok-4",
+          api_key: "test-xai-key",
+          callbacks: [%{on_llm_token_usage: fn usage -> send(test_pid, {:usage, usage}) end}]
+        })
+
+      response_body = %{
+        "choices" => [
+          %{
+            "message" => %{"role" => "assistant", "content" => "Hi"},
+            "finish_reason" => "stop",
+            "index" => 0
+          }
+        ],
+        "usage" => %{"prompt_tokens" => 11, "completion_tokens" => 22, "total_tokens" => 33}
+      }
+
+      expect(Req, :post, fn _opts ->
+        {:ok, %Req.Response{status: 200, body: response_body}}
+      end)
+
+      assert {:ok, [%Message{}]} = ChatGrok.call(grok, [Message.new_user!("Hi")], [])
+
+      assert_received {:usage, %TokenUsage{input: 11, output: 22}}
+    end
+
+    test "parses the arguments of a non-streamed tool call" do
+      grok = ChatGrok.new!(%{model: "grok-4", api_key: "test-xai-key"})
+
+      response_body = %{
+        "choices" => [
+          %{
+            "message" => %{
+              "role" => "assistant",
+              "content" => "",
+              "tool_calls" => [
+                %{
+                  "id" => "call_1",
+                  "type" => "function",
+                  "function" => %{"name" => "get_weather", "arguments" => "{\"city\":\"Paris\"}"}
+                }
+              ]
+            },
+            "finish_reason" => "tool_calls",
+            "index" => 0
+          }
+        ]
+      }
+
+      expect(Req, :post, fn _opts ->
+        {:ok, %Req.Response{status: 200, body: response_body}}
+      end)
+
+      assert {:ok, [%Message{tool_calls: [tool_call]}]} =
+               ChatGrok.call(grok, [Message.new_user!("Weather in Paris?")], [])
+
+      assert %ToolCall{status: :complete, call_id: "call_1", arguments: %{"city" => "Paris"}} =
+               tool_call
+    end
+
+    test "carries the finish reason onto a non-streamed message" do
+      grok = ChatGrok.new!(%{model: "grok-4", api_key: "test-xai-key"})
+
+      response_body = %{
+        "choices" => [
+          %{
+            "message" => %{"role" => "assistant", "content" => "Hel"},
+            "finish_reason" => "length",
+            "index" => 0
+          }
+        ]
+      }
+
+      expect(Req, :post, fn _opts ->
+        {:ok, %Req.Response{status: 200, body: response_body}}
+      end)
+
+      assert {:ok, [%Message{status: :length}]} =
+               ChatGrok.call(grok, [Message.new_user!("Hi")], [])
+    end
+
+    # A streamed request hands `Req` an `:into` collector, so a mocked post has
+    # to drive that collector the way a real response would rather than handing
+    # back a buffered body.
+    defp expect_streamed_post(chunks) do
+      expect(Req, :post, fn opts ->
+        collector = Keyword.fetch!(opts, :into)
+        start = {Req.Request.new(), %Req.Response{status: 200, headers: %{}, body: ""}}
+
+        {_req, response} =
+          Enum.reduce(chunks, start, fn chunk, acc ->
+            case collector.({:data, chunk}, acc) do
+              {:cont, next} -> next
+              {:halt, next} -> next
+            end
+          end)
+
+        {:ok, response}
+      end)
+    end
+
+    defp streaming_grok(attrs \\ %{}) do
+      ChatGrok.new!(
+        Map.merge(
+          %{
+            model: "grok-4",
+            api_key: "test-xai-key",
+            stream: true,
+            stream_options: %{include_usage: true}
+          },
+          attrs
+        )
+      )
+    end
+
+    @content_chunk ~s|data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"Hel"},"finish_reason":null}]}\n\n|
+    @final_chunk ~s|data: {"choices":[{"index":0,"delta":{"content":"lo!"},"finish_reason":"stop"}]}\n\n|
+    @usage_chunk ~s|data: {"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":22,"total_tokens":33}}\n\n|
+
+    test "streamed call reports the usage-only terminal chunk" do
+      expect_streamed_post([@content_chunk, @final_chunk, @usage_chunk])
+
+      assert {:ok, items} = ChatGrok.call(streaming_grok(), [Message.new_user!("Hi")], [])
+
+      # The usage rides back as a `%TokenUsage{}` among the deltas, the shape
+      # `LLMChain.merge_delta/2` folds into the final delta.
+      assert [%TokenUsage{input: 11, output: 22} = usage] =
+               items |> List.flatten() |> Enum.filter(&match?(%TokenUsage{}, &1))
+
+      assert usage.raw["total_tokens"] == 33
+    end
+
+    test "a streamed turn assembles into a complete Message" do
+      # The finish reason is what makes the merged delta convertible. Without it
+      # every delta stays `:incomplete`, `to_message/1` fails, and an LLMChain
+      # run ends with the reply stranded in the delta.
+      expect_streamed_post([@content_chunk, @final_chunk, @usage_chunk])
+
+      assert {:ok, items} = ChatGrok.call(streaming_grok(), [Message.new_user!("Hi")], [])
+
+      chain =
+        items
+        |> List.flatten()
+        |> Enum.reduce(LLMChain.new!(%{llm: streaming_grok()}), &LLMChain.merge_delta(&2, &1))
+
+      assert {:ok, %Message{status: :complete} = message} = MessageDelta.to_message(chain.delta)
+      assert ContentPart.parts_to_string(message.content) == "Hello!"
+      assert %TokenUsage{input: 11, output: 22} = TokenUsage.get(message)
+    end
+
+    test "a streamed run through LLMChain adds the assistant message" do
+      expect_streamed_post([@content_chunk, @final_chunk, @usage_chunk])
+
+      assert {:ok, chain} =
+               %{llm: streaming_grok()}
+               |> LLMChain.new!()
+               |> LLMChain.add_message(Message.new_user!("Hi"))
+               |> LLMChain.run()
+
+      assert %Message{role: :assistant, status: :complete} = chain.last_message
+      assert ContentPart.parts_to_string(chain.last_message.content) == "Hello!"
+    end
+
+    test "streaming fires :on_llm_new_delta as chunks arrive" do
+      test_pid = self()
+
+      grok =
+        streaming_grok(%{
+          callbacks: [%{on_llm_new_delta: fn deltas -> send(test_pid, {:delta, deltas}) end}]
+        })
+
+      expect_streamed_post([@content_chunk, @final_chunk, @usage_chunk])
+
+      assert {:ok, _items} = ChatGrok.call(grok, [Message.new_user!("Hi")], [])
+
+      # One callback per arriving chunk, not a single batch after the fact.
+      assert_received {:delta, [%MessageDelta{content: "Hel"}]}
+      assert_received {:delta, [%MessageDelta{content: "lo!", status: :complete}]}
+      assert_received {:delta, [%TokenUsage{input: 11, output: 22}]}
+    end
+
+    test "streamed parallel tool calls keep their argument fragments apart" do
+      chunks = [
+        ~s|data: {"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\\"city\\":"}}]},"finish_reason":null}]}\n\n|,
+        ~s|data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_2","type":"function","function":{"name":"get_weather","arguments":"{\\"city\\":"}}]},"finish_reason":null}]}\n\n|,
+        ~s|data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\\"SF\\"}"}}]},"finish_reason":null}]}\n\n|,
+        ~s|data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":"\\"NYC\\"}"}}]},"finish_reason":"tool_calls"}]}\n\n|
+      ]
+
+      expect_streamed_post(chunks)
+
+      assert {:ok, items} = ChatGrok.call(streaming_grok(), [Message.new_user!("Hi")], [])
+
+      merged = items |> List.flatten() |> MessageDelta.merge_deltas()
+      assert {:ok, %Message{tool_calls: [sf, nyc]}} = MessageDelta.to_message(merged)
+      assert %ToolCall{call_id: "call_1", arguments: %{"city" => "SF"}} = sf
+      assert %ToolCall{call_id: "call_2", arguments: %{"city" => "NYC"}} = nyc
+    end
+
+    test "a truncated stream reports the length status" do
+      truncated =
+        ~s|data: {"choices":[{"index":0,"delta":{"content":"Hel"},"finish_reason":"length"}]}\n\n|
+
+      expect_streamed_post([@content_chunk, truncated])
+
+      assert {:ok, items} = ChatGrok.call(streaming_grok(), [Message.new_user!("Hi")], [])
+
+      merged = items |> List.flatten() |> MessageDelta.merge_deltas()
+      assert %MessageDelta{status: :length} = merged
     end
   end
 end

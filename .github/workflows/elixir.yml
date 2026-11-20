@@ -36,39 +36,96 @@ jobs:
       matrix:
         include:
           - pair:
-              elixir: "1.16"
-              otp: "25"
-          - pair:
-              elixir: "1.18"
+              elixir: "1.17"
               otp: "27"
+          - pair:
+              elixir: "1.20"
+              otp: "29"
             lint: lint
 
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: erlef/setup-beam@v1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          elixir-version: "1.18"
-          otp-version: "27"
+          persist-credentials: false
 
-      - uses: actions/cache@v4
+      - id: beam
+        uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
+        with:
+          elixir-version: ${{ matrix.pair.elixir }}
+          otp-version: ${{ matrix.pair.otp }}
+
+      - name: Cache deps
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: deps
           key: ${{ runner.os }}-mix-${{ hashFiles('**/mix.lock') }}
           restore-keys: ${{ runner.os }}-mix-
+
+      # No restore-keys here, unlike the deps cache above. The key already
+      # covers OS, OTP, Elixir, and the mix.lock hash, so it hits on every run
+      # where the lockfile is unchanged. A prefix fallback could therefore only
+      # ever fire when mix.lock *did* change, which is exactly when reusing a
+      # _build from a different lockfile is unsafe: Mix reads dependency
+      # versions from the _build manifests, so a fresh deps/ paired with a
+      # stale _build/ makes `mix deps.get` report the old version and fail with
+      # "Dependencies have diverged". `mix deps.get` reconciles a stale deps/
+      # on its own, which is why the cache above keeps its fallback.
+      - name: Cache _build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: _build
+          key: ${{ runner.os }}-build-${{ steps.beam.outputs.otp-version }}-${{ steps.beam.outputs.elixir-version }}-${{ hashFiles('**/mix.lock') }}
 
       - run: mix deps.get
 
       - run: mix format --check-formatted
         if: ${{ matrix.lint }}
 
-      - run: mix deps.get && mix deps.unlock --check-unused
+      - run: mix deps.unlock --check-unused
         if: ${{ matrix.lint }}
 
       - run: mix deps.compile
 
       - run: mix compile --warnings-as-errors
         if: ${{ matrix.lint }}
+
+      # Cache key based on Erlang/Elixir version and the mix.lock hash
+      - name: Restore PLT cache
+        if: ${{ matrix.lint }}
+        id: plt_cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          key: |
+            plt-${{ runner.os }}-${{ steps.beam.outputs.otp-version }}-${{ steps.beam.outputs.elixir-version }}-${{ hashFiles('**/mix.lock') }}
+          restore-keys: |
+            plt-${{ runner.os }}-${{ steps.beam.outputs.otp-version }}-${{ steps.beam.outputs.elixir-version }}-
+          path: |
+            priv/plts
+
+      # Create PLTs if no cache was found
+      - name: Create PLTs
+        if: ${{ matrix.lint && steps.plt_cache.outputs.cache-hit != 'true' }}
+        run: |
+          mkdir -p priv/plts
+          mix dialyzer --plt
+
+      # By default, the GitHub Cache action only saves the cache if all steps in the job succeed,
+      # so we separate the cache restore and save steps in case running dialyzer fails.
+      - name: Save PLT cache
+        if: ${{ matrix.lint && steps.plt_cache.outputs.cache-hit != 'true' }}
+        id: plt_cache_save
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          key: |
+            plt-${{ runner.os }}-${{ steps.beam.outputs.otp-version }}-${{ steps.beam.outputs.elixir-version }}-${{ hashFiles('**/mix.lock') }}
+          path: |
+            priv/plts
+
+      # --format github prints warnings as inline PR annotations.
+      # --format dialyxir keeps the raw warnings readable in the action log.
+      - name: Run dialyzer
+        if: ${{ matrix.lint }}
+        run: mix dialyzer --format github --format dialyxir
 
       - name: Run tests
         run: mix test

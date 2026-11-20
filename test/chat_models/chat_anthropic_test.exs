@@ -4,10 +4,10 @@ defmodule LangChain.ChatModels.ChatAnthropicTest do
 
   doctest LangChain.ChatModels.ChatAnthropic
 
-  import LangChain.TestingHelpers
   alias LangChain.ChatModels.ChatAnthropic
   alias LangChain.Chains.LLMChain
   alias LangChain.Message
+  alias LangChain.Message.Citation
   alias LangChain.Message.ContentPart
   alias LangChain.Message.ToolCall
   alias LangChain.Message.ToolResult
@@ -18,9 +18,9 @@ defmodule LangChain.ChatModels.ChatAnthropicTest do
   alias LangChain.LangChainError
   alias LangChain.Utils.BedrockStreamDecoder
 
-  @test_model "claude-3-5-sonnet-20241022"
-  @bedrock_test_model "anthropic.claude-3-5-sonnet-20241022-v2:0"
-  @claude_3_7 "claude-3-7-sonnet-20250219"
+  @test_model "claude-haiku-4-5"
+  @sonnet "claude-sonnet-4-6"
+  @bedrock_test_model "us.anthropic.claude-haiku-4-5-20251001-v1:0"
   @apis [:anthropic, :anthropic_bedrock]
 
   defp hello_world(_args, _context) do
@@ -73,6 +73,39 @@ defmodule LangChain.ChatModels.ChatAnthropicTest do
         })
 
       assert model.endpoint == override_url
+    end
+
+    test "supports setting json_response and json_schema" do
+      json_schema = %{
+        "type" => "object",
+        "properties" => %{
+          "name" => %{"type" => "string"},
+          "age" => %{"type" => "integer"}
+        },
+        "required" => ["name", "age"],
+        "additionalProperties" => false
+      }
+
+      {:ok, anthropic} =
+        ChatAnthropic.new(%{
+          "model" => @test_model,
+          "json_response" => true,
+          "json_schema" => json_schema
+        })
+
+      assert anthropic.json_response == true
+      assert anthropic.json_schema == json_schema
+    end
+
+    test "returns error when json_response is true but json_schema is nil" do
+      assert {:error, changeset} =
+               ChatAnthropic.new(%{
+                 "model" => @test_model,
+                 "json_response" => true
+               })
+
+      refute changeset.valid?
+      assert {"is required when json_response is true", _} = changeset.errors[:json_schema]
     end
   end
 
@@ -129,6 +162,78 @@ defmodule LangChain.ChatModels.ChatAnthropicTest do
                  "type" => "text"
                }
              ]
+    end
+  end
+
+  describe "for_api/3 with messages inserted after a tool result" do
+    # A user turn, an assistant tool call, and the tool result answering it.
+    defp tool_call_turn do
+      [
+        Message.new_user!("Go!"),
+        Message.new_assistant!(%{
+          tool_calls: [
+            ToolCall.new!(%{status: :complete, call_id: "call_1", name: "load_reference"})
+          ]
+        }),
+        Message.new_tool_result!(%{
+          tool_results: [
+            ToolResult.new!(%{tool_call_id: "call_1", name: "load_reference", content: "Loaded."})
+          ]
+        })
+      ]
+    end
+
+    test "an [assistant, user] pair stays three separate turns" do
+      # The assistant message breaks the run of user-role messages, so the tool
+      # result turn carries only the tool result and the user message stands as
+      # a turn of its own. This is the shape `LangChain.MessageExpansion`
+      # recommends for established material.
+      {:ok, anthropic} = ChatAnthropic.new()
+
+      messages =
+        tool_call_turn() ++
+          [
+            Message.new_assistant!("The reference material."),
+            Message.new_user!("Use the reference above.")
+          ]
+
+      %{messages: api_messages} = ChatAnthropic.for_api(anthropic, messages, [])
+
+      assert [
+               %{"role" => "user"},
+               %{"role" => "assistant"},
+               %{"role" => "user", "content" => tool_turn},
+               %{"role" => "assistant", "content" => material},
+               %{"role" => "user", "content" => anchor}
+             ] = api_messages
+
+      assert [%{"type" => "tool_result", "tool_use_id" => "call_1"}] = tool_turn
+      assert [%{"type" => "text", "text" => "The reference material."}] = material
+      assert [%{"type" => "text", "text" => "Use the reference above."}] = anchor
+    end
+
+    test "a user message directly after a tool result merges into the tool result turn" do
+      # A `:tool` message serializes to `"role" => "user"`, and consecutive
+      # user-role messages are combined in order. Anthropic requires tool_result
+      # blocks first in a user message with any text after them, which is the
+      # order produced here, so the request is valid. The text shares the tool
+      # result's turn instead of standing as its own.
+      {:ok, anthropic} = ChatAnthropic.new()
+
+      messages = tool_call_turn() ++ [Message.new_user!("Use the reference above.")]
+
+      %{messages: api_messages} = ChatAnthropic.for_api(anthropic, messages, [])
+
+      assert [
+               %{"role" => "user"},
+               %{"role" => "assistant"},
+               %{"role" => "user", "content" => combined}
+             ] = api_messages
+
+      assert [
+               %{"type" => "tool_result", "tool_use_id" => "call_1"},
+               %{"type" => "text", "text" => "Use the reference above."}
+             ] = combined
     end
   end
 
@@ -198,6 +303,56 @@ defmodule LangChain.ChatModels.ChatAnthropicTest do
                ]
     end
 
+    test "does not include cache_control when not set" do
+      {:ok, anthropic} = ChatAnthropic.new(%{model: @test_model})
+
+      data = ChatAnthropic.for_api(anthropic, [], [])
+      refute Map.has_key?(data, :cache_control)
+    end
+
+    test "includes top-level cache_control when set to ephemeral" do
+      {:ok, anthropic} =
+        ChatAnthropic.new(%{
+          model: @test_model,
+          cache_control: %{"type" => "ephemeral"}
+        })
+
+      data = ChatAnthropic.for_api(anthropic, [], [])
+      assert %{cache_control: %{"type" => "ephemeral"}} = data
+    end
+
+    test "includes top-level cache_control with TTL" do
+      {:ok, anthropic} =
+        ChatAnthropic.new(%{
+          model: @test_model,
+          cache_control: %{"type" => "ephemeral", "ttl" => "1h"}
+        })
+
+      data = ChatAnthropic.for_api(anthropic, [], [])
+      assert %{cache_control: %{"type" => "ephemeral", "ttl" => "1h"}} = data
+    end
+
+    test "top-level cache_control works alongside messages and system prompt" do
+      {:ok, anthropic} =
+        ChatAnthropic.new(%{
+          model: @test_model,
+          cache_control: %{"type" => "ephemeral"}
+        })
+
+      data =
+        ChatAnthropic.for_api(
+          anthropic,
+          [
+            Message.new_system!("You are helpful."),
+            Message.new_user!("Hello")
+          ],
+          []
+        )
+
+      assert %{cache_control: %{"type" => "ephemeral"}, messages: [_user_msg]} = data
+      assert [%{"text" => "You are helpful.", "type" => "text"}] = data.system
+    end
+
     test "generates a map for an API call with max_tokens set" do
       {:ok, anthropic} =
         ChatAnthropic.new(%{
@@ -238,6 +393,39 @@ defmodule LangChain.ChatModels.ChatAnthropicTest do
       assert data.tool_choice == %{"type" => "tool", "name" => "get_weather"}
     end
 
+    test "includes disable_parallel_tool_use when set in tool_choice" do
+      {:ok, anthropic} =
+        ChatAnthropic.new(%{
+          model: @test_model,
+          tool_choice: %{"type" => "auto", "disable_parallel_tool_use" => true}
+        })
+
+      data = ChatAnthropic.for_api(anthropic, [], [])
+      assert data.model == @test_model
+      assert data.tool_choice == %{"type" => "auto", "disable_parallel_tool_use" => true}
+    end
+
+    test "includes disable_parallel_tool_use with specific tool" do
+      {:ok, anthropic} =
+        ChatAnthropic.new(%{
+          model: @test_model,
+          tool_choice: %{
+            "type" => "tool",
+            "name" => "get_weather",
+            "disable_parallel_tool_use" => true
+          }
+        })
+
+      data = ChatAnthropic.for_api(anthropic, [], [])
+      assert data.model == @test_model
+
+      assert data.tool_choice == %{
+               "type" => "tool",
+               "name" => "get_weather",
+               "disable_parallel_tool_use" => true
+             }
+    end
+
     test "adds tool definitions to map" do
       tool =
         Function.new!(%{
@@ -268,11 +456,13 @@ defmodule LangChain.ChatModels.ChatAnthropicTest do
                        "person" => %{
                          "properties" => %{"name" => %{"type" => "string"}},
                          "required" => ["name"],
-                         "type" => "object"
+                         "type" => "object",
+                         "additionalProperties" => false
                        }
                      },
                      "required" => ["person"],
-                     "type" => "object"
+                     "type" => "object",
+                     "additionalProperties" => false
                    }
                  }
                ]
@@ -361,6 +551,176 @@ defmodule LangChain.ChatModels.ChatAnthropicTest do
                  }
                ]
     end
+
+    test "does not include output_config when json_response is false" do
+      {:ok, anthropic} = ChatAnthropic.new(%{"model" => @test_model})
+      data = ChatAnthropic.for_api(anthropic, [], [])
+      refute Map.has_key?(data, :output_config)
+    end
+
+    test "includes output_config when json_response is true with schema" do
+      json_schema = %{
+        "type" => "object",
+        "properties" => %{
+          "name" => %{"type" => "string"},
+          "age" => %{"type" => "integer"}
+        },
+        "required" => ["name", "age"],
+        "additionalProperties" => false
+      }
+
+      {:ok, anthropic} =
+        ChatAnthropic.new(%{
+          "model" => @test_model,
+          "json_response" => true,
+          "json_schema" => json_schema
+        })
+
+      data = ChatAnthropic.for_api(anthropic, [], [])
+
+      assert data.output_config == %{
+               "format" => %{
+                 "type" => "json_schema",
+                 "schema" => json_schema
+               }
+             }
+    end
+
+    test "sends output_config as given when json_response is false" do
+      {:ok, anthropic} =
+        ChatAnthropic.new(%{"model" => @test_model, "output_config" => %{"effort" => "medium"}})
+
+      data = ChatAnthropic.for_api(anthropic, [], [])
+
+      assert data.output_config == %{"effort" => "medium"}
+    end
+
+    test "merges the json_response format into a caller's output_config" do
+      json_schema = %{"type" => "object", "properties" => %{"name" => %{"type" => "string"}}}
+
+      {:ok, anthropic} =
+        ChatAnthropic.new(%{
+          "model" => @test_model,
+          "json_response" => true,
+          "json_schema" => json_schema,
+          "output_config" => %{"effort" => "medium"}
+        })
+
+      data = ChatAnthropic.for_api(anthropic, [], [])
+
+      assert data.output_config == %{
+               "effort" => "medium",
+               "format" => %{"type" => "json_schema", "schema" => json_schema}
+             }
+    end
+
+    test "stringifies atom keys in output_config when merging the json_response format" do
+      json_schema = %{"type" => "object"}
+
+      {:ok, anthropic} =
+        ChatAnthropic.new(%{
+          model: @test_model,
+          json_response: true,
+          json_schema: json_schema,
+          output_config: %{effort: "low", format: %{"type" => "other"}}
+        })
+
+      data = ChatAnthropic.for_api(anthropic, [], [])
+
+      assert data.output_config == %{
+               "effort" => "low",
+               "format" => %{"type" => "json_schema", "schema" => json_schema}
+             }
+    end
+  end
+
+  describe "for_api/3 with a streamed thinking block that has empty text" do
+    test "sends the merged block back with empty text and its signature" do
+      model = ChatAnthropic.new!(%{model: "claude-sonnet-5-5", stream: true})
+
+      # Under `display: "omitted"` a tool-using turn streams a thinking block
+      # whose text stays empty and whose signature arrives in one delta.
+      events = [
+        %{
+          "type" => "message_start",
+          "message" => %{
+            "id" => "msg_01",
+            "type" => "message",
+            "role" => "assistant",
+            "model" => "claude-sonnet-5-5",
+            "content" => [],
+            "stop_reason" => nil,
+            "stop_sequence" => nil,
+            "usage" => %{"input_tokens" => 20, "output_tokens" => 1}
+          }
+        },
+        %{
+          "type" => "content_block_start",
+          "index" => 0,
+          "content_block" => %{"type" => "thinking", "thinking" => "", "signature" => ""}
+        },
+        %{
+          "type" => "content_block_delta",
+          "index" => 0,
+          "delta" => %{"type" => "signature_delta", "signature" => "SIG"}
+        },
+        %{"type" => "content_block_stop", "index" => 0},
+        %{
+          "type" => "content_block_start",
+          "index" => 1,
+          "content_block" => %{
+            "type" => "tool_use",
+            "id" => "toolu_01",
+            "name" => "get_weather",
+            "input" => %{}
+          }
+        },
+        %{
+          "type" => "content_block_delta",
+          "index" => 1,
+          "delta" => %{"type" => "input_json_delta", "partial_json" => "{\"city\": \"Paris\"}"}
+        },
+        %{"type" => "content_block_stop", "index" => 1},
+        %{
+          "type" => "message_delta",
+          "delta" => %{"stop_reason" => "tool_use", "stop_sequence" => nil},
+          "usage" => %{"output_tokens" => 30}
+        },
+        %{"type" => "message_stop"}
+      ]
+
+      {:ok, assistant_msg} =
+        events
+        |> Enum.filter(&ChatAnthropic.relevant_event?/1)
+        |> Enum.map(&ChatAnthropic.do_process_response(model, &1))
+        |> List.flatten()
+        |> MessageDelta.merge_deltas()
+        |> MessageDelta.to_message()
+
+      tool_msg =
+        Message.new_tool_result!(%{
+          tool_results: [ToolResult.new!(%{tool_call_id: "toolu_01", content: "Sunny"})]
+        })
+
+      data =
+        ChatAnthropic.for_api(
+          model,
+          [Message.new_user!("Weather in Paris?"), assistant_msg, tool_msg],
+          []
+        )
+
+      assert [_user, %{"role" => "assistant", "content" => content}, _tool] = data.messages
+
+      assert [
+               %{"type" => "thinking", "thinking" => "", "signature" => "SIG"},
+               %{
+                 "type" => "tool_use",
+                 "id" => "toolu_01",
+                 "name" => "get_weather",
+                 "input" => %{"city" => "Paris"}
+               }
+             ] = content
+    end
   end
 
   describe "do_process_response/2 with Bedrock" do
@@ -442,6 +802,70 @@ defmodule LangChain.ChatModels.ChatAnthropicTest do
       assert struct.role == :assistant
       assert struct.content == [ContentPart.text!("Greetings!")]
       assert is_nil(struct.index)
+      refute Map.has_key?(struct.metadata, :stop_details)
+    end
+
+    test "a refusal is content filtered and reports the policy category", %{model: model} do
+      response = %{
+        "id" => "id-123",
+        "type" => "message",
+        "role" => "assistant",
+        "content" => [],
+        "model" => "claude-opus-4-5",
+        "stop_reason" => "refusal",
+        "stop_details" => %{
+          "type" => "refusal",
+          "category" => "cyber",
+          "explanation" => "Request matched a restricted policy."
+        },
+        "usage" => %{"input_tokens" => 17, "output_tokens" => 0}
+      }
+
+      assert %Message{} = struct = ChatAnthropic.do_process_response(model, response)
+      assert struct.role == :assistant
+      assert struct.status == :content_filtered
+      assert struct.content == []
+
+      assert struct.metadata[:stop_details] == %{
+               "type" => "refusal",
+               "category" => "cyber",
+               "explanation" => "Request matched a restricted policy."
+             }
+    end
+
+    test "a refusal that stopped mid-output keeps the partial content", %{model: model} do
+      response = %{
+        "id" => "id-123",
+        "type" => "message",
+        "role" => "assistant",
+        "content" => [%{"type" => "text", "text" => "Here is the first step"}],
+        "model" => "claude-opus-4-5",
+        "stop_reason" => "refusal",
+        "stop_details" => %{"type" => "refusal", "category" => nil, "explanation" => nil},
+        "usage" => %{"input_tokens" => 17, "output_tokens" => 6}
+      }
+
+      assert %Message{} = struct = ChatAnthropic.do_process_response(model, response)
+      assert struct.status == :content_filtered
+      assert struct.content == [ContentPart.text!("Here is the first step")]
+      assert struct.metadata[:stop_details]["type"] == "refusal"
+    end
+
+    test "a non-refusal stop reason carries a null stop_details", %{model: model} do
+      response = %{
+        "id" => "id-123",
+        "type" => "message",
+        "role" => "assistant",
+        "content" => [%{"type" => "text", "text" => "Greetings!"}],
+        "model" => "claude-opus-4-5",
+        "stop_reason" => "end_turn",
+        "stop_details" => nil,
+        "usage" => %{"input_tokens" => 17, "output_tokens" => 11}
+      }
+
+      assert %Message{} = struct = ChatAnthropic.do_process_response(model, response)
+      assert struct.status == :complete
+      refute Map.has_key?(struct.metadata, :stop_details)
     end
 
     test "handles receiving a complete message with thinking", %{model: model} do
@@ -586,7 +1010,7 @@ defmodule LangChain.ChatModels.ChatAnthropicTest do
         "message" => %{
           "content" => [],
           "id" => "msg_017vYxGobHipWyoZT5uDbGnJ",
-          "model" => @claude_3_7,
+          "model" => @sonnet,
           "role" => "assistant",
           "stop_reason" => nil,
           "stop_sequence" => nil,
@@ -639,6 +1063,92 @@ defmodule LangChain.ChatModels.ChatAnthropicTest do
                  output: 80,
                  raw: %{"output_tokens" => 80}
                })
+    end
+
+    test "a streamed refusal is content filtered and reports the policy category", %{model: model} do
+      response = %{
+        "type" => "message_delta",
+        "delta" => %{
+          "stop_reason" => "refusal",
+          "stop_sequence" => nil,
+          "stop_details" => %{
+            "type" => "refusal",
+            "category" => "bio",
+            "explanation" => "Request matched a restricted policy."
+          }
+        },
+        "usage" => %{"output_tokens" => 12}
+      }
+
+      assert %MessageDelta{} = struct = ChatAnthropic.do_process_response(model, response)
+      assert struct.status == :content_filtered
+
+      assert struct.metadata[:stop_details] == %{
+               "type" => "refusal",
+               "category" => "bio",
+               "explanation" => "Request matched a restricted policy."
+             }
+    end
+
+    test "a streamed refusal reports stop_details sent at the event level", %{model: model} do
+      response = %{
+        "type" => "message_delta",
+        "delta" => %{"stop_reason" => "refusal", "stop_sequence" => nil},
+        "stop_details" => %{"type" => "refusal", "category" => "cyber"},
+        "usage" => %{"output_tokens" => 12}
+      }
+
+      assert %MessageDelta{} = struct = ChatAnthropic.do_process_response(model, response)
+      assert struct.status == :content_filtered
+      assert struct.metadata[:stop_details] == %{"type" => "refusal", "category" => "cyber"}
+    end
+
+    test "a streamed refusal survives merging into the assembled message", %{model: model} do
+      start_event = %{
+        "type" => "message_start",
+        "message" => %{
+          "type" => "message",
+          "role" => "assistant",
+          "content" => [],
+          "usage" => %{"input_tokens" => 14, "output_tokens" => 1}
+        }
+      }
+
+      text_event = %{
+        "type" => "content_block_delta",
+        "index" => 0,
+        "delta" => %{"type" => "text_delta", "text" => "Here is the first step"}
+      }
+
+      stop_event = %{
+        "type" => "message_delta",
+        "delta" => %{
+          "stop_reason" => "refusal",
+          "stop_sequence" => nil,
+          "stop_details" => %{"type" => "refusal", "category" => "cyber"}
+        },
+        "usage" => %{"output_tokens" => 12}
+      }
+
+      deltas =
+        Enum.map(
+          [start_event, text_event, stop_event],
+          &ChatAnthropic.do_process_response(model, &1)
+        )
+
+      merged = MessageDelta.merge_deltas(deltas)
+      assert merged.status == :content_filtered
+      assert merged.metadata[:stop_details] == %{"type" => "refusal", "category" => "cyber"}
+
+      assert {:ok, %Message{} = message} = MessageDelta.to_message(merged)
+      assert message.status == :content_filtered
+      assert message.content == [ContentPart.text!("Here is the first step")]
+      assert message.metadata[:stop_details] == %{"type" => "refusal", "category" => "cyber"}
+      # `message_delta` closes with the totals for the message, so its 12 output
+      # tokens replace the 1 opened with rather than adding to it. The input
+      # count it does not repeat carries forward from `message_start`.
+      assert message.metadata[:usage].input == 14
+      assert message.metadata[:usage].output == 12
     end
 
     test "handles receiving a content_block_start event for text", %{model: model} do
@@ -885,7 +1395,7 @@ defmodule LangChain.ChatModels.ChatAnthropicTest do
             "message" => %{
               "content" => [],
               "id" => "msg_017vYxGobHipWyoZT5uDbGnJ",
-              "model" => @claude_3_7,
+              "model" => "claude-3-7-sonnet-20250219",
               "role" => "assistant",
               "stop_reason" => nil,
               "stop_sequence" => nil,
@@ -1229,12 +1739,12 @@ defmodule LangChain.ChatModels.ChatAnthropicTest do
                metadata: %{
                  usage: %LangChain.TokenUsage{
                    input: 99,
-                   output: 362,
+                   output: 234,
                    raw: %{
                      "cache_creation_input_tokens" => 0,
                      "cache_read_input_tokens" => 0,
                      "input_tokens" => 99,
-                     "output_tokens" => 362
+                     "output_tokens" => 234
                    }
                  }
                }
@@ -1263,6 +1773,460 @@ defmodule LangChain.ChatModels.ChatAnthropicTest do
                ],
                "role" => "assistant"
              }
+    end
+
+    # -- Citation tests --
+
+    test "handles receiving a non-streaming response with char_location citations", %{
+      model: model
+    } do
+      response = %{
+        "id" => "msg_123",
+        "type" => "message",
+        "role" => "assistant",
+        "stop_reason" => "end_turn",
+        "usage" => %{"input_tokens" => 100, "output_tokens" => 50},
+        "content" => [
+          %{"type" => "text", "text" => "According to the document, "},
+          %{
+            "type" => "text",
+            "text" => "the sky is blue",
+            "citations" => [
+              %{
+                "type" => "char_location",
+                "cited_text" => "The sky is blue.",
+                "document_index" => 0,
+                "document_title" => "Science Facts",
+                "start_char_index" => 0,
+                "end_char_index" => 16
+              }
+            ]
+          }
+        ]
+      }
+
+      result = ChatAnthropic.do_process_response(model, response)
+      assert %Message{} = msg = result
+
+      assert [part1, part2] = msg.content
+      assert part1.content == "According to the document, "
+      assert part1.citations == []
+
+      assert part2.content == "the sky is blue"
+      assert [%Citation{} = citation] = part2.citations
+      assert citation.cited_text == "The sky is blue."
+      assert citation.source.type == :document
+      assert citation.source.title == "Science Facts"
+      assert citation.source.document_id == "0"
+      assert citation.metadata["provider_type"] == "char_location"
+      assert citation.metadata["start_char_index"] == 0
+      assert citation.metadata["end_char_index"] == 16
+    end
+
+    test "handles receiving a non-streaming response with page_location citations", %{
+      model: model
+    } do
+      response = %{
+        "id" => "msg_124",
+        "type" => "message",
+        "role" => "assistant",
+        "stop_reason" => "end_turn",
+        "usage" => %{"input_tokens" => 100, "output_tokens" => 50},
+        "content" => [
+          %{
+            "type" => "text",
+            "text" => "on page 3 it says",
+            "citations" => [
+              %{
+                "type" => "page_location",
+                "cited_text" => "Important finding.",
+                "document_index" => 1,
+                "document_title" => "Research Paper",
+                "start_page_number" => 3,
+                "end_page_number" => 3
+              }
+            ]
+          }
+        ]
+      }
+
+      result = ChatAnthropic.do_process_response(model, response)
+      assert %Message{} = msg = result
+
+      assert [part] = msg.content
+      assert [%Citation{} = citation] = part.citations
+      assert citation.metadata["provider_type"] == "page_location"
+      assert citation.metadata["start_page_number"] == 3
+      assert citation.metadata["end_page_number"] == 3
+    end
+
+    test "handles receiving a non-streaming response with content_block_location citations", %{
+      model: model
+    } do
+      response = %{
+        "id" => "msg_125",
+        "type" => "message",
+        "role" => "assistant",
+        "stop_reason" => "end_turn",
+        "usage" => %{"input_tokens" => 100, "output_tokens" => 50},
+        "content" => [
+          %{
+            "type" => "text",
+            "text" => "the introduction states",
+            "citations" => [
+              %{
+                "type" => "content_block_location",
+                "cited_text" => "This paper examines...",
+                "document_index" => 0,
+                "document_title" => "Paper",
+                "start_block_index" => 0,
+                "end_block_index" => 2
+              }
+            ]
+          }
+        ]
+      }
+
+      result = ChatAnthropic.do_process_response(model, response)
+      assert %Message{} = msg = result
+
+      assert [part] = msg.content
+      assert [%Citation{} = citation] = part.citations
+      assert citation.metadata["provider_type"] == "content_block_location"
+      assert citation.metadata["start_block_index"] == 0
+      assert citation.metadata["end_block_index"] == 2
+    end
+
+    test "handles receiving multiple text blocks with mixed citations", %{model: model} do
+      response = %{
+        "id" => "msg_126",
+        "type" => "message",
+        "role" => "assistant",
+        "stop_reason" => "end_turn",
+        "usage" => %{"input_tokens" => 100, "output_tokens" => 50},
+        "content" => [
+          %{"type" => "text", "text" => "According to the document, "},
+          %{
+            "type" => "text",
+            "text" => "the sky is blue",
+            "citations" => [
+              %{
+                "type" => "char_location",
+                "cited_text" => "The sky is blue.",
+                "document_index" => 0,
+                "document_title" => "Science Facts",
+                "start_char_index" => 0,
+                "end_char_index" => 16
+              }
+            ]
+          },
+          %{"type" => "text", "text" => " and "},
+          %{
+            "type" => "text",
+            "text" => "water is wet",
+            "citations" => [
+              %{
+                "type" => "char_location",
+                "cited_text" => "Water is wet.",
+                "document_index" => 0,
+                "document_title" => "Science Facts",
+                "start_char_index" => 50,
+                "end_char_index" => 63
+              }
+            ]
+          }
+        ]
+      }
+
+      result = ChatAnthropic.do_process_response(model, response)
+      assert %Message{} = msg = result
+
+      assert length(msg.content) == 4
+      all_citations = Message.all_citations(msg)
+      assert length(all_citations) == 2
+      assert Enum.all?(all_citations, &(&1.source.type == :document))
+    end
+
+    test "handles receiving a citations_delta streaming event", %{model: model} do
+      response = %{
+        "type" => "content_block_delta",
+        "index" => 0,
+        "delta" => %{
+          "type" => "citations_delta",
+          "citation" => %{
+            "type" => "char_location",
+            "cited_text" => "42 is the answer.",
+            "document_index" => 0,
+            "document_title" => "Hitchhiker's Guide",
+            "start_char_index" => 0,
+            "end_char_index" => 17
+          }
+        }
+      }
+
+      assert %MessageDelta{} = struct = ChatAnthropic.do_process_response(model, response)
+      assert struct.role == :assistant
+      assert struct.index == 0
+      assert struct.status == :incomplete
+
+      assert %ContentPart{} = part = struct.content
+      assert part.type == :text
+      assert part.content == nil
+      assert [%Citation{} = citation] = part.citations
+      assert citation.cited_text == "42 is the answer."
+      assert citation.source.type == :document
+      assert citation.source.title == "Hitchhiker's Guide"
+      assert citation.metadata["provider_type"] == "char_location"
+    end
+
+    test "accumulates citations across streaming deltas", %{model: model} do
+      processed =
+        [
+          %{
+            "message" => %{
+              "content" => [],
+              "id" => "msg_127",
+              "model" => @test_model,
+              "role" => "assistant",
+              "stop_reason" => nil,
+              "stop_sequence" => nil,
+              "type" => "message",
+              "usage" => %{
+                "input_tokens" => 100,
+                "output_tokens" => 0
+              }
+            },
+            "type" => "message_start"
+          },
+          %{
+            "content_block" => %{"type" => "text", "text" => ""},
+            "index" => 0,
+            "type" => "content_block_start"
+          },
+          %{
+            "delta" => %{"type" => "text_delta", "text" => "The answer is "},
+            "index" => 0,
+            "type" => "content_block_delta"
+          },
+          %{
+            "delta" => %{
+              "type" => "citations_delta",
+              "citation" => %{
+                "type" => "char_location",
+                "cited_text" => "42 is the answer.",
+                "document_index" => 0,
+                "document_title" => "Hitchhiker's Guide",
+                "start_char_index" => 0,
+                "end_char_index" => 17
+              }
+            },
+            "index" => 0,
+            "type" => "content_block_delta"
+          },
+          %{
+            "delta" => %{"type" => "text_delta", "text" => "42."},
+            "index" => 0,
+            "type" => "content_block_delta"
+          },
+          %{"index" => 0, "type" => "content_block_stop"},
+          %{
+            "delta" => %{"stop_reason" => "end_turn", "stop_sequence" => nil},
+            "type" => "message_delta",
+            "usage" => %{"output_tokens" => 25}
+          },
+          %{"type" => "message_stop"}
+        ]
+        |> Enum.filter(&ChatAnthropic.relevant_event?/1)
+        |> Enum.map(&ChatAnthropic.do_process_response(model, &1))
+
+      # merge the deltas and convert to a message
+      {:ok, %Message{} = merged} =
+        MessageDelta.merge_deltas(processed) |> MessageDelta.to_message()
+
+      assert merged.status == :complete
+      assert merged.role == :assistant
+
+      assert [%ContentPart{} = part] = merged.content
+      assert part.type == :text
+      assert part.content == "The answer is 42."
+      assert [%Citation{} = citation] = part.citations
+      assert citation.cited_text == "42 is the answer."
+      assert citation.source.document_id == "0"
+    end
+
+    test "handles interleaved text and multiple citation deltas", %{model: model} do
+      processed =
+        [
+          %{
+            "message" => %{
+              "content" => [],
+              "id" => "msg_128",
+              "model" => @test_model,
+              "role" => "assistant",
+              "stop_reason" => nil,
+              "stop_sequence" => nil,
+              "type" => "message",
+              "usage" => %{
+                "input_tokens" => 100,
+                "output_tokens" => 0
+              }
+            },
+            "type" => "message_start"
+          },
+          %{
+            "content_block" => %{"type" => "text", "text" => ""},
+            "index" => 0,
+            "type" => "content_block_start"
+          },
+          %{
+            "delta" => %{"type" => "text_delta", "text" => "Fact one: "},
+            "index" => 0,
+            "type" => "content_block_delta"
+          },
+          %{
+            "delta" => %{
+              "type" => "citations_delta",
+              "citation" => %{
+                "type" => "char_location",
+                "cited_text" => "First fact.",
+                "document_index" => 0,
+                "document_title" => "Doc A",
+                "start_char_index" => 0,
+                "end_char_index" => 11
+              }
+            },
+            "index" => 0,
+            "type" => "content_block_delta"
+          },
+          %{
+            "delta" => %{"type" => "text_delta", "text" => "sky is blue. "},
+            "index" => 0,
+            "type" => "content_block_delta"
+          },
+          %{
+            "delta" => %{"type" => "text_delta", "text" => "Fact two: "},
+            "index" => 0,
+            "type" => "content_block_delta"
+          },
+          %{
+            "delta" => %{
+              "type" => "citations_delta",
+              "citation" => %{
+                "type" => "char_location",
+                "cited_text" => "Second fact.",
+                "document_index" => 1,
+                "document_title" => "Doc B",
+                "start_char_index" => 0,
+                "end_char_index" => 12
+              }
+            },
+            "index" => 0,
+            "type" => "content_block_delta"
+          },
+          %{
+            "delta" => %{"type" => "text_delta", "text" => "water is wet."},
+            "index" => 0,
+            "type" => "content_block_delta"
+          },
+          %{"index" => 0, "type" => "content_block_stop"},
+          %{
+            "delta" => %{"stop_reason" => "end_turn", "stop_sequence" => nil},
+            "type" => "message_delta",
+            "usage" => %{"output_tokens" => 40}
+          },
+          %{"type" => "message_stop"}
+        ]
+        |> Enum.filter(&ChatAnthropic.relevant_event?/1)
+        |> Enum.map(&ChatAnthropic.do_process_response(model, &1))
+
+      {:ok, %Message{} = merged} =
+        MessageDelta.merge_deltas(processed) |> MessageDelta.to_message()
+
+      assert [%ContentPart{} = part] = merged.content
+      assert part.content == "Fact one: sky is blue. Fact two: water is wet."
+      assert [citation1, citation2] = part.citations
+      assert citation1.cited_text == "First fact."
+      assert citation1.source.title == "Doc A"
+      assert citation2.cited_text == "Second fact."
+      assert citation2.source.title == "Doc B"
+    end
+
+    test "handles multi-block streaming with citations on only some blocks", %{model: model} do
+      processed =
+        [
+          %{
+            "message" => %{
+              "content" => [],
+              "id" => "msg_129",
+              "model" => @test_model,
+              "role" => "assistant",
+              "stop_reason" => nil,
+              "stop_sequence" => nil,
+              "type" => "message",
+              "usage" => %{
+                "input_tokens" => 100,
+                "output_tokens" => 0
+              }
+            },
+            "type" => "message_start"
+          },
+          # Block 0: text without citations
+          %{
+            "content_block" => %{"type" => "text", "text" => ""},
+            "index" => 0,
+            "type" => "content_block_start"
+          },
+          %{
+            "delta" => %{"type" => "text_delta", "text" => "Intro text."},
+            "index" => 0,
+            "type" => "content_block_delta"
+          },
+          %{"index" => 0, "type" => "content_block_stop"},
+          # Block 1: text with citation
+          %{
+            "content_block" => %{"type" => "text", "text" => ""},
+            "index" => 1,
+            "type" => "content_block_start"
+          },
+          %{
+            "delta" => %{"type" => "text_delta", "text" => "cited text"},
+            "index" => 1,
+            "type" => "content_block_delta"
+          },
+          %{
+            "delta" => %{
+              "type" => "citations_delta",
+              "citation" => %{
+                "type" => "char_location",
+                "cited_text" => "From the source.",
+                "document_index" => 0,
+                "document_title" => "Source Doc",
+                "start_char_index" => 0,
+                "end_char_index" => 16
+              }
+            },
+            "index" => 1,
+            "type" => "content_block_delta"
+          },
+          %{"index" => 1, "type" => "content_block_stop"},
+          %{
+            "delta" => %{"stop_reason" => "end_turn", "stop_sequence" => nil},
+            "type" => "message_delta",
+            "usage" => %{"output_tokens" => 30}
+          },
+          %{"type" => "message_stop"}
+        ]
+        |> Enum.filter(&ChatAnthropic.relevant_event?/1)
+        |> Enum.map(&ChatAnthropic.do_process_response(model, &1))
+
+      {:ok, %Message{} = merged} =
+        MessageDelta.merge_deltas(processed) |> MessageDelta.to_message()
+
+      assert [block0, block1] = merged.content
+      assert block0.content == "Intro text."
+      assert block0.citations == []
+      assert block1.content == "cited text"
+      assert [%Citation{}] = block1.citations
     end
   end
 
@@ -1300,11 +2264,11 @@ defmodule LangChain.ChatModels.ChatAnthropicTest do
     end
 
     @tag live_call: true, live_anthropic: true
-    test "handles tool_call with text content response when NOT streaming" do
+    test "handles strict tool_call with text content response when NOT streaming" do
       chat =
         ChatAnthropic.new!(%{
           stream: false,
-          model: @claude_3_7,
+          model: @sonnet,
           verbose_api: false
         })
 
@@ -1319,8 +2283,14 @@ defmodule LangChain.ChatModels.ChatAnthropicTest do
           [
             Function.new!(%{
               name: "do_thing",
-              parameters: [FunctionParam.new!(%{type: :string, name: "value", required: true})],
-              function: fn _args, _context -> :ok end
+              parameters_schema: %{
+                "type" => "object",
+                "properties" => %{"value" => %{"type" => "string"}},
+                "required" => ["value"],
+                "additionalProperties" => false
+              },
+              function: fn _args, _context -> :ok end,
+              strict: true
             })
           ]
         )
@@ -1334,6 +2304,100 @@ defmodule LangChain.ChatModels.ChatAnthropicTest do
       assert tool_call.type == :function
       assert tool_call.name == "do_thing"
       assert tool_call.arguments == %{"value" => "test value"}
+    end
+
+    test "merges req_opts into the request (streaming)" do
+      expect(Req, :post, fn req_struct, _opts ->
+        assert req_struct.options.retry == false
+
+        {:error, RuntimeError.exception("Something went wrong")}
+      end)
+
+      model = ChatAnthropic.new!(%{stream: true, model: @test_model, req_opts: [retry: false]})
+
+      assert {:error, %LangChainError{message: error_message}} =
+               ChatAnthropic.call(model, "prompt", [])
+
+      assert error_message =~ "Unhanded error in streaming response"
+    end
+
+    test "merges req_opts into the request (non-streaming)" do
+      expect(Req, :post, fn req_struct ->
+        assert req_struct.options.retry == false
+
+        {:error, RuntimeError.exception("Something went wrong")}
+      end)
+
+      model =
+        ChatAnthropic.new!(%{stream: false, model: @test_model, req_opts: [retry: false]})
+
+      assert {:error, %LangChainError{message: error_message}} =
+               ChatAnthropic.call(model, "prompt", [])
+
+      assert error_message =~ "Unhanded error in non-streamed response"
+    end
+
+    test "returns unhandled error in original attribute (streaming)" do
+      expect(Req, :post, fn _req_struct, _opts ->
+        {:error, RuntimeError.exception("Something went wrong")}
+      end)
+
+      model = ChatAnthropic.new!(%{stream: true, model: @test_model})
+
+      assert {:error, %LangChainError{message: error_message} = error} =
+               ChatAnthropic.call(model, "prompt", [])
+
+      assert error_message =~ "Unhanded error in streaming response"
+
+      assert %RuntimeError{message: "Something went wrong"} =
+               error.original
+    end
+
+    test "returns unexpected response in original attribute (streaming)" do
+      expect(Req, :post, fn _req_struct, _opts ->
+        {:what, "RANDOM!"}
+      end)
+
+      model = ChatAnthropic.new!(%{stream: true, model: @test_model})
+
+      assert {:error, %LangChainError{message: error_message} = error} =
+               ChatAnthropic.call(model, "prompt", [])
+
+      assert error_message =~ "Unexpected response"
+
+      assert {:what, "RANDOM!"} = error.original
+    end
+
+    test "returns unhandled error in original attribute (non-streaming)" do
+      expect(Req, :post, fn _req_struct ->
+        {:error, RuntimeError.exception("Something went wrong")}
+      end)
+
+      model =
+        ChatAnthropic.new!(%{stream: false, model: @test_model})
+
+      assert {:error, %LangChainError{message: error_message} = error} =
+               ChatAnthropic.call(model, "prompt", [])
+
+      assert error_message =~ "Unhanded error in non-streamed response"
+
+      assert %RuntimeError{message: "Something went wrong"} =
+               error.original
+    end
+
+    test "returns unexpected response in original attribute (non-streaming)" do
+      expect(Req, :post, fn _req_struct ->
+        {:what, "RANDOM!"}
+      end)
+
+      model =
+        ChatAnthropic.new!(%{stream: false, model: @test_model})
+
+      assert {:error, %LangChainError{message: error_message} = error} =
+               ChatAnthropic.call(model, "prompt", [])
+
+      assert error_message =~ "Unexpected response"
+      assert {:what, "RANDOM!"} = error.original
     end
 
     test "returns error tuple when receiving overloaded_error" do
@@ -1350,6 +2414,31 @@ defmodule LangChain.ChatModels.ChatAnthropicTest do
 
       assert reason.type == "overloaded_error"
       assert reason.message == "Overloaded (from test)"
+    end
+
+    test "returns error when overloaded_error arrives as SSE event in streaming response" do
+      # Simulates the real streaming scenario: HTTP 200 succeeds, but an
+      # overloaded_error arrives as an SSE event. The streaming accumulator
+      # puts the {:error, error} tuple into the response body list.
+      error =
+        LangChainError.exception(
+          type: "overloaded_error",
+          message: "Overloaded",
+          original: %{
+            "type" => "error",
+            "error" => %{"type" => "overloaded_error", "message" => "Overloaded"}
+          }
+        )
+
+      expect(Req, :post, fn _req_struct, _opts ->
+        {:ok, %Req.Response{status: 200, body: [[{:error, error}]], headers: %{}}}
+      end)
+
+      model = ChatAnthropic.new!(%{stream: true, model: @test_model})
+      assert {:error, reason} = ChatAnthropic.call(model, "prompt", [])
+
+      assert reason.type == "overloaded_error"
+      assert reason.message == "Overloaded"
     end
 
     for api <- @apis do
@@ -1369,7 +2458,7 @@ defmodule LangChain.ChatModels.ChatAnthropicTest do
           end
         }
 
-        {:ok, chat} =
+        {:ok, %ChatAnthropic{} = chat} =
           ChatAnthropic.new(%{stream: true} |> Map.merge(api_config))
 
         chat = %ChatAnthropic{chat | callbacks: [handlers]}
@@ -1410,9 +2499,14 @@ defmodule LangChain.ChatModels.ChatAnthropicTest do
         assert_received {:fired_response_headers, response_headers}
 
         assert %{
-                 "connection" => ["keep-alive"],
-                 "content-type" => ["text/event-stream; charset=utf-8"]
+                 "connection" => ["keep-alive"]
                } = response_headers
+
+        if api == :anthropic_bedrock do
+          assert response_headers["content-type"] == ["application/vnd.amazon.eventstream"]
+        else
+          assert response_headers["content-type"] == ["text/event-stream; charset=utf-8"]
+        end
       end
     end
   end
@@ -1708,7 +2802,7 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
 
   describe "parse_stream_events/2" do
     setup _ do
-      model = ChatAnthropic.new!(%{stream: true, model: @claude_3_7})
+      model = ChatAnthropic.new!(%{stream: true, model: @sonnet})
 
       chunks = [
         "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_017vYxGobHipWyoZT5uDbGnJ\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-3-7-sonnet-20250219\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":55,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":4}} }\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\",\"signature\":\"\"}             }\n\n",
@@ -1738,7 +2832,7 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
                    "id" => "msg_017vYxGobHipWyoZT5uDbGnJ",
                    "type" => "message",
                    "role" => "assistant",
-                   "model" => @claude_3_7,
+                   "model" => "claude-3-7-sonnet-20250219",
                    "content" => [],
                    "stop_reason" => nil,
                    "stop_sequence" => nil,
@@ -1843,7 +2937,7 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
             "message" => %{
               "content" => [],
               "id" => "msg_017vYxGobHipWyoZT5uDbGnJ",
-              "model" => @claude_3_7,
+              "model" => "claude-3-7-sonnet-20250219",
               "role" => "assistant",
               "stop_reason" => nil,
               "stop_sequence" => nil,
@@ -1933,7 +3027,7 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
       llm =
         ChatAnthropic.new!(%{
           stream: true,
-          model: @claude_3_7,
+          model: @sonnet,
           thinking: %{type: "enabled", budget_tokens: 1024},
           verbose_api: false
         })
@@ -1941,11 +3035,13 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
       {:ok, deltas} = ChatAnthropic.call(llm, "What is 400 + 50 + 3?")
       # IO.inspect(deltas, label: "RESULT DELTAS")
 
-      {:ok, %Message{} = merged} = MessageDelta.merge_deltas(deltas) |> MessageDelta.to_message()
+      {:ok, %Message{} = merged} =
+        deltas |> List.flatten() |> MessageDelta.merge_deltas() |> MessageDelta.to_message()
+
       # IO.inspect(merged, label: "MERGED")
 
       answer = ContentPart.parts_to_string(merged.content)
-      # IO.inspect(parts, label: "PARTS")
+      # IO.inspect(answer, label: "ANSWER")
       assert answer =~ "453"
     end
 
@@ -1954,7 +3050,7 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
     #   llm =
     #     ChatAnthropic.new!(%{
     #       stream: true,
-    #       model: @claude_3_7,
+    #       model: @sonnet,
     #       thinking: %{type: "enabled", budget_tokens: 1024},
     #       verbose_api: true
     #     })
@@ -2031,6 +3127,40 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
       }
 
       assert expected == ChatAnthropic.message_for_api(msg)
+    end
+
+    test "strips thinking ContentParts without a signature from assistant messages with tool calls" do
+      # When a conversation crosses models (e.g. Kimi K2 → Claude), the history
+      # may include assistant messages whose :thinking ContentParts have no
+      # Anthropic signature. content_part_for_api/1 returns nil for those, and
+      # they must not appear in the serialized content array or Anthropic rejects
+      # the request with "Input should be a valid dictionary or object to extract
+      # fields from" (the exact error seen in production logs).
+      msg = %Message{
+        role: :assistant,
+        status: :complete,
+        content: [
+          %ContentPart{
+            type: :thinking,
+            content: "Let me look that up.",
+            options: []
+          }
+        ],
+        tool_calls: [
+          ToolCall.new!(%{
+            call_id: "toolu_abc",
+            name: "web_lookup",
+            arguments: %{"query" => "elixir"}
+          })
+        ]
+      }
+
+      result = ChatAnthropic.message_for_api(msg)
+
+      assert result["role"] == "assistant"
+      # The nil produced by the signatureless thinking part must be gone;
+      # only the tool_use block should remain.
+      assert [%{"type" => "tool_use", "id" => "toolu_abc"}] = result["content"]
     end
 
     test "turns a tool message into expected JSON format" do
@@ -2163,6 +3293,22 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
       assert result == expected
     end
 
+    test "turns a file ContentPart into the expected JSON format" do
+      expected = %{
+        "type" => "document",
+        "source" => %{
+          "data" => "pdf_base64_data",
+          "type" => "base64",
+          "media_type" => "application/pdf"
+        }
+      }
+
+      result =
+        ChatAnthropic.content_part_for_api(ContentPart.file!("pdf_base64_data", media: :pdf))
+
+      assert result == expected
+    end
+
     test "turns image ContentPart's media_type into the expected value" do
       assert %{"source" => %{"media_type" => "image/png"}} =
                ChatAnthropic.content_part_for_api(
@@ -2183,6 +3329,112 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
                ChatAnthropic.content_part_for_api(
                  ContentPart.image!("image_base64_data", media: "image/webp")
                )
+    end
+
+    test "turns file ContentPart's media_type into the expected value" do
+      assert %{"source" => %{"media_type" => "application/pdf"}} =
+               ChatAnthropic.content_part_for_api(
+                 ContentPart.file!("pdf_base64_data", media: :pdf)
+               )
+    end
+
+    test "turns a file_url ContentPart into the expected JSON format" do
+      expected = %{
+        "type" => "document",
+        "source" => %{
+          "type" => "url",
+          "url" => "https://example.com/myfile.pdf"
+        }
+      }
+
+      result =
+        ChatAnthropic.content_part_for_api(
+          ContentPart.file_url!("https://example.com/myfile.pdf")
+        )
+
+      assert result == expected
+    end
+
+    test "turns a file ContentPart with file_id into the expected document format" do
+      result =
+        ChatAnthropic.content_part_for_api(
+          ContentPart.file!("file_011CNha8iCJcU1wXNR6q4V8w", type: :file_id)
+        )
+
+      assert %{
+               "type" => "document",
+               "source" => %{
+                 "type" => "file",
+                 "file_id" => "file_011CNha8iCJcU1wXNR6q4V8w"
+               }
+             } = result
+
+      refute Map.has_key?(result, "title")
+      refute Map.has_key?(result, "citations")
+      refute Map.has_key?(result, "cache_control")
+    end
+
+    test "file ContentPart with file_id includes title when provided" do
+      result =
+        ChatAnthropic.content_part_for_api(
+          ContentPart.file!("file_011CNha8iCJcU1wXNR6q4V8w",
+            type: :file_id,
+            title: "My Report"
+          )
+        )
+
+      assert %{
+               "type" => "document",
+               "source" => %{"type" => "file", "file_id" => "file_011CNha8iCJcU1wXNR6q4V8w"},
+               "title" => "My Report"
+             } = result
+    end
+
+    test "file ContentPart with file_id includes citations when enabled" do
+      result =
+        ChatAnthropic.content_part_for_api(
+          ContentPart.file!("file_011CNha8iCJcU1wXNR6q4V8w",
+            type: :file_id,
+            citations: true
+          )
+        )
+
+      assert %{
+               "type" => "document",
+               "source" => %{"type" => "file", "file_id" => "file_011CNha8iCJcU1wXNR6q4V8w"},
+               "citations" => %{"enabled" => true}
+             } = result
+    end
+
+    test "file ContentPart with file_id includes cache_control when enabled" do
+      result =
+        ChatAnthropic.content_part_for_api(
+          ContentPart.file!("file_011CNha8iCJcU1wXNR6q4V8w",
+            type: :file_id,
+            cache_control: true
+          )
+        )
+
+      assert %{
+               "type" => "document",
+               "source" => %{"type" => "file", "file_id" => "file_011CNha8iCJcU1wXNR6q4V8w"},
+               "cache_control" => %{"type" => "ephemeral"}
+             } = result
+    end
+
+    test "turns an image ContentPart with file_id into the expected image format" do
+      result =
+        ChatAnthropic.content_part_for_api(
+          ContentPart.image!("file_011CPMxVD3fHLUhvTqtsQA5w", type: :file_id)
+        )
+
+      assert %{
+               "type" => "image",
+               "source" => %{
+                 "type" => "file",
+                 "file_id" => "file_011CPMxVD3fHLUhvTqtsQA5w"
+               }
+             } = result
     end
 
     test "cache_control: true uses default settings" do
@@ -2214,6 +3466,165 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
         ChatAnthropic.content_part_for_api(ContentPart.image_url!("url-to-image"))
       end
     end
+
+    test "includes citations in API output for text part with citations" do
+      citation =
+        Citation.new!(%{
+          cited_text: "The sky is blue.",
+          source: %{type: :document, title: "Science Facts", document_id: "0"},
+          metadata: %{
+            "provider_type" => "char_location",
+            "start_char_index" => 0,
+            "end_char_index" => 16
+          }
+        })
+
+      part = ContentPart.text!("the sky is blue")
+      part = %{part | citations: [citation]}
+
+      result = ChatAnthropic.content_part_for_api(part)
+
+      assert result == %{
+               "type" => "text",
+               "text" => "the sky is blue",
+               "citations" => [
+                 %{
+                   "type" => "char_location",
+                   "cited_text" => "The sky is blue.",
+                   "document_index" => 0,
+                   "document_title" => "Science Facts",
+                   "start_char_index" => 0,
+                   "end_char_index" => 16
+                 }
+               ]
+             }
+    end
+
+    test "round-trips all three citation types through content_part_for_api" do
+      char_citation =
+        Citation.new!(%{
+          cited_text: "Text A",
+          source: %{type: :document, title: "Doc", document_id: "0"},
+          metadata: %{
+            "provider_type" => "char_location",
+            "start_char_index" => 10,
+            "end_char_index" => 20
+          }
+        })
+
+      page_citation =
+        Citation.new!(%{
+          cited_text: "Text B",
+          source: %{type: :document, title: "Paper", document_id: "1"},
+          metadata: %{
+            "provider_type" => "page_location",
+            "start_page_number" => 3,
+            "end_page_number" => 5
+          }
+        })
+
+      block_citation =
+        Citation.new!(%{
+          cited_text: "Text C",
+          source: %{type: :document, title: "Report", document_id: "2"},
+          metadata: %{
+            "provider_type" => "content_block_location",
+            "start_block_index" => 0,
+            "end_block_index" => 2
+          }
+        })
+
+      part = ContentPart.text!("some text")
+      part = %{part | citations: [char_citation, page_citation, block_citation]}
+
+      result = ChatAnthropic.content_part_for_api(part)
+      assert [c1, c2, c3] = result["citations"]
+
+      assert c1["type"] == "char_location"
+      assert c1["start_char_index"] == 10
+      assert c1["end_char_index"] == 20
+
+      assert c2["type"] == "page_location"
+      assert c2["start_page_number"] == 3
+      assert c2["end_page_number"] == 5
+
+      assert c3["type"] == "content_block_location"
+      assert c3["start_block_index"] == 0
+      assert c3["end_block_index"] == 2
+    end
+
+    test "omits citations from API output when content part has no citations" do
+      part = ContentPart.text!("no citations here")
+      result = ChatAnthropic.content_part_for_api(part)
+
+      refute Map.has_key?(result, "citations")
+      assert result == %{"type" => "text", "text" => "no citations here"}
+    end
+
+    test "round-trips message with citations through message_for_api" do
+      citation =
+        Citation.new!(%{
+          cited_text: "The sky is blue.",
+          source: %{type: :document, title: "Science Facts", document_id: "0"},
+          metadata: %{
+            "provider_type" => "char_location",
+            "start_char_index" => 0,
+            "end_char_index" => 16
+          }
+        })
+
+      part_with = %{ContentPart.text!("the sky is blue") | citations: [citation]}
+      part_without = ContentPart.text!("According to the document, ")
+
+      msg =
+        Message.new_assistant!(%{
+          content: [part_without, part_with]
+        })
+
+      api_data = ChatAnthropic.message_for_api(msg)
+
+      assert api_data["role"] == "assistant"
+      assert [api_part1, api_part2] = api_data["content"]
+
+      refute Map.has_key?(api_part1, "citations")
+      assert api_part1 == %{"type" => "text", "text" => "According to the document, "}
+
+      assert [api_citation] = api_part2["citations"]
+      assert api_citation["type"] == "char_location"
+      assert api_citation["cited_text"] == "The sky is blue."
+      assert api_citation["document_index"] == 0
+    end
+
+    test "raises LangChainError (not KeyError) when :media option is missing for base64 image" do
+      # Previously this raised KeyError which bypassed LangChainError rescue blocks
+      part =
+        ContentPart.new!(%{
+          type: :image,
+          content: "base64encodeddata",
+          options: [source: :base64]
+        })
+
+      assert_raise LangChainError,
+                   ~r/Required :media option missing for base64-encoded image/,
+                   fn ->
+                     ChatAnthropic.content_part_for_api(part)
+                   end
+    end
+
+    test "raises LangChainError (not KeyError) when :media option is missing for base64 document" do
+      part =
+        ContentPart.new!(%{
+          type: :file,
+          content: "base64encodeddata",
+          options: [source: :base64]
+        })
+
+      assert_raise LangChainError,
+                   ~r/Required :media option missing for base64-encoded document/,
+                   fn ->
+                     ChatAnthropic.content_part_for_api(part)
+                   end
+    end
   end
 
   describe "function_for_api/1" do
@@ -2230,7 +3641,11 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
 
       assert output == %{
                "name" => "do_something",
-               "input_schema" => %{"properties" => %{}, "type" => "object"}
+               "input_schema" => %{
+                 "properties" => %{},
+                 "type" => "object",
+                 "additionalProperties" => false
+               }
              }
 
       # with no parameters but has description
@@ -2247,7 +3662,11 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
       assert output == %{
                "name" => "do_something",
                "description" => "Does something",
-               "input_schema" => %{"properties" => %{}, "type" => "object"}
+               "input_schema" => %{
+                 "properties" => %{},
+                 "type" => "object",
+                 "additionalProperties" => false
+               }
              }
 
       # with parameters
@@ -2283,10 +3702,12 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
                        "name" => %{"type" => "string"},
                        "occupation" => %{"type" => "string"}
                      },
-                     "required" => ["name"]
+                     "required" => ["name"],
+                     "additionalProperties" => false
                    }
                  },
-                 "required" => ["person"]
+                 "required" => ["person"],
+                 "additionalProperties" => false
                }
              }
     end
@@ -2304,8 +3725,32 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
 
       assert output == %{
                "name" => "do_something",
-               "input_schema" => %{"properties" => %{}, "type" => "object"},
+               "input_schema" => %{
+                 "properties" => %{},
+                 "type" => "object",
+                 "additionalProperties" => false
+               },
                "cache_control" => %{"type" => "ephemeral"}
+             }
+    end
+
+    test "supports strict mode on the function definition" do
+      json_schema = %{"properties" => %{}, "type" => "object", "additionalProperties" => false}
+
+      tool =
+        Function.new!(%{
+          name: "do_something",
+          parameters_schema: json_schema,
+          function: fn _args, _context -> :ok end,
+          strict: true
+        })
+
+      output = ChatAnthropic.function_for_api(tool)
+
+      assert output == %{
+               "name" => "do_something",
+               "input_schema" => json_schema,
+               "strict" => true
              }
     end
 
@@ -2318,7 +3763,11 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
       assert result == %{
                "name" => "hello_world",
                #  NOTE: Sends the required empty parameter definition when none set
-               "input_schema" => %{"properties" => %{}, "type" => "object"}
+               "input_schema" => %{
+                 "properties" => %{},
+                 "type" => "object",
+                 "additionalProperties" => false
+               }
              }
     end
 
@@ -2350,8 +3799,31 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
       assert result == %{
                "name" => "say_hi",
                "description" => "Provide a friendly greeting.",
-               "input_schema" => params_def
+               "input_schema" => Map.put(params_def, "additionalProperties", false)
              }
+    end
+
+    test "does not override explicit additionalProperties in user-provided schema" do
+      params_def = %{
+        "type" => "object",
+        "properties" => %{
+          "data" => %{"type" => "string"}
+        },
+        "required" => [],
+        "additionalProperties" => true
+      }
+
+      fun =
+        Function.new!(%{
+          name: "flexible_tool",
+          parameters_schema: params_def,
+          function: fn _args, _context -> :ok end
+        })
+
+      result = ChatAnthropic.function_for_api(fun)
+
+      # put_new should not override the explicit true value
+      assert result["input_schema"]["additionalProperties"] == true
     end
   end
 
@@ -2369,6 +3841,35 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
       }
 
       assert json == expected
+    end
+
+    test "normalizes string arguments to a JSON object for tool_use input" do
+      # A ToolCall whose arguments never went through completion still holds a
+      # raw JSON string. It must be serialized as an object, not a string, or
+      # Anthropic rejects the request with "Input should be an object".
+      call = %ToolCall{
+        status: :incomplete,
+        type: :function,
+        call_id: "toolu_123",
+        name: "create_task",
+        arguments: ~s({"title":"x"})
+      }
+
+      assert %{"input" => %{"title" => "x"}} = ChatAnthropic.for_api(call)
+    end
+
+    test "normalizes empty-string arguments to an empty object for tool_use input" do
+      # `"" || %{}` is `""`, so an empty-string accumulation slips through the
+      # old guard. A zero-argument tool call must send an empty object.
+      call = %ToolCall{
+        status: :incomplete,
+        type: :function,
+        call_id: "toolu_123",
+        name: "ping",
+        arguments: ""
+      }
+
+      assert %{"input" => %{}} = ChatAnthropic.for_api(call)
     end
 
     test "turns a tool result into expected JSON format" do
@@ -2662,10 +4163,12 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
         assert updated_chain.last_message.status == :complete
         assert updated_chain.last_message.role == :assistant
         # the final message includes the token usage
-        assert %TokenUsage{input: 20} = updated_chain.last_message.metadata.usage
+        assert %TokenUsage{input: usage} = updated_chain.last_message.metadata.usage
+        # Anthropic and Bedrock compute token usage differently for the same inputs.
+        assert usage in [20, 40]
 
         assert_received {:streamed_fn, data}
-        assert %MessageDelta{role: :assistant} = data
+        assert [%MessageDelta{role: :assistant} | _] = data
       end
 
       Module.put_attribute(__MODULE__, :tag, {:"live_#{api}", true})
@@ -2770,7 +4273,7 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
         assert updated_chain.last_message.role == :assistant
 
         assert_received {:streamed_fn, data}
-        assert %MessageDelta{role: :assistant} = data
+        assert [%MessageDelta{role: :assistant} | _] = data
       end
     end
 
@@ -2886,7 +4389,7 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
       {:ok, updated_chain} = original_chain |> LLMChain.run()
 
       assert %Message{role: :assistant, status: :complete} = updated_chain.last_message
-      assert %TokenUsage{input: 28} = updated_chain.last_message.metadata.usage
+      assert %TokenUsage{input: 56} = updated_chain.last_message.metadata.usage
 
       assert_received {:test_message_processed, message}
       assert %Message{role: :assistant} = message
@@ -2894,13 +4397,13 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
       assert message == updated_chain.last_message
 
       assert_received {:test_token_usage, usage}
-      assert %TokenUsage{input: 28} = usage
+      assert %TokenUsage{input: 56} = usage
 
       # get all the deltas sent to the test process
       deltas = collect_messages() |> List.flatten()
 
       # apply the deltas to the original chain
-      delta_merged_chain = LLMChain.apply_deltas(original_chain, deltas)
+      {:ok, delta_merged_chain} = LLMChain.apply_deltas(original_chain, deltas)
 
       # the received merged deltas should match the ones assembled by the chain.
       # This is also verifying that we're receiving the token usage via sent
@@ -2938,10 +4441,32 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
                "api_version" => "2023-06-01",
                "top_k" => nil,
                "top_p" => nil,
-               "beta_headers" => ["tools-2024-04-04"],
+               "beta_headers" => ["structured-outputs-2025-11-13"],
+               "json_response" => false,
+               "json_schema" => nil,
                "module" => "Elixir.LangChain.ChatModels.ChatAnthropic",
                "version" => 1
              }
+    end
+
+    test "includes json_response and json_schema in the serialized config" do
+      json_schema = %{
+        "type" => "object",
+        "properties" => %{"name" => %{"type" => "string"}},
+        "required" => ["name"],
+        "additionalProperties" => false
+      }
+
+      model =
+        ChatAnthropic.new!(%{
+          model: "claude-3-haiku-20240307",
+          json_response: true,
+          json_schema: json_schema
+        })
+
+      result = ChatAnthropic.serialize_config(model)
+      assert result["json_response"] == true
+      assert result["json_schema"] == json_schema
     end
 
     test "includes beta_headers in the serialized config" do
@@ -2991,14 +4516,459 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
       ChatAnthropic.call(model, "prompt", [])
     end
 
-    test "defaults to tools-2024-04-04 when beta_headers is not provided" do
+    test "defaults to structured-outputs-2025-11-13 when beta_headers is not provided" do
       expect(Req, :post, fn req_struct, _opts ->
-        assert req_struct.headers["anthropic-beta"] == ["tools-2024-04-04"]
+        assert req_struct.headers["anthropic-beta"] == ["structured-outputs-2025-11-13"]
       end)
 
       model = ChatAnthropic.new!(%{stream: true, model: @test_model})
 
       ChatAnthropic.call(model, "prompt", [])
+    end
+  end
+
+  describe "suppress_api_key" do
+    test "defaults to false" do
+      model = ChatAnthropic.new!(%{model: @test_model})
+      assert model.suppress_api_key == false
+    end
+
+    test "new!/1 accepts suppress_api_key: true" do
+      model = ChatAnthropic.new!(%{model: @test_model, suppress_api_key: true})
+      assert model.suppress_api_key == true
+    end
+
+    test "new/1 accepts a string-keyed \"suppress_api_key\" => true" do
+      assert {:ok, model} =
+               ChatAnthropic.new(%{"model" => @test_model, "suppress_api_key" => true})
+
+      assert model.suppress_api_key == true
+    end
+
+    test "omits the x-api-key header when suppress_api_key is true" do
+      expect(Req, :post, fn req_struct, _opts ->
+        refute Map.has_key?(req_struct.headers, "x-api-key")
+      end)
+
+      model =
+        ChatAnthropic.new!(%{
+          stream: true,
+          model: @test_model,
+          api_key: "secret-key",
+          suppress_api_key: true
+        })
+
+      ChatAnthropic.call(model, "prompt", [])
+    end
+
+    test "sends the x-api-key header when suppress_api_key is false" do
+      expect(Req, :post, fn req_struct, _opts ->
+        assert req_struct.headers["x-api-key"] == ["secret-key"]
+      end)
+
+      model = ChatAnthropic.new!(%{stream: true, model: @test_model, api_key: "secret-key"})
+      ChatAnthropic.call(model, "prompt", [])
+    end
+  end
+
+  describe "cache_messages for multi-turn conversations" do
+    test "when cache_messages is enabled, adds cache_control to last user message's last ContentPart" do
+      anthropic = ChatAnthropic.new!(%{cache_messages: %{enabled: true}})
+
+      messages = [
+        Message.new_user!("First message"),
+        Message.new_assistant!("First response"),
+        Message.new_user!("Second message")
+      ]
+
+      data = ChatAnthropic.for_api(anthropic, messages, [])
+
+      # Find the last user message in the API data
+      last_user_message = List.last(data.messages)
+
+      assert last_user_message["role"] == "user"
+      # Get the last content part
+      last_content = List.last(last_user_message["content"])
+      # Should have cache_control set
+      assert last_content["cache_control"] == %{"type" => "ephemeral"}
+    end
+
+    test "when cache_messages is disabled, does not add cache_control automatically" do
+      anthropic = ChatAnthropic.new!(%{cache_messages: %{enabled: false}})
+
+      messages = [
+        Message.new_user!("First message"),
+        Message.new_assistant!("First response"),
+        Message.new_user!("Second message")
+      ]
+
+      data = ChatAnthropic.for_api(anthropic, messages, [])
+
+      # Find the last user message in the API data
+      last_user_message = List.last(data.messages)
+
+      assert last_user_message["role"] == "user"
+      # Get the last content part
+      last_content = List.last(last_user_message["content"])
+      # Should NOT have cache_control
+      refute Map.has_key?(last_content, "cache_control")
+    end
+
+    test "when cache_messages is not set, does not add cache_control automatically" do
+      anthropic = ChatAnthropic.new!(%{})
+
+      messages = [
+        Message.new_user!("First message"),
+        Message.new_assistant!("First response"),
+        Message.new_user!("Second message")
+      ]
+
+      data = ChatAnthropic.for_api(anthropic, messages, [])
+
+      # Find the last user message in the API data
+      last_user_message = List.last(data.messages)
+
+      assert last_user_message["role"] == "user"
+      # Get the last content part
+      last_content = List.last(last_user_message["content"])
+      # Should NOT have cache_control
+      refute Map.has_key?(last_content, "cache_control")
+    end
+
+    test "cache_messages works with multi-part messages" do
+      anthropic = ChatAnthropic.new!(%{cache_messages: %{enabled: true}})
+
+      messages = [
+        Message.new_user!([
+          ContentPart.text!("First part"),
+          ContentPart.text!("Second part")
+        ]),
+        Message.new_assistant!("Response"),
+        Message.new_user!([
+          ContentPart.text!("Question about document"),
+          ContentPart.text!("Additional context")
+        ])
+      ]
+
+      data = ChatAnthropic.for_api(anthropic, messages, [])
+
+      # Find the last user message
+      last_user_message = List.last(data.messages)
+
+      assert last_user_message["role"] == "user"
+      content_parts = last_user_message["content"]
+      assert length(content_parts) == 2
+
+      # Only the LAST content part should have cache_control
+      first_part = Enum.at(content_parts, 0)
+      refute Map.has_key?(first_part, "cache_control")
+
+      last_part = List.last(content_parts)
+      assert last_part["cache_control"] == %{"type" => "ephemeral"}
+    end
+
+    test "cache_messages supports TTL configuration with map value" do
+      anthropic = ChatAnthropic.new!(%{cache_messages: %{enabled: true, ttl: "1h"}})
+
+      messages = [
+        Message.new_user!("First message"),
+        Message.new_assistant!("Response"),
+        Message.new_user!("Second message")
+      ]
+
+      data = ChatAnthropic.for_api(anthropic, messages, [])
+
+      # Find the last user message
+      last_user_message = List.last(data.messages)
+
+      assert last_user_message["role"] == "user"
+      last_content = List.last(last_user_message["content"])
+      assert last_content["cache_control"] == %{"type" => "ephemeral", "ttl" => "1h"}
+    end
+
+    test "cache_messages with tool results in conversation" do
+      anthropic = ChatAnthropic.new!(%{cache_messages: %{enabled: true}})
+
+      messages = [
+        Message.new_user!("Use a tool"),
+        Message.new_assistant!(%{
+          tool_calls: [ToolCall.new!(%{call_id: "call_123", name: "greet", arguments: nil})]
+        }),
+        Message.new_tool_result!(%{
+          tool_results: [ToolResult.new!(%{tool_call_id: "call_123", content: "result"})]
+        }),
+        Message.new_assistant!("Tool executed"),
+        Message.new_user!("What was the result?")
+      ]
+
+      data = ChatAnthropic.for_api(anthropic, messages, [])
+
+      # The last message in the API should be the last user message
+      # Note: tool results get combined with the previous user message by post_process
+      last_message = List.last(data.messages)
+
+      assert last_message["role"] == "user"
+      # Find the last text content part (not tool_result)
+      text_parts =
+        Enum.filter(last_message["content"], fn part -> part["type"] == "text" end)
+
+      last_text_part = List.last(text_parts)
+      assert last_text_part["cache_control"] == %{"type" => "ephemeral"}
+    end
+
+    test "cache_messages does not override explicit cache_control in ContentParts" do
+      anthropic = ChatAnthropic.new!(%{cache_messages: %{enabled: true}})
+
+      messages = [
+        Message.new_user!([
+          ContentPart.text!("First part", cache_control: %{"type" => "ephemeral", "ttl" => "5m"}),
+          ContentPart.text!("Second part")
+        ])
+      ]
+
+      data = ChatAnthropic.for_api(anthropic, messages, [])
+
+      last_user_message = List.last(data.messages)
+      content_parts = last_user_message["content"]
+
+      # First part should keep its explicit cache_control
+      first_part = Enum.at(content_parts, 0)
+      assert first_part["cache_control"] == %{"type" => "ephemeral", "ttl" => "5m"}
+
+      # Last part should get the cache_messages setting
+      last_part = List.last(content_parts)
+      assert last_part["cache_control"] == %{"type" => "ephemeral"}
+    end
+
+    test "simulates moving cache breakpoint in multi-turn conversation" do
+      anthropic = ChatAnthropic.new!(%{cache_messages: %{enabled: true}})
+
+      # First turn
+      messages_turn1 = [
+        Message.new_user!("First question")
+      ]
+
+      data1 = ChatAnthropic.for_api(anthropic, messages_turn1, [])
+      last_msg1 = List.last(data1.messages)
+      assert last_msg1["role"] == "user"
+      last_content1 = List.last(last_msg1["content"])
+      assert last_content1["cache_control"] == %{"type" => "ephemeral"}
+
+      # Second turn - with default count=3, both user messages should have cache_control
+      messages_turn2 = [
+        Message.new_user!("First question"),
+        Message.new_assistant!("First answer"),
+        Message.new_user!("Second question")
+      ]
+
+      data2 = ChatAnthropic.for_api(anthropic, messages_turn2, [])
+
+      # Both user messages should have cache_control (since count=3 and only 2 user messages)
+      last_msg2 = List.last(data2.messages)
+      assert last_msg2["role"] == "user"
+      last_content2 = List.last(last_msg2["content"])
+      assert last_content2["cache_control"] == %{"type" => "ephemeral"}
+
+      first_msg2 = Enum.at(data2.messages, 0)
+      assert first_msg2["role"] == "user"
+      first_content2 = List.last(first_msg2["content"])
+      assert first_content2["cache_control"] == %{"type" => "ephemeral"}
+    end
+
+    test "supports custom count for cache breakpoints" do
+      # Test with count: 1 - only last user message
+      anthropic_1 = ChatAnthropic.new!(%{cache_messages: %{enabled: true, count: 1}})
+
+      messages = [
+        Message.new_user!("First"),
+        Message.new_assistant!("Response 1"),
+        Message.new_user!("Second"),
+        Message.new_assistant!("Response 2"),
+        Message.new_user!("Third")
+      ]
+
+      data = ChatAnthropic.for_api(anthropic_1, messages, [])
+
+      # Get all user messages
+      user_messages = Enum.filter(data.messages, fn msg -> msg["role"] == "user" end)
+      assert length(user_messages) == 3
+
+      # Only the last user message should have cache_control
+      first_user = Enum.at(user_messages, 0)
+      first_content = List.last(first_user["content"])
+      refute Map.has_key?(first_content, "cache_control")
+
+      second_user = Enum.at(user_messages, 1)
+      second_content = List.last(second_user["content"])
+      refute Map.has_key?(second_content, "cache_control")
+
+      last_user = Enum.at(user_messages, 2)
+      last_content = List.last(last_user["content"])
+      assert last_content["cache_control"] == %{"type" => "ephemeral"}
+    end
+
+    test "supports count: 2 for cache breakpoints" do
+      anthropic = ChatAnthropic.new!(%{cache_messages: %{enabled: true, count: 2}})
+
+      messages = [
+        Message.new_user!("First"),
+        Message.new_assistant!("Response 1"),
+        Message.new_user!("Second"),
+        Message.new_assistant!("Response 2"),
+        Message.new_user!("Third"),
+        Message.new_assistant!("Response 3"),
+        Message.new_user!("Fourth")
+      ]
+
+      data = ChatAnthropic.for_api(anthropic, messages, [])
+
+      # Get all user messages
+      user_messages = Enum.filter(data.messages, fn msg -> msg["role"] == "user" end)
+      assert length(user_messages) == 4
+
+      # First two user messages should NOT have cache_control
+      first_user = Enum.at(user_messages, 0)
+      first_content = List.last(first_user["content"])
+      refute Map.has_key?(first_content, "cache_control")
+
+      second_user = Enum.at(user_messages, 1)
+      second_content = List.last(second_user["content"])
+      refute Map.has_key?(second_content, "cache_control")
+
+      # Last two user messages SHOULD have cache_control
+      third_user = Enum.at(user_messages, 2)
+      third_content = List.last(third_user["content"])
+      assert third_content["cache_control"] == %{"type" => "ephemeral"}
+
+      fourth_user = Enum.at(user_messages, 3)
+      fourth_content = List.last(fourth_user["content"])
+      assert fourth_content["cache_control"] == %{"type" => "ephemeral"}
+    end
+
+    test "defaults to count: 3 for cache breakpoints" do
+      anthropic = ChatAnthropic.new!(%{cache_messages: %{enabled: true}})
+
+      messages = [
+        Message.new_user!("First"),
+        Message.new_assistant!("Response 1"),
+        Message.new_user!("Second"),
+        Message.new_assistant!("Response 2"),
+        Message.new_user!("Third"),
+        Message.new_assistant!("Response 3"),
+        Message.new_user!("Fourth"),
+        Message.new_assistant!("Response 4"),
+        Message.new_user!("Fifth")
+      ]
+
+      data = ChatAnthropic.for_api(anthropic, messages, [])
+
+      # Get all user messages
+      user_messages = Enum.filter(data.messages, fn msg -> msg["role"] == "user" end)
+      assert length(user_messages) == 5
+
+      # First two user messages should NOT have cache_control
+      first_user = Enum.at(user_messages, 0)
+      first_content = List.last(first_user["content"])
+      refute Map.has_key?(first_content, "cache_control")
+
+      second_user = Enum.at(user_messages, 1)
+      second_content = List.last(second_user["content"])
+      refute Map.has_key?(second_content, "cache_control")
+
+      # Last three user messages SHOULD have cache_control (default count=3)
+      third_user = Enum.at(user_messages, 2)
+      third_content = List.last(third_user["content"])
+      assert third_content["cache_control"] == %{"type" => "ephemeral"}
+
+      fourth_user = Enum.at(user_messages, 3)
+      fourth_content = List.last(fourth_user["content"])
+      assert fourth_content["cache_control"] == %{"type" => "ephemeral"}
+
+      fifth_user = Enum.at(user_messages, 4)
+      fifth_content = List.last(fifth_user["content"])
+      assert fifth_content["cache_control"] == %{"type" => "ephemeral"}
+    end
+
+    test "limits count to maximum of 4 breakpoints" do
+      anthropic = ChatAnthropic.new!(%{cache_messages: %{enabled: true, count: 10}})
+
+      messages = [
+        Message.new_user!("First"),
+        Message.new_assistant!("Response 1"),
+        Message.new_user!("Second"),
+        Message.new_assistant!("Response 2"),
+        Message.new_user!("Third"),
+        Message.new_assistant!("Response 3"),
+        Message.new_user!("Fourth"),
+        Message.new_assistant!("Response 4"),
+        Message.new_user!("Fifth"),
+        Message.new_assistant!("Response 5"),
+        Message.new_user!("Sixth")
+      ]
+
+      data = ChatAnthropic.for_api(anthropic, messages, [])
+
+      # Get all user messages
+      user_messages = Enum.filter(data.messages, fn msg -> msg["role"] == "user" end)
+      assert length(user_messages) == 6
+
+      # First two user messages should NOT have cache_control
+      first_user = Enum.at(user_messages, 0)
+      first_content = List.last(first_user["content"])
+      refute Map.has_key?(first_content, "cache_control")
+
+      second_user = Enum.at(user_messages, 1)
+      second_content = List.last(second_user["content"])
+      refute Map.has_key?(second_content, "cache_control")
+
+      # Last four user messages SHOULD have cache_control (clamped to max of 4)
+      third_user = Enum.at(user_messages, 2)
+      third_content = List.last(third_user["content"])
+      assert third_content["cache_control"] == %{"type" => "ephemeral"}
+
+      fourth_user = Enum.at(user_messages, 3)
+      fourth_content = List.last(fourth_user["content"])
+      assert fourth_content["cache_control"] == %{"type" => "ephemeral"}
+
+      fifth_user = Enum.at(user_messages, 4)
+      fifth_content = List.last(fifth_user["content"])
+      assert fifth_content["cache_control"] == %{"type" => "ephemeral"}
+
+      sixth_user = Enum.at(user_messages, 5)
+      sixth_content = List.last(sixth_user["content"])
+      assert sixth_content["cache_control"] == %{"type" => "ephemeral"}
+    end
+
+    test "count works with TTL configuration" do
+      anthropic = ChatAnthropic.new!(%{cache_messages: %{enabled: true, count: 2, ttl: "1h"}})
+
+      messages = [
+        Message.new_user!("First"),
+        Message.new_assistant!("Response 1"),
+        Message.new_user!("Second"),
+        Message.new_assistant!("Response 2"),
+        Message.new_user!("Third")
+      ]
+
+      data = ChatAnthropic.for_api(anthropic, messages, [])
+
+      # Get all user messages
+      user_messages = Enum.filter(data.messages, fn msg -> msg["role"] == "user" end)
+      assert length(user_messages) == 3
+
+      # First user message should NOT have cache_control
+      first_user = Enum.at(user_messages, 0)
+      first_content = List.last(first_user["content"])
+      refute Map.has_key?(first_content, "cache_control")
+
+      # Last two user messages SHOULD have cache_control with TTL
+      second_user = Enum.at(user_messages, 1)
+      second_content = List.last(second_user["content"])
+      assert second_content["cache_control"] == %{"type" => "ephemeral", "ttl" => "1h"}
+
+      third_user = Enum.at(user_messages, 2)
+      third_content = List.last(third_user["content"])
+      assert third_content["cache_control"] == %{"type" => "ephemeral", "ttl" => "1h"}
     end
   end
 
@@ -3010,6 +4980,852 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text
 
       refute inspect(changeset) =~ "1234567890"
       assert inspect(changeset) =~ "**redacted**"
+    end
+  end
+
+  describe "live citations" do
+    # Historical document with stable, unchanging facts
+    @historical_document """
+    The Apollo 11 mission launched on July 16, 1969, from Kennedy Space Center in Florida. \
+    The crew consisted of Commander Neil Armstrong, Command Module Pilot Michael Collins, \
+    and Lunar Module Pilot Edwin "Buzz" Aldrin. On July 20, 1969, Armstrong and Aldrin \
+    landed the lunar module Eagle on the Moon's Sea of Tranquility. Armstrong became the \
+    first human to step onto the lunar surface at 10:56 PM EDT. He famously declared, \
+    "That's one small step for man, one giant leap for mankind." The crew returned safely \
+    to Earth on July 24, 1969, splashing down in the Pacific Ocean.\
+    """
+
+    @tag live_call: true, live_anthropic: true
+    test "parses citations from non-streaming response with plain text document" do
+      chat =
+        ChatAnthropic.new!(%{
+          stream: false,
+          model: @test_model,
+          temperature: 0.0,
+          max_tokens: 512
+        })
+
+      message =
+        Message.new_user!([
+          ContentPart.file!(@historical_document,
+            media: :text,
+            citations: true,
+            title: "Apollo 11 Facts"
+          ),
+          ContentPart.text!(
+            "According to the document, who was the commander of Apollo 11 and when did the mission launch? Use citations to back up your answer."
+          )
+        ])
+
+      {:ok, response} = ChatAnthropic.call(chat, [message], [])
+
+      assert %Message{role: :assistant, status: :complete} = response
+      assert is_list(response.content)
+
+      all_citations = Message.all_citations(response)
+      assert length(all_citations) > 0, "Expected at least one citation in the response"
+
+      Enum.each(all_citations, fn citation ->
+        assert %Citation{} = citation
+        assert citation.source.type == :document
+        assert is_binary(citation.cited_text)
+        assert citation.metadata["provider_type"] == "char_location"
+      end)
+    end
+
+    @tag live_call: true, live_anthropic: true
+    test "parses citations from streaming response with plain text document" do
+      chat =
+        ChatAnthropic.new!(%{
+          stream: true,
+          model: @test_model,
+          temperature: 0.0,
+          max_tokens: 512
+        })
+
+      message =
+        Message.new_user!([
+          ContentPart.file!(@historical_document,
+            media: :text,
+            citations: true,
+            title: "Apollo 11 Facts"
+          ),
+          ContentPart.text!(
+            "According to the document, when did Apollo 11 launch? Use citations to back up your answer."
+          )
+        ])
+
+      {:ok, deltas} = ChatAnthropic.call(chat, [message], [])
+
+      {:ok, %Message{} = merged} =
+        deltas |> List.flatten() |> MessageDelta.merge_deltas() |> MessageDelta.to_message()
+
+      assert merged.role == :assistant
+      assert merged.status == :complete
+
+      all_citations = Message.all_citations(merged)
+      assert length(all_citations) > 0, "Expected at least one citation in the streaming response"
+
+      Enum.each(all_citations, fn citation ->
+        assert %Citation{} = citation
+        assert citation.source.type == :document
+        assert is_binary(citation.cited_text)
+        assert citation.metadata["provider_type"] == "char_location"
+      end)
+    end
+  end
+
+  describe "streaming citation delta merging (captured from live API)" do
+    setup do
+      model = ChatAnthropic.new!(%{stream: true})
+      %{model: model}
+    end
+
+    test "merges citation-first streaming sequence into message with text and citations", %{
+      model: model
+    } do
+      # Captured from a real Anthropic streaming response with citations enabled.
+      # The citation delta arrives BEFORE the text deltas for the same content block.
+      processed =
+        [
+          %{
+            "message" => %{
+              "content" => [],
+              "id" => "msg_live_citation_001",
+              "model" => @test_model,
+              "role" => "assistant",
+              "stop_reason" => nil,
+              "stop_sequence" => nil,
+              "type" => "message",
+              "usage" => %{
+                "input_tokens" => 811,
+                "output_tokens" => 5
+              }
+            },
+            "type" => "message_start"
+          },
+          # content_block_start for cited text block
+          %{
+            "content_block" => %{"type" => "text", "text" => ""},
+            "index" => 0,
+            "type" => "content_block_start"
+          },
+          # Citation arrives BEFORE the text (this is how Anthropic sends it)
+          %{
+            "delta" => %{
+              "type" => "citations_delta",
+              "citation" => %{
+                "type" => "char_location",
+                "cited_text" =>
+                  "The Apollo 11 mission launched on July 16, 1969, from Kennedy Space Center in Florida. ",
+                "document_index" => 0,
+                "document_title" => "Apollo 11 Facts",
+                "start_char_index" => 0,
+                "end_char_index" => 87
+              }
+            },
+            "index" => 0,
+            "type" => "content_block_delta"
+          },
+          # Text deltas arrive after the citation
+          %{
+            "delta" => %{"type" => "text_delta", "text" => "Apollo"},
+            "index" => 0,
+            "type" => "content_block_delta"
+          },
+          %{
+            "delta" => %{"type" => "text_delta", "text" => " 11 launched on July 16"},
+            "index" => 0,
+            "type" => "content_block_delta"
+          },
+          %{
+            "delta" => %{
+              "type" => "text_delta",
+              "text" => ", 1969, from Kennedy Space Center in Florida."
+            },
+            "index" => 0,
+            "type" => "content_block_delta"
+          },
+          %{"index" => 0, "type" => "content_block_stop"},
+          %{
+            "delta" => %{"stop_reason" => "end_turn", "stop_sequence" => nil},
+            "type" => "message_delta",
+            "usage" => %{"output_tokens" => 45}
+          },
+          %{"type" => "message_stop"}
+        ]
+        |> Enum.filter(&ChatAnthropic.relevant_event?/1)
+        |> Enum.map(&ChatAnthropic.do_process_response(model, &1))
+
+      {:ok, %Message{} = merged} =
+        MessageDelta.merge_deltas(processed) |> MessageDelta.to_message()
+
+      assert merged.role == :assistant
+      assert merged.status == :complete
+
+      # Single content block with both text and citation
+      assert [%ContentPart{} = part] = merged.content
+
+      assert part.content ==
+               "Apollo 11 launched on July 16, 1969, from Kennedy Space Center in Florida."
+
+      assert [%Citation{} = citation] = part.citations
+      assert citation.cited_text =~ "Apollo 11 mission launched"
+      assert citation.source.type == :document
+      assert citation.source.title == "Apollo 11 Facts"
+      assert citation.source.document_id == "0"
+      assert citation.metadata["provider_type"] == "char_location"
+      assert citation.metadata["start_char_index"] == 0
+      assert citation.metadata["end_char_index"] == 87
+    end
+
+    test "merges multi-block response with cited and uncited blocks", %{model: model} do
+      # Captured pattern: Anthropic splits response into separate text blocks
+      # for cited vs uncited spans
+      processed =
+        [
+          %{
+            "message" => %{
+              "content" => [],
+              "id" => "msg_live_citation_002",
+              "model" => @test_model,
+              "role" => "assistant",
+              "stop_reason" => nil,
+              "stop_sequence" => nil,
+              "type" => "message",
+              "usage" => %{
+                "input_tokens" => 819,
+                "output_tokens" => 5
+              }
+            },
+            "type" => "message_start"
+          },
+          # Block 0: cited text
+          %{
+            "content_block" => %{"type" => "text", "text" => ""},
+            "index" => 0,
+            "type" => "content_block_start"
+          },
+          %{
+            "delta" => %{
+              "type" => "citations_delta",
+              "citation" => %{
+                "type" => "char_location",
+                "cited_text" =>
+                  "The crew consisted of Commander Neil Armstrong, Command Module Pilot Michael Collins, and Lunar Module Pilot Edwin \"Buzz\" Aldrin. ",
+                "document_index" => 0,
+                "document_title" => "Apollo 11 Facts",
+                "start_char_index" => 87,
+                "end_char_index" => 217
+              }
+            },
+            "index" => 0,
+            "type" => "content_block_delta"
+          },
+          %{
+            "delta" => %{
+              "type" => "text_delta",
+              "text" => "The commander of Apollo 11 was Neil Armstrong"
+            },
+            "index" => 0,
+            "type" => "content_block_delta"
+          },
+          %{"index" => 0, "type" => "content_block_stop"},
+          # Block 1: uncited connector text
+          %{
+            "content_block" => %{"type" => "text", "text" => ""},
+            "index" => 1,
+            "type" => "content_block_start"
+          },
+          %{
+            "delta" => %{"type" => "text_delta", "text" => ", and "},
+            "index" => 1,
+            "type" => "content_block_delta"
+          },
+          %{"index" => 1, "type" => "content_block_stop"},
+          # Block 2: another cited text
+          %{
+            "content_block" => %{"type" => "text", "text" => ""},
+            "index" => 2,
+            "type" => "content_block_start"
+          },
+          %{
+            "delta" => %{
+              "type" => "citations_delta",
+              "citation" => %{
+                "type" => "char_location",
+                "cited_text" =>
+                  "The Apollo 11 mission launched on July 16, 1969, from Kennedy Space Center in Florida. ",
+                "document_index" => 0,
+                "document_title" => "Apollo 11 Facts",
+                "start_char_index" => 0,
+                "end_char_index" => 87
+              }
+            },
+            "index" => 2,
+            "type" => "content_block_delta"
+          },
+          %{
+            "delta" => %{
+              "type" => "text_delta",
+              "text" =>
+                "the mission launched on July 16, 1969, from Kennedy Space Center in Florida."
+            },
+            "index" => 2,
+            "type" => "content_block_delta"
+          },
+          %{"index" => 2, "type" => "content_block_stop"},
+          %{
+            "delta" => %{"stop_reason" => "end_turn", "stop_sequence" => nil},
+            "type" => "message_delta",
+            "usage" => %{"output_tokens" => 66}
+          },
+          %{"type" => "message_stop"}
+        ]
+        |> Enum.filter(&ChatAnthropic.relevant_event?/1)
+        |> Enum.map(&ChatAnthropic.do_process_response(model, &1))
+
+      {:ok, %Message{} = merged} =
+        MessageDelta.merge_deltas(processed) |> MessageDelta.to_message()
+
+      assert merged.status == :complete
+      assert [block0, block1, block2] = merged.content
+
+      # Block 0: cited
+      assert block0.content == "The commander of Apollo 11 was Neil Armstrong"
+      assert [%Citation{} = c0] = block0.citations
+      assert c0.cited_text =~ "Commander Neil Armstrong"
+
+      # Block 1: uncited connector
+      assert block1.content == ", and "
+      assert block1.citations == []
+
+      # Block 2: cited
+      assert block2.content =~
+               "the mission launched on July 16, 1969, from Kennedy Space Center in Florida."
+
+      assert [%Citation{} = c2] = block2.citations
+      assert c2.cited_text =~ "Apollo 11 mission launched"
+
+      # Message-level helper collects all citations
+      all_citations = Message.all_citations(merged)
+      assert length(all_citations) == 2
+    end
+  end
+
+  describe "non-streamed API error responses" do
+    test "returns the API's error type and message for a 400" do
+      stub(Req, :post, fn _req_struct ->
+        {:ok,
+         %Req.Response{
+           status: 400,
+           body: %{
+             "type" => "error",
+             "error" => %{
+               "type" => "invalid_request_error",
+               "message" =>
+                 "messages.1.content.0: Invalid `signature` in `thinking` block. " <>
+                   "The block is bound to a different conversation."
+             }
+           }
+         }}
+      end)
+
+      model = ChatAnthropic.new!(%{stream: false, model: @test_model})
+
+      assert {:error, %LangChainError{type: "invalid_request_error", message: message}} =
+               ChatAnthropic.call(model, "prompt", [])
+
+      assert message =~ "bound to a different conversation"
+    end
+
+    test "returns the API's error type and message for a 5xx" do
+      stub(Req, :post, fn _req_struct ->
+        {:ok,
+         %Req.Response{
+           status: 500,
+           body: %{
+             "type" => "error",
+             "error" => %{"type" => "api_error", "message" => "Internal server error"}
+           }
+         }}
+      end)
+
+      model = ChatAnthropic.new!(%{stream: false, model: @test_model})
+
+      assert {:error, %LangChainError{type: "api_error", message: "Internal server error"}} =
+               ChatAnthropic.call(model, "prompt", [])
+    end
+
+    test "returns an unexpected_response error for an error status without an error body" do
+      stub(Req, :post, fn _req_struct ->
+        {:ok, %Req.Response{status: 502, body: "Bad Gateway"}}
+      end)
+
+      model = ChatAnthropic.new!(%{stream: false, model: @test_model})
+
+      assert {:error, %LangChainError{type: "unexpected_response"}} =
+               ChatAnthropic.call(model, "prompt", [])
+    end
+  end
+
+  describe "retry_count" do
+    test "defaults to 2" do
+      model = ChatAnthropic.new!(%{model: @test_model})
+      assert model.retry_count == 2
+    end
+
+    test "is configurable via new/1" do
+      model = ChatAnthropic.new!(%{model: @test_model, retry_count: 0})
+      assert model.retry_count == 0
+    end
+
+    test "retry_count controls the number of retries after the initial attempt" do
+      call_count = :counters.new(1, [])
+
+      stub(Req, :post, fn _req_struct ->
+        count = :counters.get(call_count, 1) + 1
+        :counters.put(call_count, 1, count)
+        {:error, %Req.TransportError{reason: :closed}}
+      end)
+
+      # retry_count: 2 = 1 initial attempt + 2 retries = 3 total HTTP requests
+      model = ChatAnthropic.new!(%{stream: false, model: @test_model, retry_count: 2})
+
+      assert {:error, %LangChainError{message: "Retries exceeded. Connection failed."}} =
+               ChatAnthropic.call(model, "prompt", [])
+
+      assert :counters.get(call_count, 1) == 3
+    end
+
+    test "retry_count: 0 makes one attempt with no retries" do
+      call_count = :counters.new(1, [])
+
+      stub(Req, :post, fn _req_struct ->
+        count = :counters.get(call_count, 1) + 1
+        :counters.put(call_count, 1, count)
+        {:error, %Req.TransportError{reason: :closed}}
+      end)
+
+      model = ChatAnthropic.new!(%{stream: false, model: @test_model, retry_count: 0})
+
+      assert {:error, %LangChainError{message: "Retries exceeded. Connection failed."}} =
+               ChatAnthropic.call(model, "prompt", [])
+
+      # Exactly 1 HTTP request, no retries
+      assert :counters.get(call_count, 1) == 1
+    end
+  end
+
+  describe "retry_on_fallback?/1" do
+    test "returns true for overloaded (non-streaming HTTP 529 type)" do
+      assert ChatAnthropic.retry_on_fallback?(
+               LangChainError.exception(type: "overloaded", message: "Overloaded")
+             )
+    end
+
+    test "returns true for overloaded_error (streaming SSE event type)" do
+      assert ChatAnthropic.retry_on_fallback?(
+               LangChainError.exception(type: "overloaded_error", message: "Overloaded")
+             )
+    end
+
+    test "returns true for rate_limited" do
+      assert ChatAnthropic.retry_on_fallback?(
+               LangChainError.exception(type: "rate_limited", message: "Rate limited")
+             )
+    end
+
+    test "returns true for timeout" do
+      assert ChatAnthropic.retry_on_fallback?(
+               LangChainError.exception(type: "timeout", message: "Timed out")
+             )
+    end
+
+    test "returns false for invalid_request_error" do
+      refute ChatAnthropic.retry_on_fallback?(
+               LangChainError.exception(type: "invalid_request_error", message: "Bad request")
+             )
+    end
+
+    test "returns false for unknown error types" do
+      refute ChatAnthropic.retry_on_fallback?(
+               LangChainError.exception(type: "something_else", message: "Unknown")
+             )
+    end
+  end
+
+  describe "streamed token usage" do
+    setup do
+      %{model: ChatAnthropic.new!(%{stream: true})}
+    end
+
+    # The events below are transcribed from Anthropic's streaming documentation.
+    # A stream reports usage twice: `message_start` opens the message and
+    # `message_delta` closes it with the totals for the whole message, repeating
+    # the input classes rather than adding to them.
+    defp stream_to_message(model, events) do
+      {:ok, %Message{} = message} =
+        events
+        |> Enum.filter(&ChatAnthropic.relevant_event?/1)
+        |> Enum.map(&ChatAnthropic.do_process_response(model, &1))
+        |> MessageDelta.merge_deltas()
+        |> MessageDelta.to_message()
+
+      message
+    end
+
+    defp message_start_event(usage) do
+      %{
+        "type" => "message_start",
+        "message" => %{
+          "id" => "msg_01G",
+          "type" => "message",
+          "role" => "assistant",
+          "model" => "claude-3-7-sonnet-20250219",
+          "content" => [],
+          "stop_reason" => nil,
+          "stop_sequence" => nil,
+          "usage" => usage
+        }
+      }
+    end
+
+    defp text_events do
+      [
+        %{
+          "type" => "content_block_start",
+          "index" => 0,
+          "content_block" => %{"type" => "text", "text" => ""}
+        },
+        %{
+          "type" => "content_block_delta",
+          "index" => 0,
+          "delta" => %{"type" => "text_delta", "text" => "Hello"}
+        },
+        %{"type" => "content_block_stop", "index" => 0}
+      ]
+    end
+
+    defp message_delta_event(usage) do
+      %{
+        "type" => "message_delta",
+        "delta" => %{"stop_reason" => "end_turn", "stop_sequence" => nil},
+        "usage" => usage
+      }
+    end
+
+    test "the closing total is the message's usage, not a sum", %{model: model} do
+      message =
+        stream_to_message(
+          model,
+          [
+            message_start_event(%{
+              "input_tokens" => 2679,
+              "cache_creation_input_tokens" => 0,
+              "cache_read_input_tokens" => 0,
+              "output_tokens" => 3
+            })
+          ] ++
+            text_events() ++
+            [
+              message_delta_event(%{
+                "input_tokens" => 10_682,
+                "cache_creation_input_tokens" => 0,
+                "cache_read_input_tokens" => 0,
+                "output_tokens" => 510,
+                "server_tool_use" => %{"web_search_requests" => 1}
+              })
+            ]
+        )
+
+      usage = TokenUsage.get(message)
+
+      assert usage.input == 10_682
+      assert usage.output == 510
+      assert usage.raw["input_tokens"] == 10_682
+      assert usage.raw["server_tool_use"] == %{"web_search_requests" => 1}
+    end
+
+    test "cache classes are reported once, not doubled", %{model: model} do
+      message =
+        stream_to_message(
+          model,
+          [
+            message_start_event(%{
+              "input_tokens" => 10,
+              "cache_creation_input_tokens" => 31_350,
+              "cache_read_input_tokens" => 0,
+              "output_tokens" => 1
+            })
+          ] ++
+            text_events() ++
+            [
+              message_delta_event(%{
+                "input_tokens" => 10,
+                "cache_creation_input_tokens" => 31_350,
+                "cache_read_input_tokens" => 0,
+                "output_tokens" => 93
+              })
+            ]
+        )
+
+      usage = TokenUsage.get(message)
+
+      assert usage.input == 10
+      assert usage.output == 93
+      assert usage.raw["cache_creation_input_tokens"] == 31_350
+      assert usage.raw["cache_read_input_tokens"] == 0
+    end
+
+    test "a closing total that omits the input classes keeps the opening ones", %{model: model} do
+      # Anthropic's documentation also shows `message_delta` carrying only
+      # `output_tokens`. Nothing is added, but nothing is lost either.
+      message =
+        stream_to_message(
+          model,
+          [
+            message_start_event(%{
+              "input_tokens" => 25,
+              "cache_creation_input_tokens" => 4096,
+              "cache_read_input_tokens" => 128,
+              "output_tokens" => 1
+            })
+          ] ++ text_events() ++ [message_delta_event(%{"output_tokens" => 15})]
+        )
+
+      usage = TokenUsage.get(message)
+
+      assert usage.input == 25
+      assert usage.output == 15
+      assert usage.raw["cache_creation_input_tokens"] == 4096
+      assert usage.raw["cache_read_input_tokens"] == 128
+    end
+
+    test "no input class exceeds the largest single event reporting it", %{model: model} do
+      start_usage = %{
+        "input_tokens" => 10,
+        "cache_creation_input_tokens" => 31_350,
+        "cache_read_input_tokens" => 7,
+        "output_tokens" => 1
+      }
+
+      delta_usage = %{
+        "input_tokens" => 10,
+        "cache_creation_input_tokens" => 31_350,
+        "cache_read_input_tokens" => 7,
+        "output_tokens" => 93
+      }
+
+      message =
+        stream_to_message(
+          model,
+          [message_start_event(start_usage)] ++
+            text_events() ++ [message_delta_event(delta_usage)]
+        )
+
+      usage = TokenUsage.get(message)
+
+      for key <- ["input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"] do
+        largest_reported = max(start_usage[key], delta_usage[key])
+
+        assert usage.raw[key] <= largest_reported,
+               "#{key} accumulated to #{usage.raw[key]}, above the largest single reading of #{largest_reported}"
+      end
+
+      assert usage.input <= max(start_usage["input_tokens"], delta_usage["input_tokens"])
+    end
+  end
+
+  describe "progress updates (thinking display: \"updates\")" do
+    defp updates_model do
+      ChatAnthropic.new!(%{
+        thinking: %{type: "enabled", budget_tokens: 2000, display: "updates"}
+      })
+    end
+
+    defp thinking_response(blocks) do
+      %{
+        "id" => "msg_progress",
+        "type" => "message",
+        "role" => "assistant",
+        "content" => blocks,
+        "model" => "claude-haiku-4-5",
+        "stop_reason" => "tool_use",
+        "stop_details" => nil,
+        "usage" => %{"input_tokens" => 10, "output_tokens" => 5}
+      }
+    end
+
+    test "marks a non-empty thinking block as narration" do
+      response =
+        thinking_response([
+          %{"type" => "thinking", "thinking" => "Checking the logs next.", "signature" => "SIG"}
+        ])
+
+      assert %Message{content: [part]} =
+               ChatAnthropic.do_process_response(updates_model(), response)
+
+      assert part.type == :thinking
+      assert ContentPart.utterance(part) == "narration"
+    end
+
+    test "leaves a thinking block unmarked under the default display" do
+      response =
+        thinking_response([
+          %{"type" => "thinking", "thinking" => "Reasoning about this.", "signature" => "SIG"}
+        ])
+
+      model = ChatAnthropic.new!(%{thinking: %{type: "enabled", budget_tokens: 2000}})
+
+      assert %Message{content: [part]} = ChatAnthropic.do_process_response(model, response)
+      assert ContentPart.utterance(part) == nil
+    end
+
+    test "leaves a thinking block unmarked under display summarized" do
+      response =
+        thinking_response([
+          %{"type" => "thinking", "thinking" => "A summary.", "signature" => "SIG"}
+        ])
+
+      model =
+        ChatAnthropic.new!(%{
+          thinking: %{type: "enabled", budget_tokens: 2000, display: "summarized"}
+        })
+
+      assert %Message{content: [part]} = ChatAnthropic.do_process_response(model, response)
+      assert ContentPart.utterance(part) == nil
+    end
+
+    test "reads display from a string-keyed thinking map" do
+      response =
+        thinking_response([
+          %{"type" => "thinking", "thinking" => "On it.", "signature" => "SIG"}
+        ])
+
+      model =
+        ChatAnthropic.new!(%{
+          thinking: %{"type" => "enabled", "budget_tokens" => 2000, "display" => "updates"}
+        })
+
+      assert %Message{content: [part]} = ChatAnthropic.do_process_response(model, response)
+      assert ContentPart.utterance(part) == "narration"
+    end
+
+    test "leaves an empty thinking block unmarked" do
+      response =
+        thinking_response([%{"type" => "thinking", "thinking" => "", "signature" => "SIG"}])
+
+      assert %Message{content: [part]} =
+               ChatAnthropic.do_process_response(updates_model(), response)
+
+      assert ContentPart.utterance(part) == nil
+    end
+
+    test "leaves text parts unmarked" do
+      response =
+        thinking_response([
+          %{"type" => "thinking", "thinking" => "Looking it up.", "signature" => "SIG"},
+          %{"type" => "text", "text" => "Here is the answer."}
+        ])
+
+      assert %Message{content: [thinking, text]} =
+               ChatAnthropic.do_process_response(updates_model(), response)
+
+      assert ContentPart.utterance(thinking) == "narration"
+      assert ContentPart.utterance(text) == nil
+    end
+
+    test "a message with a narration thinking part and a tool call is still a tool call" do
+      response =
+        thinking_response([
+          %{"type" => "thinking", "thinking" => "Calling the tool.", "signature" => "SIG"},
+          %{
+            "type" => "tool_use",
+            "id" => "toolu_1",
+            "name" => "get_weather",
+            "input" => %{"city" => "Paris"}
+          }
+        ])
+
+      message = ChatAnthropic.do_process_response(updates_model(), response)
+
+      assert Message.is_tool_call?(message)
+      refute Message.narration?(message)
+    end
+
+    test "a message whose only content is a narration thinking part is not narration" do
+      response =
+        thinking_response([
+          %{"type" => "thinking", "thinking" => "Thinking out loud.", "signature" => "SIG"}
+        ])
+
+      message = ChatAnthropic.do_process_response(updates_model(), response)
+
+      # narration? reads text parts. A progress update is a rendering signal,
+      # so it never decides whether the turn is over.
+      refute Message.narration?(message)
+    end
+
+    test "marks a streamed thinking block from its opening event" do
+      delta =
+        ChatAnthropic.do_process_response(updates_model(), %{
+          "type" => "content_block_start",
+          "index" => 0,
+          "content_block" => %{
+            "type" => "thinking",
+            "thinking" => "Starting the search.",
+            "signature" => ""
+          }
+        })
+
+      assert %MessageDelta{content: part} = delta
+      assert ContentPart.utterance(part) == "narration"
+    end
+
+    test "marks streamed thinking deltas and merges to one marker" do
+      model = updates_model()
+
+      deltas =
+        for text <- ["Checking ", "the logs."] do
+          ChatAnthropic.do_process_response(model, %{
+            "type" => "content_block_delta",
+            "index" => 0,
+            "delta" => %{"type" => "thinking_delta", "thinking" => text}
+          })
+        end
+
+      merged = MessageDelta.merge_deltas(deltas)
+
+      assert [part] = merged.merged_content
+      assert part.content == "Checking the logs."
+      assert ContentPart.utterance(part) == "narration"
+    end
+
+    test "leaves streamed thinking deltas unmarked under the default display" do
+      model = ChatAnthropic.new!(%{thinking: %{type: "enabled", budget_tokens: 2000}})
+
+      delta =
+        ChatAnthropic.do_process_response(model, %{
+          "type" => "content_block_delta",
+          "index" => 0,
+          "delta" => %{"type" => "thinking_delta", "thinking" => "Reasoning."}
+        })
+
+      assert %MessageDelta{content: part} = delta
+      assert ContentPart.utterance(part) == nil
+    end
+
+    test "a model with no thinking config marks nothing" do
+      response =
+        thinking_response([
+          %{"type" => "thinking", "thinking" => "Hmm.", "signature" => "SIG"}
+        ])
+
+      model = ChatAnthropic.new!(%{})
+
+      assert %Message{content: [part]} = ChatAnthropic.do_process_response(model, response)
+      assert ContentPart.utterance(part) == nil
     end
   end
 end

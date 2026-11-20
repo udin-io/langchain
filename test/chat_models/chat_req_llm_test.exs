@@ -1,0 +1,3647 @@
+if Code.ensure_loaded?(ReqLLM) do
+  defmodule LangChain.ChatModels.ChatReqLLMTest do
+    use LangChain.BaseCase
+    use Mimic
+
+    alias LangChain.ChatModels.ChatReqLLM
+    alias LangChain.Chains.LLMChain
+    alias LangChain.Message
+    alias LangChain.Message.ContentPart
+    alias LangChain.Message.ToolCall
+    alias LangChain.Message.ToolResult
+    alias LangChain.MessageDelta
+    alias LangChain.TokenUsage
+    alias LangChain.Function
+    alias LangChain.FunctionParam
+    alias LangChain.LangChainError
+
+    # The Anthropic-based req_llm model string for live tests
+    @live_model "anthropic:claude-haiku-4-5"
+
+    # ============================================================
+    # Helpers for constructing fake ReqLLM structs in unit tests
+    # ============================================================
+
+    defp base_response_fields do
+      %{
+        id: "test-response-id",
+        model: "claude-haiku-4-5",
+        context: ReqLLM.Context.new([]),
+        object: nil,
+        stream?: false,
+        stream: nil,
+        provider_meta: %{},
+        error: nil
+      }
+    end
+
+    defp req_llm_text_response(text, finish_reason \\ :stop, usage \\ nil) do
+      struct!(
+        ReqLLM.Response,
+        Map.merge(base_response_fields(), %{
+          message: %ReqLLM.Message{
+            role: :assistant,
+            content: [ReqLLM.Message.ContentPart.text(text)],
+            tool_calls: nil
+          },
+          finish_reason: finish_reason,
+          usage: usage
+        })
+      )
+    end
+
+    # The response req_llm's Anthropic decoder builds from a refusal that
+    # carries no content block.
+    defp decoded_anthropic_refusal() do
+      {:ok, model} = ReqLLM.model("anthropic:claude-haiku-4-5")
+
+      {:ok, response} =
+        ReqLLM.Providers.Anthropic.Response.decode_response(
+          %{
+            "id" => "msg_1",
+            "type" => "message",
+            "role" => "assistant",
+            "model" => "claude-haiku-4-5",
+            "content" => [],
+            "stop_reason" => "refusal",
+            "stop_sequence" => nil,
+            "stop_details" => %{
+              "type" => "refusal",
+              "category" => "reasoning_extraction",
+              "explanation" => "This request was blocked."
+            },
+            "usage" => %{"input_tokens" => 30, "output_tokens" => 0}
+          },
+          model
+        )
+
+      response
+    end
+
+    defp openai_reasoning_details() do
+      [
+        %ReqLLM.Message.ReasoningDetails{
+          text: nil,
+          signature: "ENCRYPTED_REASONING",
+          encrypted?: true,
+          provider: :openai,
+          format: "openai-responses-v1",
+          index: 0,
+          provider_data: %{"id" => "rs_1", "type" => "reasoning"}
+        }
+      ]
+    end
+
+    defp anthropic_detail(text, signature, index) do
+      %ReqLLM.Message.ReasoningDetails{
+        text: text,
+        signature: signature,
+        encrypted?: true,
+        provider: :anthropic,
+        format: "anthropic-thinking-v1",
+        index: index
+      }
+    end
+
+    # Two thinking blocks interleaved with narration, each with its own
+    # signature, ahead of a tool call.
+    defp interleaved_thinking_response() do
+      thinking_response(
+        [
+          ReqLLM.Message.ContentPart.thinking("Find the issue."),
+          ReqLLM.Message.ContentPart.text("Looking it up."),
+          ReqLLM.Message.ContentPart.thinking("Then assign it.")
+        ],
+        [
+          anthropic_detail("Find the issue.", "SIG_FIRST", 0),
+          anthropic_detail("Then assign it.", "SIG_SECOND", 1)
+        ]
+      )
+    end
+
+    # The content blocks req_llm's Anthropic encoder sends for an assistant
+    # message, read back from the request body.
+    defp anthropic_assistant_blocks(%Message{} = message) do
+      {:ok, model} = ReqLLM.model("anthropic:claude-haiku-4-5")
+
+      context = ChatReqLLM.messages_to_req_llm_context([Message.new_user!("hi"), message])
+      body = ReqLLM.Providers.Anthropic.Context.encode_request(context, model)
+
+      assert [_user, %{role: "assistant", content: blocks}] = body.messages
+      blocks
+    end
+
+    # A tool-calling response whose content and reasoning details are given.
+    defp thinking_response(content, details) do
+      struct!(
+        ReqLLM.Response,
+        Map.merge(base_response_fields(), %{
+          message: %ReqLLM.Message{
+            role: :assistant,
+            content: content,
+            tool_calls: [ReqLLM.ToolCall.new("c1", "assign_issue", "{}")],
+            reasoning_details: details
+          },
+          finish_reason: :tool_calls,
+          usage: nil
+        })
+      )
+    end
+
+    # The reasoning part do_process_response/2 builds from openai_reasoning_details/0.
+    defp openai_reasoning_part() do
+      ContentPart.new!(%{
+        type: :unsupported,
+        options: [
+          reasoning_details: [
+            %{
+              "text" => nil,
+              "signature" => "ENCRYPTED_REASONING",
+              "encrypted" => true,
+              "provider" => "openai",
+              "format" => "openai-responses-v1",
+              "index" => 0,
+              "provider_data" => %{"id" => "rs_1", "type" => "reasoning"}
+            }
+          ]
+        ]
+      })
+    end
+
+    # Stores and reloads a message the way a JSON-backed store does: option keys
+    # become strings, every value goes through JSON, and the keys come back as
+    # atoms. Metadata holds arbitrary terms that do not encode as JSON, so a
+    # store keeps only the keys it knows and none of them is reasoning.
+    defp json_round_trip(%Message{content: parts} = message) do
+      restored =
+        Enum.map(parts, fn %ContentPart{options: options} = part ->
+          stored =
+            options
+            |> Map.new(fn {key, value} -> {Atom.to_string(key), value} end)
+            |> Jason.encode!()
+            |> Jason.decode!()
+
+          %ContentPart{
+            part
+            | options: Enum.map(stored, fn {key, value} -> {String.to_atom(key), value} end)
+          }
+        end)
+
+      %Message{message | content: restored, metadata: nil}
+    end
+
+    defp req_llm_tool_call_response(tool_calls) do
+      struct!(
+        ReqLLM.Response,
+        Map.merge(base_response_fields(), %{
+          message: %ReqLLM.Message{
+            role: :assistant,
+            content: [],
+            tool_calls: tool_calls
+          },
+          finish_reason: :tool_calls,
+          usage: %{input_tokens: 20, output_tokens: 10, total_tokens: 30}
+        })
+      )
+    end
+
+    # ============================================================
+    # new/1 and new!/1
+    # ============================================================
+
+    describe "new/1" do
+      test "works with minimal attrs (model only)" do
+        assert {:ok, %ChatReqLLM{} = model} =
+                 ChatReqLLM.new(%{model: "anthropic:claude-haiku-4-5"})
+
+        assert model.model == "anthropic:claude-haiku-4-5"
+        assert model.stream == false
+        assert model.receive_timeout == nil
+        assert model.provider_opts == %{}
+        assert model.callbacks == []
+        assert model.verbose_api == false
+      end
+
+      test "accepts string keys" do
+        assert {:ok, %ChatReqLLM{} = model} =
+                 ChatReqLLM.new(%{"model" => "openai:gpt-4o"})
+
+        assert model.model == "openai:gpt-4o"
+      end
+
+      test "accepts all optional fields" do
+        assert {:ok, %ChatReqLLM{} = model} =
+                 ChatReqLLM.new(%{
+                   model: "groq:llama-3.3-70b-versatile",
+                   max_tokens: 1000,
+                   temperature: 0.7,
+                   stream: false,
+                   receive_timeout: 30_000,
+                   base_url: "http://localhost:11434",
+                   provider_opts: %{"thinking" => %{"type" => "enabled"}},
+                   verbose_api: true
+                 })
+
+        assert model.max_tokens == 1000
+        assert model.temperature == 0.7
+        assert model.stream == false
+        assert model.receive_timeout == 30_000
+        assert model.base_url == "http://localhost:11434"
+        assert model.provider_opts == %{"thinking" => %{"type" => "enabled"}}
+        assert model.verbose_api == true
+      end
+
+      test "returns error when model is blank" do
+        assert {:error, changeset} = ChatReqLLM.new(%{model: ""})
+        refute changeset.valid?
+        # empty string triggers required validation (can't be blank) before length check
+        assert changeset.errors[:model]
+      end
+
+      test "returns error when model is nil" do
+        assert {:error, changeset} = ChatReqLLM.new(%{model: nil})
+        refute changeset.valid?
+        assert {"can't be blank", _} = changeset.errors[:model]
+      end
+
+      test "returns error when temperature is out of range" do
+        assert {:error, changeset} = ChatReqLLM.new(%{model: "anthropic:x", temperature: 3.0})
+        refute changeset.valid?
+        assert changeset.errors[:temperature]
+      end
+
+      test "returns error when max_tokens is zero or negative" do
+        assert {:error, _} = ChatReqLLM.new(%{model: "anthropic:x", max_tokens: 0})
+        assert {:error, _} = ChatReqLLM.new(%{model: "anthropic:x", max_tokens: -1})
+      end
+
+      test "returns error when receive_timeout is zero or negative" do
+        assert {:error, _} = ChatReqLLM.new(%{model: "anthropic:x", receive_timeout: 0})
+        assert {:error, _} = ChatReqLLM.new(%{model: "anthropic:x", receive_timeout: -1})
+      end
+
+      test "new!/1 raises on invalid" do
+        assert_raise LangChainError, fn ->
+          ChatReqLLM.new!(%{model: nil})
+        end
+      end
+    end
+
+    # ============================================================
+    # retry_on_fallback?/1
+    # ============================================================
+
+    describe "retry_on_fallback?/1" do
+      test "returns true for rate_limit_exceeded" do
+        assert ChatReqLLM.retry_on_fallback?(
+                 LangChainError.exception(type: "rate_limit_exceeded", message: "too fast")
+               )
+      end
+
+      test "returns true for overloaded" do
+        assert ChatReqLLM.retry_on_fallback?(
+                 LangChainError.exception(type: "overloaded", message: "busy")
+               )
+      end
+
+      test "returns true for timeout" do
+        assert ChatReqLLM.retry_on_fallback?(
+                 LangChainError.exception(type: "timeout", message: "timed out")
+               )
+      end
+
+      test "returns false for authentication_error" do
+        refute ChatReqLLM.retry_on_fallback?(
+                 LangChainError.exception(type: "authentication_error", message: "bad key")
+               )
+      end
+
+      test "returns false for invalid_request_error" do
+        refute ChatReqLLM.retry_on_fallback?(
+                 LangChainError.exception(type: "invalid_request_error", message: "bad request")
+               )
+      end
+
+      test "returns false for unknown error type" do
+        refute ChatReqLLM.retry_on_fallback?(
+                 LangChainError.exception(type: "something_else", message: "unknown")
+               )
+      end
+    end
+
+    # ============================================================
+    # serialize_config/1 and restore_from_map/1
+    # ============================================================
+
+    describe "serialize_config/1" do
+      test "serializes to a JSON-safe map with version" do
+        model =
+          ChatReqLLM.new!(%{
+            model: "openai:gpt-4o",
+            temperature: 0.5,
+            max_tokens: 2000,
+            stream: false
+          })
+
+        config = ChatReqLLM.serialize_config(model)
+        assert is_map(config)
+        assert config["version"] == 1
+        assert config["model"] == "openai:gpt-4o"
+        assert config["temperature"] == 0.5
+        assert config["max_tokens"] == 2000
+      end
+
+      test "does not include api_key in serialized config" do
+        model = ChatReqLLM.new!(%{model: "anthropic:claude-haiku-4-5", api_key: "secret-key"})
+        config = ChatReqLLM.serialize_config(model)
+        refute Map.has_key?(config, "api_key")
+      end
+    end
+
+    describe "restore_from_map/1" do
+      test "restores a model from serialized config" do
+        model = ChatReqLLM.new!(%{model: "openai:gpt-4o", temperature: 0.7, max_tokens: 500})
+        config = ChatReqLLM.serialize_config(model)
+
+        assert {:ok, %ChatReqLLM{} = restored} = ChatReqLLM.restore_from_map(config)
+        assert restored.model == "openai:gpt-4o"
+        assert restored.temperature == 0.7
+        assert restored.max_tokens == 500
+      end
+    end
+
+    # ============================================================
+    # translate_finish_reason/1
+    # ============================================================
+
+    describe "translate_finish_reason/1" do
+      test "maps :stop to :complete" do
+        assert :complete == ChatReqLLM.translate_finish_reason(:stop)
+      end
+
+      test "maps :tool_calls to :complete" do
+        assert :complete == ChatReqLLM.translate_finish_reason(:tool_calls)
+      end
+
+      test "maps :length to :length" do
+        assert :length == ChatReqLLM.translate_finish_reason(:length)
+      end
+
+      test "maps :content_filter to :content_filtered" do
+        assert :content_filtered == ChatReqLLM.translate_finish_reason(:content_filter)
+      end
+
+      test "maps :incomplete to :length" do
+        assert :length == ChatReqLLM.translate_finish_reason(:incomplete)
+      end
+
+      test "maps nil to :complete" do
+        assert :complete == ChatReqLLM.translate_finish_reason(nil)
+      end
+
+      test "maps unknown to :complete with a warning" do
+        assert :complete == ChatReqLLM.translate_finish_reason(:bizarre_unknown_reason)
+      end
+    end
+
+    # ============================================================
+    # translate_usage/1
+    # ============================================================
+
+    describe "translate_usage/1" do
+      test "returns nil for nil usage" do
+        assert nil == ChatReqLLM.translate_usage(nil)
+      end
+
+      test "maps atom-key usage map to TokenUsage" do
+        usage = %{input_tokens: 100, output_tokens: 50, total_tokens: 150}
+        result = ChatReqLLM.translate_usage(usage)
+        assert %TokenUsage{input: 100, output: 50} = result
+        assert result.raw == usage
+      end
+
+      test "maps usage with extra provider fields to TokenUsage" do
+        usage = %{input_tokens: 80, output_tokens: 40, cached_tokens: 10}
+        result = ChatReqLLM.translate_usage(usage)
+        assert %TokenUsage{input: 80, output: 40} = result
+        assert result.raw == usage
+      end
+
+      test "handles missing fields gracefully" do
+        result = ChatReqLLM.translate_usage(%{})
+        assert %TokenUsage{input: 0, output: 0} = result
+      end
+    end
+
+    # ============================================================
+    # content_part_to_req_llm/1  (outbound content translation)
+    # ============================================================
+
+    describe "content_part_to_req_llm/1" do
+      test "translates :text ContentPart" do
+        part = ContentPart.text!("Hello world")
+        result = ChatReqLLM.content_part_to_req_llm(part)
+        assert %ReqLLM.Message.ContentPart{type: :text, text: "Hello world"} = result
+      end
+
+      test "translates :thinking ContentPart with signature into metadata" do
+        part =
+          ContentPart.new!(%{
+            type: :thinking,
+            content: "Let me think...",
+            options: [signature: "SIG_DATA"]
+          })
+
+        result = ChatReqLLM.content_part_to_req_llm(part)
+
+        assert %ReqLLM.Message.ContentPart{
+                 type: :thinking,
+                 text: "Let me think...",
+                 metadata: %{signature: "SIG_DATA"}
+               } = result
+      end
+
+      test "omits :thinking ContentPart without signature" do
+        part = ContentPart.new!(%{type: :thinking, content: "Let me think..."})
+
+        {result, log} =
+          ExUnit.CaptureLog.with_log(fn -> ChatReqLLM.content_part_to_req_llm(part) end)
+
+        assert result == nil
+        assert log =~ "Thinking ContentPart without signature will be omitted"
+      end
+
+      test "translates :image_url ContentPart" do
+        part = ContentPart.new!(%{type: :image_url, content: "https://example.com/img.png"})
+        result = ChatReqLLM.content_part_to_req_llm(part)
+
+        assert %ReqLLM.Message.ContentPart{type: :image_url, url: "https://example.com/img.png"} =
+                 result
+      end
+
+      test "translates :image ContentPart with base64 data" do
+        raw_bytes = <<1, 2, 3, 4, 5>>
+        b64 = Base.encode64(raw_bytes)
+        part = ContentPart.new!(%{type: :image, content: b64, options: [media: :png]})
+        result = ChatReqLLM.content_part_to_req_llm(part)
+
+        assert %ReqLLM.Message.ContentPart{
+                 type: :image,
+                 data: ^raw_bytes,
+                 media_type: "image/png"
+               } =
+                 result
+      end
+
+      test "translates :file ContentPart with base64 data" do
+        raw_bytes = <<10, 20, 30>>
+        b64 = Base.encode64(raw_bytes)
+
+        part =
+          ContentPart.new!(%{
+            type: :file,
+            content: b64,
+            options: [media: :pdf, filename: "doc.pdf"]
+          })
+
+        result = ChatReqLLM.content_part_to_req_llm(part)
+
+        assert %ReqLLM.Message.ContentPart{
+                 type: :file,
+                 data: ^raw_bytes,
+                 media_type: "application/pdf",
+                 filename: "doc.pdf"
+               } = result
+      end
+
+      test "translates :file_url ContentPart to text (unsupported)" do
+        part = ContentPart.new!(%{type: :file_url, content: "https://example.com/doc.pdf"})
+        result = ChatReqLLM.content_part_to_req_llm(part)
+        assert %ReqLLM.Message.ContentPart{type: :text} = result
+        assert String.contains?(result.text, "https://example.com/doc.pdf")
+      end
+
+      test "returns nil for :unsupported ContentPart" do
+        part = ContentPart.new!(%{type: :unsupported, content: "some data"})
+        result = ChatReqLLM.content_part_to_req_llm(part)
+        assert nil == result
+      end
+
+      test "keeps a text part's cache_control, with true as the default ephemeral block" do
+        default =
+          ChatReqLLM.content_part_to_req_llm(ContentPart.text!("Doc", cache_control: true))
+
+        assert default.metadata == %{cache_control: %{"type" => "ephemeral"}}
+
+        setting = %{"type" => "ephemeral", "ttl" => "1h"}
+
+        custom =
+          ChatReqLLM.content_part_to_req_llm(ContentPart.text!("Doc", cache_control: setting))
+
+        assert custom.metadata == %{cache_control: setting}
+      end
+
+      test "keeps a text part's prompt_cache_breakpoint" do
+        part = ContentPart.text!("Doc", prompt_cache_breakpoint: %{mode: "explicit"})
+        result = ChatReqLLM.content_part_to_req_llm(part)
+        assert result.metadata == %{prompt_cache_breakpoint: %{mode: "explicit"}}
+      end
+
+      test "a text part without cache options has no metadata" do
+        assert ChatReqLLM.content_part_to_req_llm(ContentPart.text!("Doc")).metadata == %{}
+      end
+
+      test "an OpenAI Responses request puts the breakpoint on the part that has it" do
+        message =
+          Message.new_user!([
+            ContentPart.text!("Store context", prompt_cache_breakpoint: %{mode: "explicit"}),
+            ContentPart.text!("Question")
+          ])
+
+        body =
+          [message]
+          |> ChatReqLLM.messages_to_req_llm_context()
+          |> ReqLLM.Providers.OpenAI.ResponsesAPI.build_request_body("gpt-5", [], nil)
+
+        assert [%{"content" => [cached, question]}] = body["input"]
+        assert cached["prompt_cache_breakpoint"] == %{mode: "explicit"}
+        refute Map.has_key?(question, "prompt_cache_breakpoint")
+      end
+
+      test "an Anthropic request puts cache_control on the part that has it" do
+        {:ok, model} = ReqLLM.model("anthropic:claude-haiku-4-5")
+
+        message =
+          Message.new_user!([
+            ContentPart.text!("Store context", cache_control: true),
+            ContentPart.text!("Question")
+          ])
+
+        body =
+          [message]
+          |> ChatReqLLM.messages_to_req_llm_context()
+          |> ReqLLM.Providers.Anthropic.Context.encode_request(model)
+
+        assert [%{role: "user", content: [cached, question]}] = body.messages
+        assert cached[:cache_control] == %{"type" => "ephemeral"}
+        refute Map.has_key?(question, :cache_control)
+      end
+    end
+
+    # ============================================================
+    # message_to_req_llm_messages/1  (outbound message translation)
+    # ============================================================
+
+    describe "message_to_req_llm_messages/1" do
+      test "sends a kept reasoning part back as the message's reasoning details" do
+        msg =
+          Message.new_assistant!(%{
+            tool_calls: [
+              ToolCall.new!(%{
+                call_id: "c1",
+                name: "search",
+                arguments: %{"q" => "x"},
+                status: :complete
+              })
+            ],
+            content: [openai_reasoning_part()]
+          })
+
+        [result] = ChatReqLLM.message_to_req_llm_messages(msg)
+
+        assert %ReqLLM.Message{role: :assistant, reasoning_details: details} = result
+        assert details == openai_reasoning_details()
+      end
+
+      test "an OpenAI Responses request carries the kept reasoning item before its function call" do
+        messages = [
+          Message.new_user!("Find a family SUV."),
+          Message.new_assistant!(%{
+            tool_calls: [
+              ToolCall.new!(%{
+                call_id: "c1",
+                name: "search",
+                arguments: %{"q" => "suv"},
+                status: :complete
+              })
+            ],
+            content: [openai_reasoning_part()]
+          }),
+          Message.new_tool_result!(%{
+            tool_results: [ToolResult.new!(%{tool_call_id: "c1", name: "search", content: "[]"})]
+          })
+        ]
+
+        body =
+          messages
+          |> ChatReqLLM.messages_to_req_llm_context()
+          |> ReqLLM.Providers.OpenAI.ResponsesAPI.build_request_body("gpt-5", [], nil)
+
+        input = body["input"]
+        reasoning = Enum.find_index(input, &(&1["type"] == "reasoning"))
+        call = Enum.find_index(input, &(&1["type"] == "function_call"))
+
+        assert %{"id" => "rs_1", "encrypted_content" => "ENCRYPTED_REASONING"} =
+                 Enum.at(input, reasoning)
+
+        assert reasoning < call
+      end
+
+      test "an assistant message without kept reasoning sends none" do
+        [result] = ChatReqLLM.message_to_req_llm_messages(Message.new_assistant!("Answer"))
+        assert result.reasoning_details == nil
+      end
+
+      test "the reasoning part is not sent as content" do
+        msg =
+          Message.new_assistant!(%{
+            content: [ContentPart.text!("Answer"), openai_reasoning_part()]
+          })
+
+        {[result], log} =
+          ExUnit.CaptureLog.with_log(fn -> ChatReqLLM.message_to_req_llm_messages(msg) end)
+
+        assert [%ReqLLM.Message.ContentPart{type: :text, text: "Answer"}] = result.content
+        refute log =~ "Unsupported ContentPart"
+      end
+
+      test "sends interleaved Anthropic thinking back in the order it was produced" do
+        model = ChatReqLLM.new!(%{model: "anthropic:claude-haiku-4-5"})
+
+        message =
+          model
+          |> ChatReqLLM.do_process_response(interleaved_thinking_response())
+          |> json_round_trip()
+
+        assert [%ReqLLM.Message{reasoning_details: nil}] =
+                 ChatReqLLM.message_to_req_llm_messages(message)
+
+        assert [
+                 %{type: "thinking", thinking: "Find the issue.", signature: "SIG_FIRST"},
+                 %{type: "text", text: "Looking it up."},
+                 %{type: "thinking", thinking: "Then assign it.", signature: "SIG_SECOND"},
+                 %{type: "tool_use", name: "assign_issue"}
+               ] = anthropic_assistant_blocks(message)
+      end
+
+      test "sends Anthropic details when a detail has no thinking part of its own" do
+        model = ChatReqLLM.new!(%{model: "anthropic:claude-haiku-4-5"})
+        # Two streamed blocks merged into one part carry one signature, so the
+        # second block exists only as a detail. Sending the parts would drop it.
+        response =
+          thinking_response(
+            [ReqLLM.Message.ContentPart.thinking("Find the issue.")],
+            [
+              anthropic_detail("Find the issue.", "SIG_FIRST", 0),
+              anthropic_detail("Then assign it.", "SIG_SECOND", 1)
+            ]
+          )
+
+        message = ChatReqLLM.do_process_response(model, response)
+
+        assert [%ReqLLM.Message{reasoning_details: [_, _]}] =
+                 ChatReqLLM.message_to_req_llm_messages(message)
+
+        assert [
+                 %{type: "thinking", signature: "SIG_FIRST"},
+                 %{type: "thinking", signature: "SIG_SECOND"},
+                 %{type: "tool_use"}
+               ] = anthropic_assistant_blocks(message)
+      end
+
+      test "sends OpenAI reasoning as details even when a summary part carries it" do
+        model = ChatReqLLM.new!(%{model: "anthropic:claude-haiku-4-5"})
+        # OpenAI's encoder rebuilds reasoning items from the details alone and
+        # skips thinking parts, so the details always go.
+        [detail] = openai_reasoning_details()
+
+        response =
+          thinking_response(
+            [ReqLLM.Message.ContentPart.thinking("Planning the search.")],
+            [%{detail | text: "Planning the search."}]
+          )
+
+        message = ChatReqLLM.do_process_response(model, response)
+
+        assert [%ContentPart{type: :thinking} = summary | _] = message.content
+        assert summary.options[:signature] == "ENCRYPTED_REASONING"
+
+        assert [%ReqLLM.Message{reasoning_details: [%ReqLLM.Message.ReasoningDetails{}]}] =
+                 ChatReqLLM.message_to_req_llm_messages(message)
+      end
+
+      test "a reasoning part reloaded from JSON sends its reasoning back unchanged" do
+        msg =
+          %{content: [ContentPart.text!("Answer"), openai_reasoning_part()]}
+          |> Message.new_assistant!()
+          |> json_round_trip()
+
+        assert [%ReqLLM.Message{reasoning_details: details}] =
+                 ChatReqLLM.message_to_req_llm_messages(msg)
+
+        assert details == openai_reasoning_details()
+      end
+
+      test "a kept detail from an unknown provider is dropped" do
+        part =
+          ContentPart.new!(%{
+            type: :unsupported,
+            options: [reasoning_details: [%{"provider" => "not_a_known_provider_atom"}]]
+          })
+
+        assert [%ReqLLM.Message{reasoning_details: nil}] =
+                 ChatReqLLM.message_to_req_llm_messages(
+                   Message.new_assistant!(%{content: [part]})
+                 )
+      end
+
+      test "translates a system message with string content" do
+        msg = Message.new_system!("You are helpful.")
+        [result] = ChatReqLLM.message_to_req_llm_messages(msg)
+        assert %ReqLLM.Message{role: :system} = result
+
+        assert [%ReqLLM.Message.ContentPart{type: :text, text: "You are helpful."}] =
+                 result.content
+      end
+
+      test "translates a user message with string content" do
+        msg = Message.new_user!("Hello!")
+        [result] = ChatReqLLM.message_to_req_llm_messages(msg)
+        assert %ReqLLM.Message{role: :user} = result
+        assert [%ReqLLM.Message.ContentPart{type: :text, text: "Hello!"}] = result.content
+      end
+
+      test "translates a user message with multiple ContentParts" do
+        msg =
+          Message.new_user!([
+            ContentPart.text!("Look at this:"),
+            ContentPart.new!(%{type: :image_url, content: "https://example.com/img.png"})
+          ])
+
+        [result] = ChatReqLLM.message_to_req_llm_messages(msg)
+        assert %ReqLLM.Message{role: :user} = result
+        assert length(result.content) == 2
+        assert Enum.at(result.content, 0).type == :text
+        assert Enum.at(result.content, 1).type == :image_url
+      end
+
+      test "translates an assistant message with text content" do
+        msg = Message.new_assistant!(%{content: "I can help with that."})
+        [result] = ChatReqLLM.message_to_req_llm_messages(msg)
+        assert %ReqLLM.Message{role: :assistant} = result
+
+        assert [%ReqLLM.Message.ContentPart{type: :text, text: "I can help with that."}] =
+                 result.content
+      end
+
+      test "translates an assistant message with tool calls" do
+        tool_call =
+          ToolCall.new!(%{
+            type: :function,
+            status: :complete,
+            call_id: "call_abc",
+            name: "get_weather",
+            arguments: %{"city" => "Paris"}
+          })
+
+        msg = Message.new_assistant!(%{tool_calls: [tool_call]})
+        [result] = ChatReqLLM.message_to_req_llm_messages(msg)
+
+        assert %ReqLLM.Message{role: :assistant} = result
+        assert [%ReqLLM.ToolCall{id: "call_abc"} = req_call] = result.tool_calls
+        assert req_call.function.name == "get_weather"
+        assert req_call.function.arguments == ~s({"city":"Paris"})
+      end
+
+      test "expands a :tool message to one ReqLLM message per ToolResult" do
+        results = [
+          ToolResult.new!(%{tool_call_id: "call_1", content: "Result A"}),
+          ToolResult.new!(%{tool_call_id: "call_2", content: "Result B"})
+        ]
+
+        msg = Message.new!(%{role: :tool, tool_results: results})
+        req_messages = ChatReqLLM.message_to_req_llm_messages(msg)
+
+        assert length(req_messages) == 2
+
+        [msg_a, msg_b] = req_messages
+        assert msg_a.role == :tool
+        assert msg_a.tool_call_id == "call_1"
+        assert [%ReqLLM.Message.ContentPart{type: :text, text: "Result A"}] = msg_a.content
+
+        assert msg_b.role == :tool
+        assert msg_b.tool_call_id == "call_2"
+        assert [%ReqLLM.Message.ContentPart{type: :text, text: "Result B"}] = msg_b.content
+      end
+    end
+
+    # ============================================================
+    # messages_to_req_llm_context/1
+    # ============================================================
+
+    describe "messages_to_req_llm_context/1" do
+      test "converts a list of messages to a ReqLLM.Context" do
+        messages = [
+          Message.new_system!("You are helpful."),
+          Message.new_user!("Hi"),
+          Message.new_assistant!(%{content: "Hello!"})
+        ]
+
+        context = ChatReqLLM.messages_to_req_llm_context(messages)
+        assert %ReqLLM.Context{} = context
+        assert length(context.messages) == 3
+      end
+
+      test "expands tool result messages correctly" do
+        results = [
+          ToolResult.new!(%{tool_call_id: "c1", content: "R1"}),
+          ToolResult.new!(%{tool_call_id: "c2", content: "R2"})
+        ]
+
+        messages = [
+          Message.new_user!("Use tools"),
+          Message.new!(%{role: :tool, tool_results: results})
+        ]
+
+        context = ChatReqLLM.messages_to_req_llm_context(messages)
+        # 1 user + 2 expanded tool results = 3 total
+        assert length(context.messages) == 3
+        assert Enum.at(context.messages, 1).role == :tool
+        assert Enum.at(context.messages, 2).role == :tool
+      end
+    end
+
+    # ============================================================
+    # function_to_req_llm_tool/1
+    # ============================================================
+
+    describe "function_to_req_llm_tool/1" do
+      test "creates a ReqLLM.Tool with correct name and description" do
+        fun =
+          Function.new!(%{
+            name: "get_weather",
+            description: "Get current weather",
+            parameters_schema: %{
+              "type" => "object",
+              "properties" => %{"city" => %{"type" => "string"}},
+              "required" => ["city"]
+            },
+            function: fn _, _ -> {:ok, "sunny"} end
+          })
+
+        tool = ChatReqLLM.function_to_req_llm_tool(fun)
+
+        assert %ReqLLM.Tool{} = tool
+        assert tool.name == "get_weather"
+        assert tool.description == "Get current weather"
+        assert tool.parameter_schema == fun.parameters_schema
+      end
+
+      test "defaults strict to false when not set on the Function" do
+        fun =
+          Function.new!(%{
+            name: "get_weather",
+            description: "Get current weather",
+            function: fn _, _ -> {:ok, "sunny"} end
+          })
+
+        assert %ReqLLM.Tool{strict: false} = ChatReqLLM.function_to_req_llm_tool(fun)
+      end
+
+      test "passes strict: true through to the ReqLLM.Tool" do
+        fun =
+          Function.new!(%{
+            name: "get_weather",
+            description: "Get current weather",
+            strict: true,
+            parameters_schema: %{
+              "type" => "object",
+              "properties" => %{"city" => %{"type" => "string"}},
+              "required" => ["city"]
+            },
+            function: fn _, _ -> {:ok, "sunny"} end
+          })
+
+        assert %ReqLLM.Tool{strict: true} = ChatReqLLM.function_to_req_llm_tool(fun)
+      end
+
+      test "strict tool serializes with strict: true in OpenAI format" do
+        fun =
+          Function.new!(%{
+            name: "get_weather",
+            description: "Get current weather",
+            strict: true,
+            parameters_schema: %{
+              "type" => "object",
+              "properties" => %{"city" => %{"type" => "string"}},
+              "required" => ["city"]
+            },
+            function: fn _, _ -> {:ok, "sunny"} end
+          })
+
+        assert %{"function" => %{"strict" => true}} =
+                 fun
+                 |> ChatReqLLM.function_to_req_llm_tool()
+                 |> ReqLLM.Tool.to_schema(:openai)
+      end
+
+      test "maps a Function defined with FunctionParam list to a parameter schema" do
+        fun =
+          Function.new!(%{
+            name: "set_user_name",
+            description: "Sets the user name",
+            parameters: [
+              FunctionParam.new!(%{name: "user_name", type: :string, required: true})
+            ],
+            function: fn _, _ -> {:ok, "ok"} end
+          })
+
+        tool = ChatReqLLM.function_to_req_llm_tool(fun)
+
+        assert %ReqLLM.Tool{} = tool
+
+        assert %{
+                 "type" => "object",
+                 "properties" => %{"user_name" => %{"type" => "string"}},
+                 "required" => ["user_name"]
+               } = tool.parameter_schema
+      end
+
+      test "maps a Function with no parameters to an empty object schema" do
+        fun =
+          Function.new!(%{
+            name: "get_current_user_info",
+            description: "Returns current user info",
+            function: fn _, _ -> {:ok, "ok"} end
+          })
+
+        tool = ChatReqLLM.function_to_req_llm_tool(fun)
+
+        assert %{"type" => "object", "properties" => %{}} = tool.parameter_schema
+      end
+
+      test "stub callback returns {:ok, stub}" do
+        fun =
+          Function.new!(%{
+            name: "noop",
+            description: "Does nothing",
+            function: fn _, _ -> {:ok, "real"} end
+          })
+
+        tool = ChatReqLLM.function_to_req_llm_tool(fun)
+        assert {:ok, "stub"} == tool.callback.(%{})
+      end
+
+      test "functions_to_req_llm_tools returns empty list for nil" do
+        assert [] == ChatReqLLM.functions_to_req_llm_tools(nil)
+      end
+
+      test "functions_to_req_llm_tools returns empty list for empty list" do
+        assert [] == ChatReqLLM.functions_to_req_llm_tools([])
+      end
+
+      test "functions_to_req_llm_tools converts multiple functions" do
+        funs =
+          Enum.map(1..3, fn i ->
+            Function.new!(%{
+              name: "tool_#{i}",
+              description: "Tool #{i}",
+              function: fn _, _ -> {:ok, "ok"} end
+            })
+          end)
+
+        tools = ChatReqLLM.functions_to_req_llm_tools(funs)
+        assert length(tools) == 3
+        assert Enum.all?(tools, &match?(%ReqLLM.Tool{}, &1))
+      end
+    end
+
+    # ============================================================
+    # do_process_response/2  (inbound response processing)
+    # ============================================================
+
+    describe "do_process_response/2" do
+      setup do
+        {:ok, model: ChatReqLLM.new!(%{model: "anthropic:claude-haiku-4-5"})}
+      end
+
+      test "converts a simple text response to a LangChain Message", %{model: model} do
+        response = req_llm_text_response("Hello there!")
+
+        result = ChatReqLLM.do_process_response(model, response)
+
+        assert %Message{role: :assistant} = result
+        assert [%ContentPart{type: :text, content: "Hello there!"}] = result.content
+        assert result.status == :complete
+        assert result.tool_calls == nil or result.tool_calls == []
+      end
+
+      test "maps finish_reason :length to status :length", %{model: model} do
+        response = req_llm_text_response("Truncated...", :length)
+        result = ChatReqLLM.do_process_response(model, response)
+        assert result.status == :length
+      end
+
+      test "a tool call cut off with its response stays incomplete", %{model: model} do
+        response = %{
+          req_llm_tool_call_response([
+            ReqLLM.ToolCall.new("c1", "search", ~s({"query":"elixir"})),
+            ReqLLM.ToolCall.new("c2", "search", ~s({"query":"gatew))
+          ])
+          | finish_reason: :length
+        }
+
+        result = ChatReqLLM.do_process_response(model, response)
+
+        assert result.status == :length
+
+        assert [
+                 %ToolCall{status: :complete, arguments: %{"query" => "elixir"}},
+                 %ToolCall{status: :incomplete, arguments: ~s({"query":"gatew)}
+               ] = result.tool_calls
+
+        refute Message.is_tool_call?(result)
+      end
+
+      test "unparseable arguments in a finished response are unchanged", %{model: model} do
+        response =
+          req_llm_tool_call_response([ReqLLM.ToolCall.new("c1", "search", "not json")])
+
+        result = ChatReqLLM.do_process_response(model, response)
+
+        assert [%ToolCall{status: :complete, arguments: %{}}] = result.tool_calls
+      end
+
+      test "grafts the reasoning-details signature onto thinking content parts", %{model: model} do
+        response =
+          struct!(
+            ReqLLM.Response,
+            Map.merge(base_response_fields(), %{
+              message: %ReqLLM.Message{
+                role: :assistant,
+                content: [
+                  ReqLLM.Message.ContentPart.thinking("Let me reason..."),
+                  ReqLLM.Message.ContentPart.text("Answer")
+                ],
+                tool_calls: nil,
+                reasoning_details: [
+                  %ReqLLM.Message.ReasoningDetails{
+                    text: "Let me reason...",
+                    signature: "SIG_FROM_DETAILS",
+                    encrypted?: true,
+                    provider: :anthropic,
+                    format: "anthropic-thinking-v1",
+                    index: 0
+                  }
+                ]
+              },
+              finish_reason: :stop,
+              usage: nil
+            })
+          )
+
+        result = ChatReqLLM.do_process_response(model, response)
+
+        assert [
+                 %ContentPart{type: :thinking, options: opts},
+                 %ContentPart{type: :text},
+                 %ContentPart{type: :unsupported}
+               ] = result.content
+
+        assert opts[:signature] == "SIG_FROM_DETAILS"
+      end
+
+      test "gives each thinking part its own reasoning-details signature", %{model: model} do
+        response =
+          thinking_response(
+            [
+              ReqLLM.Message.ContentPart.thinking("Find the issue."),
+              ReqLLM.Message.ContentPart.text("Looking it up."),
+              ReqLLM.Message.ContentPart.thinking("Then assign it.")
+            ],
+            [
+              anthropic_detail("Find the issue.", "SIG_FIRST", 0),
+              anthropic_detail("Then assign it.", "SIG_SECOND", 1)
+            ]
+          )
+
+        result = ChatReqLLM.do_process_response(model, response)
+
+        assert [
+                 %ContentPart{type: :thinking} = first,
+                 %ContentPart{type: :text},
+                 %ContentPart{type: :thinking} = second,
+                 %ContentPart{type: :unsupported}
+               ] = result.content
+
+        assert first.options[:signature] == "SIG_FIRST"
+        assert second.options[:signature] == "SIG_SECOND"
+      end
+
+      test "pairs thinking parts by text when there are more details than parts",
+           %{model: model} do
+        # A detail with no thinking part of its own, such as a redacted block,
+        # must not shift the pairing of the parts after it.
+        response =
+          thinking_response(
+            [
+              ReqLLM.Message.ContentPart.thinking("Find the issue."),
+              ReqLLM.Message.ContentPart.thinking("Then assign it.")
+            ],
+            [
+              anthropic_detail("Find the issue.", "SIG_FIRST", 0),
+              anthropic_detail(nil, "SIG_REDACTED", 1),
+              anthropic_detail("Then assign it.", "SIG_THIRD", 2)
+            ]
+          )
+
+        result = ChatReqLLM.do_process_response(model, response)
+
+        assert [first, second, %ContentPart{type: :unsupported}] = result.content
+        assert first.options[:signature] == "SIG_FIRST"
+        assert second.options[:signature] == "SIG_THIRD"
+      end
+
+      test "leaves a thinking part unsigned when no detail holds its text", %{model: model} do
+        response =
+          thinking_response(
+            [
+              ReqLLM.Message.ContentPart.thinking("Find the issue."),
+              ReqLLM.Message.ContentPart.thinking("Something else entirely.")
+            ],
+            [anthropic_detail("Find the issue.", "SIG_FIRST", 0)]
+          )
+
+        result = ChatReqLLM.do_process_response(model, response)
+
+        assert [first, second, %ContentPart{type: :unsupported}] = result.content
+        assert first.options[:signature] == "SIG_FIRST"
+        refute Keyword.has_key?(second.options, :signature)
+      end
+
+      test "pairs thinking parts with identical text by position", %{model: model} do
+        # Thinking that is not displayed arrives with empty text in every block.
+        response =
+          thinking_response(
+            [
+              ReqLLM.Message.ContentPart.thinking(""),
+              ReqLLM.Message.ContentPart.text("Looking it up."),
+              ReqLLM.Message.ContentPart.thinking("")
+            ],
+            [anthropic_detail("", "SIG_FIRST", 0), anthropic_detail("", "SIG_SECOND", 1)]
+          )
+
+        result = ChatReqLLM.do_process_response(model, response)
+
+        assert [first, %ContentPart{type: :text}, second, %ContentPart{type: :unsupported}] =
+                 result.content
+
+        assert first.options[:signature] == "SIG_FIRST"
+        assert second.options[:signature] == "SIG_SECOND"
+      end
+
+      test "keeps reasoning details as a content part so a tool loop can send them back",
+           %{model: model} do
+        response =
+          req_llm_tool_call_response([ReqLLM.ToolCall.new("c1", "search", ~s({"q":"x"}))])
+
+        response = %{
+          response
+          | message: %{response.message | reasoning_details: openai_reasoning_details()}
+        }
+
+        result = ChatReqLLM.do_process_response(model, response)
+
+        assert [part] = result.content
+        assert part == openai_reasoning_part()
+        assert %TokenUsage{input: 20, output: 10} = result.metadata[:usage]
+      end
+
+      test "a response without reasoning details keeps none", %{model: model} do
+        result =
+          ChatReqLLM.do_process_response(model, req_llm_text_response("Hello!", :stop, nil))
+
+        refute Enum.any?(result.content, &(&1.type == :unsupported))
+      end
+
+      test "a stored and reloaded response sends back the reasoning it arrived with",
+           %{model: model} do
+        response =
+          req_llm_tool_call_response([ReqLLM.ToolCall.new("c1", "search", ~s({"q":"x"}))])
+
+        response = %{
+          response
+          | message: %{response.message | reasoning_details: openai_reasoning_details()}
+        }
+
+        reloaded =
+          model
+          |> ChatReqLLM.do_process_response(response)
+          |> json_round_trip()
+
+        assert [%ReqLLM.Message{reasoning_details: details}] =
+                 ChatReqLLM.message_to_req_llm_messages(reloaded)
+
+        assert details == openai_reasoning_details()
+      end
+
+      test "a refusal with no content is a content_filtered message carrying the stop details",
+           %{model: model} do
+        stop_details = %{
+          "type" => "refusal",
+          "category" => "reasoning_extraction",
+          "explanation" => "This request was blocked."
+        }
+
+        response =
+          struct!(
+            ReqLLM.Response,
+            Map.merge(base_response_fields(), %{
+              message: nil,
+              finish_reason: :content_filter,
+              usage: nil,
+              provider_meta: %{"stop_details" => stop_details}
+            })
+          )
+
+        assert %Message{role: :assistant, status: :content_filtered, content: content} =
+                 message = ChatReqLLM.do_process_response(model, response)
+
+        assert content in [nil, []]
+        assert message.metadata[:stop_details] == stop_details
+      end
+
+      test "a response with no message and no refusal is still an error", %{model: model} do
+        response =
+          struct!(
+            ReqLLM.Response,
+            Map.merge(base_response_fields(), %{message: nil, finish_reason: :stop, usage: nil})
+          )
+
+        assert {:error, %LangChainError{type: "unexpected_response"}} =
+                 ChatReqLLM.do_process_response(model, response)
+      end
+
+      test "a refused message keeps the provider's stop details", %{model: model} do
+        stop_details = %{"type" => "refusal", "category" => "cyber"}
+
+        response =
+          struct!(
+            ReqLLM.Response,
+            Map.merge(base_response_fields(), %{
+              message: %ReqLLM.Message{
+                role: :assistant,
+                content: [ReqLLM.Message.ContentPart.text("I can't help with that.")],
+                tool_calls: nil
+              },
+              finish_reason: :content_filter,
+              usage: nil,
+              provider_meta: %{"stop_details" => stop_details}
+            })
+          )
+
+        assert %Message{status: :content_filtered} =
+                 message = ChatReqLLM.do_process_response(model, response)
+
+        assert message.metadata[:stop_details] == stop_details
+      end
+
+      test "a content-less Anthropic refusal decodes to a content_filtered message",
+           %{model: model} do
+        assert %Message{status: :content_filtered} =
+                 message = ChatReqLLM.do_process_response(model, decoded_anthropic_refusal())
+
+        assert %{"type" => "refusal", "category" => "reasoning_extraction"} =
+                 message.metadata[:stop_details]
+
+        assert %TokenUsage{input: 30, output: 0} = TokenUsage.get(message)
+      end
+
+      test "a message that was not refused carries no stop details", %{model: model} do
+        message = ChatReqLLM.do_process_response(model, req_llm_text_response("Hello!"))
+        refute Map.has_key?(message.metadata || %{}, :stop_details)
+      end
+
+      test "maps token usage to message metadata", %{model: model} do
+        usage = %{input_tokens: 100, output_tokens: 50, total_tokens: 150}
+        response = req_llm_text_response("Hello!", :stop, usage)
+
+        result = ChatReqLLM.do_process_response(model, response)
+        assert %TokenUsage{input: 100, output: 50} = result.metadata[:usage]
+      end
+
+      test "returns error when response has error field set", %{model: model} do
+        response =
+          struct!(
+            ReqLLM.Response,
+            Map.merge(base_response_fields(), %{
+              message: nil,
+              finish_reason: :error,
+              error: %{reason: "something went wrong"},
+              usage: nil
+            })
+          )
+
+        assert {:error, %LangChainError{type: "api_error"}} =
+                 ChatReqLLM.do_process_response(model, response)
+      end
+
+      test "returns error when response has no message", %{model: model} do
+        response =
+          struct!(
+            ReqLLM.Response,
+            Map.merge(base_response_fields(), %{
+              message: nil,
+              finish_reason: nil,
+              error: nil,
+              usage: nil
+            })
+          )
+
+        assert {:error, %LangChainError{type: "unexpected_response"}} =
+                 ChatReqLLM.do_process_response(model, response)
+      end
+
+      test "converts tool call response to LangChain Message with tool_calls", %{model: model} do
+        req_tool_calls = [
+          ReqLLM.ToolCall.new("call_abc", "get_weather", ~s({"city":"Paris"}))
+        ]
+
+        response = req_llm_tool_call_response(req_tool_calls)
+        result = ChatReqLLM.do_process_response(model, response)
+
+        assert %Message{role: :assistant} = result
+        assert [%ToolCall{} = tc] = result.tool_calls
+        assert tc.call_id == "call_abc"
+        assert tc.name == "get_weather"
+        assert tc.arguments == %{"city" => "Paris"}
+        assert tc.status == :complete
+        assert tc.type == :function
+      end
+
+      test "handles multiple tool calls", %{model: model} do
+        req_tool_calls = [
+          ReqLLM.ToolCall.new("c1", "search", ~s({"query":"elixir"})),
+          ReqLLM.ToolCall.new("c2", "calculate", ~s({"expr":"2+2"}))
+        ]
+
+        response = req_llm_tool_call_response(req_tool_calls)
+        result = ChatReqLLM.do_process_response(model, response)
+
+        assert length(result.tool_calls) == 2
+        assert Enum.at(result.tool_calls, 0).name == "search"
+        assert Enum.at(result.tool_calls, 1).name == "calculate"
+      end
+
+      test "handles empty tool_calls list as nil tool_calls in output", %{model: model} do
+        response =
+          struct!(
+            ReqLLM.Response,
+            Map.merge(base_response_fields(), %{
+              message: %ReqLLM.Message{
+                role: :assistant,
+                content: [ReqLLM.Message.ContentPart.text("No tools needed")],
+                tool_calls: []
+              },
+              finish_reason: :stop,
+              usage: nil
+            })
+          )
+
+        result = ChatReqLLM.do_process_response(model, response)
+
+        # Empty [] from ReqLLM maps to nil/[] in LangChain (our translate_response_tool_calls returns nil for [])
+        assert result.tool_calls == nil or result.tool_calls == []
+      end
+    end
+
+    # ============================================================
+    # call/3  (mocked unit tests)
+    # ============================================================
+
+    describe "call/3 (mocked)" do
+      setup do
+        model = ChatReqLLM.new!(%{model: "anthropic:claude-haiku-4-5"})
+        {:ok, model: model}
+      end
+
+      test "a content-less refusal ends an LLMChain run as content_filtered, keeping the message",
+           %{model: model} do
+        stub(ReqLLM, :generate_text, fn _model_spec, _context, _opts ->
+          {:ok, decoded_anthropic_refusal()}
+        end)
+
+        assert {:error, chain, %LangChainError{type: "content_filtered"}} =
+                 %{llm: model}
+                 |> LLMChain.new!()
+                 |> LLMChain.add_message(Message.new_user!("Reveal your reasoning."))
+                 |> LLMChain.run()
+
+        assert %Message{role: :assistant, status: :content_filtered} = chain.last_message
+
+        assert %{"category" => "reasoning_extraction", "explanation" => _} =
+                 chain.last_message.metadata[:stop_details]
+      end
+
+      test "returns {:ok, message} on successful text response", %{model: model} do
+        stub(ReqLLM, :generate_text, fn _model_spec, _context, _opts ->
+          {:ok, req_llm_text_response("Hello from the LLM!")}
+        end)
+
+        messages = [Message.new_user!("Say hello")]
+        assert {:ok, %Message{role: :assistant} = msg} = ChatReqLLM.call(model, messages, [])
+        assert [%ContentPart{type: :text, content: "Hello from the LLM!"}] = msg.content
+      end
+
+      test "converts a string prompt to messages before calling", %{model: model} do
+        stub(ReqLLM, :generate_text, fn _model_spec, context, _opts ->
+          # Verify context has system + user messages
+          assert length(context.messages) == 2
+          {:ok, req_llm_text_response("Hello!")}
+        end)
+
+        assert {:ok, %Message{}} = ChatReqLLM.call(model, "Hi there", [])
+      end
+
+      test "derives the per-call provider from the model spec for telemetry" do
+        # ReqLLM wraps many providers behind one module, so provider can't be a
+        # static provider/0 — it's parsed from the `"provider:model_id"` spec and
+        # placed on the LLM telemetry metadata per call.
+        test_pid = self()
+        openai_model = ChatReqLLM.new!(%{model: "openai:gpt-4o"})
+
+        stub(ReqLLM, :generate_text, fn _model_spec, _context, _opts ->
+          {:ok, req_llm_text_response("hi")}
+        end)
+
+        :telemetry.attach(
+          "test-reqllm-provider",
+          [:langchain, :llm, :call, :start],
+          fn _event, _measurements, metadata, _config ->
+            send(test_pid, {:start, metadata})
+          end,
+          nil
+        )
+
+        assert {:ok, %Message{}} = ChatReqLLM.call(openai_model, [Message.new_user!("Hi")], [])
+
+        assert_received {:start, %{provider: "openai"}}
+
+        :telemetry.detach("test-reqllm-provider")
+      end
+
+      test "derives the provider from a variety of model spec prefixes" do
+        # The provider is parsed from the `"provider:model_id"` prefix, so each
+        # spec surfaces its own provider on the telemetry metadata. The derived
+        # strings also round-trip through ProviderMapping to canonical OTel names.
+        test_pid = self()
+
+        stub(ReqLLM, :generate_text, fn _model_spec, _context, _opts ->
+          {:ok, req_llm_text_response("hi")}
+        end)
+
+        :telemetry.attach(
+          "test-reqllm-provider-prefixes",
+          [:langchain, :llm, :call, :start],
+          fn _event, _measurements, metadata, _config ->
+            send(test_pid, {:start, metadata})
+          end,
+          nil
+        )
+
+        cases = [
+          {"anthropic:claude-haiku-4-5", "anthropic", "anthropic"},
+          {"google:gemini-1.5-pro", "google", "gcp.gemini"},
+          {"groq:llama-3.3-70b-versatile", "groq", "groq"}
+        ]
+
+        for {spec, expected_provider, expected_otel} <- cases do
+          model = ChatReqLLM.new!(%{model: spec})
+          assert {:ok, %Message{}} = ChatReqLLM.call(model, [Message.new_user!("Hi")], [])
+
+          assert_received {:start, %{provider: ^expected_provider}}
+
+          assert LangChain.OpenTelemetry.ProviderMapping.to_otel(expected_provider) ==
+                   expected_otel
+        end
+
+        :telemetry.detach("test-reqllm-provider-prefixes")
+      end
+
+      test "passes tools as ReqLLM tools in opts", %{model: model} do
+        fun =
+          Function.new!(%{
+            name: "get_weather",
+            description: "Get weather",
+            parameters_schema: %{"type" => "object", "properties" => %{}},
+            function: fn _, _ -> {:ok, "sunny"} end
+          })
+
+        stub(ReqLLM, :generate_text, fn _model_spec, _context, opts ->
+          tools = Keyword.get(opts, :tools, [])
+          assert length(tools) == 1
+          assert hd(tools).name == "get_weather"
+          {:ok, req_llm_text_response("The weather is nice.")}
+        end)
+
+        messages = [Message.new_user!("What's the weather?")]
+        assert {:ok, %Message{}} = ChatReqLLM.call(model, messages, [fun])
+      end
+
+      test "returns {:error, LangChainError} when ReqLLM returns an error", %{model: model} do
+        stub(ReqLLM, :generate_text, fn _model_spec, _context, _opts ->
+          {:error, %{status: 401, message: "Unauthorized"}}
+        end)
+
+        messages = [Message.new_user!("Hello")]
+
+        assert {:error, %LangChainError{type: "authentication_error"}} =
+                 ChatReqLLM.call(model, messages, [])
+      end
+
+      test "passes max_tokens and temperature as opts", %{model: model} do
+        model_with_opts = %{model | max_tokens: 500, temperature: 0.3}
+
+        stub(ReqLLM, :generate_text, fn _model_spec, _context, opts ->
+          assert Keyword.get(opts, :max_tokens) == 500
+          assert Keyword.get(opts, :temperature) == 0.3
+          {:ok, req_llm_text_response("OK")}
+        end)
+
+        assert {:ok, _} = ChatReqLLM.call(model_with_opts, "Test", [])
+      end
+
+      test "does not pass nil fields to opts", %{model: model} do
+        # model has nil max_tokens and nil temperature by default
+        stub(ReqLLM, :generate_text, fn _model_spec, _context, opts ->
+          refute Keyword.has_key?(opts, :max_tokens)
+          refute Keyword.has_key?(opts, :temperature)
+          {:ok, req_llm_text_response("OK")}
+        end)
+
+        assert {:ok, _} = ChatReqLLM.call(model, "Test", [])
+      end
+
+      test "does not pass receive_timeout by default", %{model: model} do
+        assert model.receive_timeout == nil
+
+        stub(ReqLLM, :generate_text, fn _model_spec, _context, opts ->
+          # Leaves req_llm to apply its provider-specific default timeout
+          refute Keyword.has_key?(opts, :receive_timeout)
+          {:ok, req_llm_text_response("OK")}
+        end)
+
+        assert {:ok, _} = ChatReqLLM.call(model, "Test", [])
+      end
+
+      test "passes receive_timeout as an opt", %{model: model} do
+        model_with_timeout = %{model | receive_timeout: 90_000}
+
+        stub(ReqLLM, :generate_text, fn _model_spec, _context, opts ->
+          assert Keyword.get(opts, :receive_timeout) == 90_000
+          {:ok, req_llm_text_response("OK")}
+        end)
+
+        assert {:ok, _} = ChatReqLLM.call(model_with_timeout, "Test", [])
+      end
+
+      test "retries on connection closed error", %{model: model} do
+        call_count = :counters.new(1, [])
+
+        stub(ReqLLM, :generate_text, fn _model_spec, _context, _opts ->
+          count = :counters.get(call_count, 1) + 1
+          :counters.put(call_count, 1, count)
+
+          if count < 2 do
+            {:error, %Req.TransportError{reason: :closed}}
+          else
+            {:ok, req_llm_text_response("Recovered!")}
+          end
+        end)
+
+        assert {:ok, %Message{}} = ChatReqLLM.call(model, "Test", [])
+      end
+
+      test "retry_count: 0 makes one attempt with no retries on :closed" do
+        call_count = :counters.new(1, [])
+
+        stub(ReqLLM, :generate_text, fn _model_spec, _context, _opts ->
+          count = :counters.get(call_count, 1) + 1
+          :counters.put(call_count, 1, count)
+          {:error, %Req.TransportError{reason: :closed}}
+        end)
+
+        model = ChatReqLLM.new!(%{model: "anthropic:claude-haiku-4-5", retry_count: 0})
+
+        assert {:error, %LangChainError{message: "Retries exceeded. Connection failed."}} =
+                 ChatReqLLM.call(model, "Test", [])
+
+        # Exactly 1 HTTP request, no retries
+        assert :counters.get(call_count, 1) == 1
+      end
+
+      test "classifies a bare :timeout error as a timeout", %{model: model} do
+        stub(ReqLLM, :generate_text, fn _model_spec, _context, _opts ->
+          {:error, :timeout}
+        end)
+
+        assert {:error, %LangChainError{type: "timeout", original: :timeout}} =
+                 ChatReqLLM.call(model, "Test", [])
+      end
+
+      test "fires on_llm_new_message callback on success", %{model: model} do
+        test_pid = self()
+
+        model_with_cb = %{
+          model
+          | callbacks: [%{on_llm_new_message: fn msg -> send(test_pid, {:got_msg, msg}) end}]
+        }
+
+        stub(ReqLLM, :generate_text, fn _, _, _ ->
+          {:ok, req_llm_text_response("Callback test")}
+        end)
+
+        ChatReqLLM.call(model_with_cb, "Test", [])
+        assert_receive {:got_msg, %Message{role: :assistant}}, 1_000
+      end
+    end
+
+    # ============================================================
+    # Integration with LLMChain (mocked)
+    # ============================================================
+
+    describe "LLMChain integration (mocked)" do
+      test "works end-to-end with LLMChain" do
+        model = ChatReqLLM.new!(%{model: "anthropic:claude-haiku-4-5"})
+
+        stub(ReqLLM, :generate_text, fn _, _, _ ->
+          {:ok, req_llm_text_response("Two plus two is four.")}
+        end)
+
+        {:ok, chain} =
+          %{llm: model}
+          |> LLMChain.new!()
+          |> LLMChain.add_message(Message.new_user!("What is 2+2?"))
+          |> LLMChain.run()
+
+        response = List.last(chain.messages)
+        assert %Message{role: :assistant} = response
+        assert is_list(response.content)
+        assert hd(response.content).content =~ "four"
+      end
+    end
+
+    # ============================================================
+    # Streaming helpers
+    # ============================================================
+
+    # Build a fake ReqLLM.StreamResponse for unit tests.
+    # All 5 enforce_keys are required; metadata_handle is a PID (won't be called).
+    defp fake_stream_response(chunks) do
+      %ReqLLM.StreamResponse{
+        stream: chunks,
+        metadata_handle: self(),
+        cancel: fn -> :ok end,
+        model: nil,
+        context: ReqLLM.Context.new([])
+      }
+    end
+
+    # Same, with the out-of-band metadata req_llm collects alongside the chunk
+    # stream. Reached only when the stream ends without a terminal chunk.
+    defp fake_stream_response(chunks, finish_reason) do
+      {:ok, handle} =
+        ReqLLM.StreamResponse.MetadataHandle.start_link(fn -> %{finish_reason: finish_reason} end)
+
+      %{fake_stream_response(chunks) | metadata_handle: handle}
+    end
+
+    # ============================================================
+    # translate_stream_chunk/1
+    # ============================================================
+
+    describe "translate_stream_chunk/1" do
+      test "translates a content chunk to a text MessageDelta" do
+        chunk = %ReqLLM.StreamChunk{type: :content, text: "Hello"}
+        [delta] = ChatReqLLM.translate_stream_chunk(chunk)
+        assert %MessageDelta{role: :assistant, status: :incomplete, index: 0} = delta
+        assert %ContentPart{type: :text, content: "Hello"} = delta.content
+      end
+
+      test "returns [] for empty content chunk" do
+        chunk = %ReqLLM.StreamChunk{type: :content, text: ""}
+        assert [] = ChatReqLLM.translate_stream_chunk(chunk)
+      end
+
+      test "returns [] for nil content chunk" do
+        chunk = %ReqLLM.StreamChunk{type: :content, text: nil}
+        assert [] = ChatReqLLM.translate_stream_chunk(chunk)
+      end
+
+      test "translates a thinking chunk to a thinking MessageDelta" do
+        chunk = %ReqLLM.StreamChunk{type: :thinking, text: "I am reasoning"}
+        [delta] = ChatReqLLM.translate_stream_chunk(chunk)
+        assert %MessageDelta{role: :assistant, status: :incomplete} = delta
+        assert %ContentPart{type: :thinking, content: "I am reasoning"} = delta.content
+      end
+
+      test "translates a tool_call chunk to a tool_calls MessageDelta" do
+        chunk = %ReqLLM.StreamChunk{
+          type: :tool_call,
+          name: "get_weather",
+          arguments: %{"city" => "Paris"},
+          metadata: %{id: "call_abc"}
+        }
+
+        [delta] = ChatReqLLM.translate_stream_chunk(chunk)
+        assert %MessageDelta{role: :assistant, status: :incomplete} = delta
+        [tc] = delta.tool_calls
+        assert %ToolCall{name: "get_weather", call_id: "call_abc", status: :complete} = tc
+        assert tc.arguments == %{"city" => "Paris"}
+      end
+
+      test "tool_call chunk generates a non-empty fallback id when metadata has no id" do
+        chunk = %ReqLLM.StreamChunk{
+          type: :tool_call,
+          name: "search",
+          arguments: %{},
+          metadata: %{}
+        }
+
+        [delta] = ChatReqLLM.translate_stream_chunk(chunk)
+        [tc] = delta.tool_calls
+        assert is_binary(tc.call_id) && tc.call_id != ""
+      end
+
+      test "terminal meta chunk produces a complete MessageDelta" do
+        chunk = %ReqLLM.StreamChunk{
+          type: :meta,
+          metadata: %{finish_reason: :stop, terminal?: true}
+        }
+
+        [delta] = ChatReqLLM.translate_stream_chunk(chunk)
+        assert %MessageDelta{role: :assistant, status: :complete} = delta
+      end
+
+      test "terminal meta with :length finish reason produces :length status" do
+        chunk = %ReqLLM.StreamChunk{
+          type: :meta,
+          metadata: %{finish_reason: :length, terminal?: true}
+        }
+
+        [delta] = ChatReqLLM.translate_stream_chunk(chunk)
+        assert delta.status == :length
+      end
+
+      test "terminal meta with :error finish reason produces a stream error tuple" do
+        chunk = %ReqLLM.StreamChunk{
+          type: :meta,
+          metadata: %{finish_reason: :error, terminal?: true, error: "The model run failed"}
+        }
+
+        assert [{:error, %LangChainError{type: "stream_error", message: "The model run failed"}}] =
+                 ChatReqLLM.translate_stream_chunk(chunk)
+      end
+
+      test "terminal meta with :error finish reason falls back to a generic message" do
+        chunk = %ReqLLM.StreamChunk{
+          type: :meta,
+          metadata: %{finish_reason: :error, terminal?: true}
+        }
+
+        assert [{:error, %LangChainError{type: "stream_error", message: "stream error"}}] =
+                 ChatReqLLM.translate_stream_chunk(chunk)
+      end
+
+      test "terminal meta with :error finish reason still emits usage" do
+        chunk = %ReqLLM.StreamChunk{
+          type: :meta,
+          metadata: %{
+            finish_reason: :error,
+            terminal?: true,
+            error: "boom",
+            usage: %{input_tokens: 10, output_tokens: 5}
+          }
+        }
+
+        assert [%MessageDelta{} = usage_delta, {:error, %LangChainError{type: "stream_error"}}] =
+                 ChatReqLLM.translate_stream_chunk(chunk)
+
+        assert %TokenUsage{input: 10, output: 5} = usage_delta.metadata[:usage]
+      end
+
+      test "meta chunk with usage produces a usage MessageDelta" do
+        chunk = %ReqLLM.StreamChunk{
+          type: :meta,
+          metadata: %{usage: %{input_tokens: 10, output_tokens: 5}}
+        }
+
+        [delta] = ChatReqLLM.translate_stream_chunk(chunk)
+        assert %MessageDelta{} = delta
+        assert %TokenUsage{input: 10, output: 5} = delta.metadata[:usage]
+      end
+
+      test "terminal meta with usage produces both usage and finish deltas" do
+        chunk = %ReqLLM.StreamChunk{
+          type: :meta,
+          metadata: %{
+            finish_reason: :stop,
+            terminal?: true,
+            usage: %{input_tokens: 20, output_tokens: 10}
+          }
+        }
+
+        deltas = ChatReqLLM.translate_stream_chunk(chunk)
+        assert length(deltas) == 2
+        usage_delta = Enum.find(deltas, &(&1.metadata != nil))
+        finish_delta = Enum.find(deltas, &(&1.status == :complete))
+        assert %TokenUsage{input: 20, output: 10} = usage_delta.metadata[:usage]
+        assert finish_delta.status == :complete
+      end
+
+      test "non-terminal meta chunk with no usage produces []" do
+        chunk = %ReqLLM.StreamChunk{
+          type: :meta,
+          metadata: %{some_info: "value"}
+        }
+
+        assert [] = ChatReqLLM.translate_stream_chunk(chunk)
+      end
+
+      test "unknown chunk type produces []" do
+        chunk = %ReqLLM.StreamChunk{type: :content, text: nil}
+        assert [] = ChatReqLLM.translate_stream_chunk(chunk)
+      end
+    end
+
+    # ============================================================
+    # do_api_request streaming (mocked)
+    # ============================================================
+
+    describe "do_api_request/4 streaming (mocked)" do
+      test "returns a flat list of MessageDeltas from stream chunks" do
+        model = ChatReqLLM.new!(%{model: @live_model, stream: true})
+
+        chunks = [
+          %ReqLLM.StreamChunk{type: :content, text: "Hello"},
+          %ReqLLM.StreamChunk{type: :content, text: " world"},
+          %ReqLLM.StreamChunk{type: :meta, metadata: %{finish_reason: :stop, terminal?: true}}
+        ]
+
+        stub(ReqLLM, :stream_text, fn _model, _context, _opts ->
+          {:ok, fake_stream_response(chunks)}
+        end)
+
+        result = ChatReqLLM.do_api_request(model, [Message.new_user!("hi")], [], 3)
+        assert is_list(result)
+        assert length(result) == 3
+
+        text_deltas = Enum.filter(result, &(&1.content != nil))
+        assert length(text_deltas) == 2
+
+        final_delta = List.last(result)
+        assert final_delta.status == :complete
+      end
+
+      test "passes receive_timeout to stream_text" do
+        test_pid = self()
+        model = ChatReqLLM.new!(%{model: @live_model, stream: true, receive_timeout: 90_000})
+
+        stub(ReqLLM, :stream_text, fn _model, _context, opts ->
+          send(test_pid, {:opts, opts})
+
+          {:ok,
+           fake_stream_response([
+             %ReqLLM.StreamChunk{type: :meta, metadata: %{finish_reason: :stop, terminal?: true}}
+           ])}
+        end)
+
+        ChatReqLLM.do_api_request(model, [Message.new_user!("hi")], [], 3)
+
+        assert_received {:opts, opts}
+        assert Keyword.get(opts, :receive_timeout) == 90_000
+      end
+
+      test "fires on_llm_new_delta callback for each chunk" do
+        test_pid = self()
+
+        model =
+          %{
+            ChatReqLLM.new!(%{model: @live_model, stream: true})
+            | callbacks: [%{on_llm_new_delta: fn deltas -> send(test_pid, {:delta, deltas}) end}]
+          }
+
+        chunks = [
+          %ReqLLM.StreamChunk{type: :content, text: "Hi"},
+          %ReqLLM.StreamChunk{type: :meta, metadata: %{finish_reason: :stop, terminal?: true}}
+        ]
+
+        stub(ReqLLM, :stream_text, fn _model, _context, _opts ->
+          {:ok, fake_stream_response(chunks)}
+        end)
+
+        ChatReqLLM.do_api_request(model, [Message.new_user!("hi")], [], 3)
+
+        assert_received {:delta, [%MessageDelta{status: :incomplete}]}
+        assert_received {:delta, [%MessageDelta{status: :complete}]}
+      end
+
+      test "translates tool call chunks correctly" do
+        model = ChatReqLLM.new!(%{model: @live_model, stream: true})
+
+        chunks = [
+          %ReqLLM.StreamChunk{
+            type: :tool_call,
+            name: "get_weather",
+            arguments: %{"city" => "Paris"},
+            metadata: %{id: "call_1"}
+          },
+          %ReqLLM.StreamChunk{
+            type: :meta,
+            metadata: %{finish_reason: :tool_calls, terminal?: true}
+          }
+        ]
+
+        stub(ReqLLM, :stream_text, fn _model, _context, _opts ->
+          {:ok, fake_stream_response(chunks)}
+        end)
+
+        result = ChatReqLLM.do_api_request(model, [Message.new_user!("weather?")], [], 3)
+
+        tool_delta = Enum.find(result, &(&1.tool_calls != nil and &1.tool_calls != []))
+        assert tool_delta != nil
+        [tc] = tool_delta.tool_calls
+        assert tc.name == "get_weather"
+        assert tc.arguments == %{"city" => "Paris"}
+      end
+
+      test "returns {:error, LangChainError} when stream_text fails" do
+        model = ChatReqLLM.new!(%{model: @live_model, stream: true})
+
+        stub(ReqLLM, :stream_text, fn _model, _context, _opts ->
+          {:error, %{status: 401}}
+        end)
+
+        assert {:error, %LangChainError{type: "authentication_error"}} =
+                 ChatReqLLM.do_api_request(model, [Message.new_user!("hi")], [], 3)
+      end
+
+      test "call/3 with stream:true returns {:ok, [MessageDelta]}" do
+        model = ChatReqLLM.new!(%{model: @live_model, stream: true})
+
+        chunks = [
+          %ReqLLM.StreamChunk{type: :content, text: "Streaming!"},
+          %ReqLLM.StreamChunk{type: :meta, metadata: %{finish_reason: :stop, terminal?: true}}
+        ]
+
+        stub(ReqLLM, :stream_text, fn _model, _context, _opts ->
+          {:ok, fake_stream_response(chunks)}
+        end)
+
+        assert {:ok, deltas} = ChatReqLLM.call(model, [Message.new_user!("hi")], [])
+        assert is_list(deltas)
+        assert Enum.all?(deltas, &match?(%MessageDelta{}, &1))
+      end
+
+      test "openai-style streaming tool call assembles a valid Message (regression)" do
+        # Reproduces the pattern emitted by ReqLLM's default OpenAI decoder
+        # (used by direct OpenAI, LiteLLM proxy, etc.):
+        #   - one :tool_call chunk with metadata: %{id, index}, name, arguments: %{}
+        #   - one or more :meta chunks with tool_call_args: %{index, fragment}
+        #   - a terminal :meta with finish_reason: :tool_calls
+        #
+        # Before the fix, the initial chunk landed at index: nil while the
+        # fragment chunks landed at index: 0, producing an orphan ToolCall
+        # without call_id/name and a "delta_conversion_failed" error from
+        # Message.new — exactly the LiteLLM-proxied OpenAI failure mode.
+        model = ChatReqLLM.new!(%{model: "openai:gpt-4o", stream: true})
+
+        chunks = [
+          %ReqLLM.StreamChunk{
+            type: :tool_call,
+            name: "ask_user",
+            arguments: %{},
+            metadata: %{id: "call_abc123", index: 0}
+          },
+          %ReqLLM.StreamChunk{
+            type: :meta,
+            metadata: %{tool_call_args: %{index: 0, fragment: "{\"question\":"}}
+          },
+          %ReqLLM.StreamChunk{
+            type: :meta,
+            metadata: %{tool_call_args: %{index: 0, fragment: "\"hi?\"}"}}
+          },
+          %ReqLLM.StreamChunk{
+            type: :meta,
+            metadata: %{finish_reason: :tool_calls, terminal?: true}
+          }
+        ]
+
+        stub(ReqLLM, :stream_text, fn _model, _context, _opts ->
+          {:ok, fake_stream_response(chunks)}
+        end)
+
+        assert {:ok, chain} =
+                 %{llm: model}
+                 |> LLMChain.new!()
+                 |> LLMChain.add_message(Message.new_user!("ask"))
+                 |> LLMChain.run()
+
+        last_msg = List.last(chain.messages)
+        assert %Message{role: :assistant, status: :complete} = last_msg
+        assert [%ToolCall{} = tc] = last_msg.tool_calls
+        assert tc.call_id == "call_abc123"
+        assert tc.name == "ask_user"
+        assert tc.status == :complete
+        assert tc.arguments == %{"question" => "hi?"}
+      end
+
+      test "openai-style streaming tool call with no follow-up fragments still completes" do
+        # If args fit in the initial chunk (non-empty map), no fragment :meta
+        # chunks will follow. The ToolCall should be emitted as :complete with
+        # the arguments already populated.
+        model = ChatReqLLM.new!(%{model: "openai:gpt-4o", stream: true})
+
+        chunks = [
+          %ReqLLM.StreamChunk{
+            type: :tool_call,
+            name: "get_time",
+            arguments: %{"zone" => "UTC"},
+            metadata: %{id: "call_xyz", index: 0}
+          },
+          %ReqLLM.StreamChunk{
+            type: :meta,
+            metadata: %{finish_reason: :tool_calls, terminal?: true}
+          }
+        ]
+
+        stub(ReqLLM, :stream_text, fn _model, _context, _opts ->
+          {:ok, fake_stream_response(chunks)}
+        end)
+
+        assert {:ok, chain} =
+                 %{llm: model}
+                 |> LLMChain.new!()
+                 |> LLMChain.add_message(Message.new_user!("time?"))
+                 |> LLMChain.run()
+
+        last_msg = List.last(chain.messages)
+        assert [%ToolCall{} = tc] = last_msg.tool_calls
+        assert tc.call_id == "call_xyz"
+        assert tc.name == "get_time"
+        assert tc.arguments == %{"zone" => "UTC"}
+      end
+
+      test "LLMChain runs successfully with stream:true" do
+        model = ChatReqLLM.new!(%{model: @live_model, stream: true})
+
+        chunks = [
+          %ReqLLM.StreamChunk{type: :content, text: "Hello "},
+          %ReqLLM.StreamChunk{type: :content, text: "there!"},
+          %ReqLLM.StreamChunk{type: :meta, metadata: %{finish_reason: :stop, terminal?: true}}
+        ]
+
+        stub(ReqLLM, :stream_text, fn _model, _context, _opts ->
+          {:ok, fake_stream_response(chunks)}
+        end)
+
+        assert {:ok, chain} =
+                 %{llm: model}
+                 |> LLMChain.new!()
+                 |> LLMChain.add_message(Message.new_user!("Say hello"))
+                 |> LLMChain.run()
+
+        last_msg = List.last(chain.messages)
+        assert last_msg.role == :assistant
+
+        text =
+          last_msg.content
+          |> Enum.filter(&(&1.type == :text))
+          |> Enum.map_join("", & &1.content)
+
+        assert text == "Hello there!"
+      end
+
+      test "a provider failure frame ends the stream with a stream error" do
+        model = ChatReqLLM.new!(%{model: @live_model, stream: true})
+
+        chunks = [
+          %ReqLLM.StreamChunk{type: :content, text: "Partial answ"},
+          %ReqLLM.StreamChunk{
+            type: :meta,
+            metadata: %{terminal?: true, finish_reason: :error, error: "The model run failed"}
+          }
+        ]
+
+        stub(ReqLLM, :stream_text, fn _model, _context, _opts ->
+          {:ok, fake_stream_response(chunks, :error)}
+        end)
+
+        assert [
+                 %MessageDelta{},
+                 {:error, %LangChainError{type: "stream_error", message: "The model run failed"}}
+               ] = ChatReqLLM.do_api_request(model, [Message.new_user!("hi")], [], 3)
+      end
+
+      test "LLMChain keeps the partial text of a failed stream as a stream_error message" do
+        model = ChatReqLLM.new!(%{model: @live_model, stream: true})
+
+        chunks = [
+          %ReqLLM.StreamChunk{type: :content, text: "Partial answ"},
+          %ReqLLM.StreamChunk{
+            type: :meta,
+            metadata: %{terminal?: true, finish_reason: :error, error: "The model run failed"}
+          }
+        ]
+
+        stub(ReqLLM, :stream_text, fn _model, _context, _opts ->
+          {:ok, fake_stream_response(chunks, :error)}
+        end)
+
+        assert {:ok, chain} =
+                 %{llm: model}
+                 |> LLMChain.new!()
+                 |> LLMChain.add_message(Message.new_user!("Say hello"))
+                 |> LLMChain.run()
+
+        assert %Message{role: :assistant, status: :stream_error} = chain.last_message
+        assert ContentPart.parts_to_string(chain.last_message.content) == "Partial answ"
+
+        assert %LangChainError{type: "stream_error", message: "The model run failed"} =
+                 chain.last_message.metadata.streaming_error
+
+        assert chain.delta == nil
+        refute chain.needs_response
+      end
+    end
+
+    # ============================================================
+    # Streaming transport failures (raised during consumption)
+    # ============================================================
+
+    describe "do_api_request/4 streaming without a terminal chunk" do
+      test "closes the turn when the finish reason reports a finished response" do
+        model = ChatReqLLM.new!(%{model: @live_model, stream: true})
+
+        chunks = [
+          %ReqLLM.StreamChunk{type: :content, text: "All "},
+          %ReqLLM.StreamChunk{type: :content, text: "done"}
+        ]
+
+        stub(ReqLLM, :stream_text, fn _model, _context, _opts ->
+          {:ok, fake_stream_response(chunks, :stop)}
+        end)
+
+        assert [%MessageDelta{}, %MessageDelta{}, %MessageDelta{} = closing] =
+                 ChatReqLLM.do_api_request(model, [Message.new_user!("hi")], [], 3)
+
+        assert closing.status == :complete
+        assert closing.content == nil
+      end
+
+      test "carries a truncating finish reason onto the closing delta" do
+        model = ChatReqLLM.new!(%{model: @live_model, stream: true})
+
+        chunks = [%ReqLLM.StreamChunk{type: :content, text: "As far as I got"}]
+
+        stub(ReqLLM, :stream_text, fn _model, _context, _opts ->
+          {:ok, fake_stream_response(chunks, :length)}
+        end)
+
+        assert [%MessageDelta{}, %MessageDelta{status: :length}] =
+                 ChatReqLLM.do_api_request(model, [Message.new_user!("hi")], [], 3)
+      end
+
+      test "leaves the turn unfinished when the stream ended early" do
+        # req_llm reports `:incomplete` for a body that ended without a
+        # recognized terminal event. The response may be a fragment, so the
+        # deltas are handed over as they are and the chain decides.
+        model = ChatReqLLM.new!(%{model: @live_model, stream: true})
+
+        chunks = [
+          %ReqLLM.StreamChunk{type: :content, text: "Half an "},
+          %ReqLLM.StreamChunk{type: :content, text: "answer"}
+        ]
+
+        stub(ReqLLM, :stream_text, fn _model, _context, _opts ->
+          {:ok, fake_stream_response(chunks, :incomplete)}
+        end)
+
+        assert [%MessageDelta{status: :incomplete}, %MessageDelta{status: :incomplete}] =
+                 ChatReqLLM.do_api_request(model, [Message.new_user!("hi")], [], 3)
+      end
+
+      test "leaves the turn unfinished when the finish reason cannot be read" do
+        model = ChatReqLLM.new!(%{model: @live_model, stream: true})
+
+        chunks = [%ReqLLM.StreamChunk{type: :content, text: "Half an answer"}]
+
+        # `fake_stream_response/1` supplies a metadata handle that cannot answer.
+        stub(ReqLLM, :stream_text, fn _model, _context, _opts ->
+          {:ok, fake_stream_response(chunks)}
+        end)
+
+        assert [%MessageDelta{status: :incomplete}] =
+                 ChatReqLLM.do_api_request(model, [Message.new_user!("hi")], [], 3)
+      end
+
+      test "delivers the closing delta to the streaming callback" do
+        test_pid = self()
+
+        model =
+          %{
+            ChatReqLLM.new!(%{model: @live_model, stream: true})
+            | callbacks: [%{on_llm_new_delta: fn deltas -> send(test_pid, {:delta, deltas}) end}]
+          }
+
+        chunks = [%ReqLLM.StreamChunk{type: :content, text: "Hi"}]
+
+        stub(ReqLLM, :stream_text, fn _model, _context, _opts ->
+          {:ok, fake_stream_response(chunks, :stop)}
+        end)
+
+        ChatReqLLM.do_api_request(model, [Message.new_user!("hi")], [], 3)
+
+        assert_received {:delta, [%MessageDelta{status: :incomplete}]}
+        assert_received {:delta, [%MessageDelta{status: :complete}]}
+      end
+
+      test "adds nothing when the stream already ended with a terminal chunk" do
+        model = ChatReqLLM.new!(%{model: @live_model, stream: true})
+
+        chunks = [
+          %ReqLLM.StreamChunk{type: :content, text: "Complete"},
+          %ReqLLM.StreamChunk{type: :meta, metadata: %{finish_reason: :stop, terminal?: true}}
+        ]
+
+        stub(ReqLLM, :stream_text, fn _model, _context, _opts ->
+          {:ok, fake_stream_response(chunks, :stop)}
+        end)
+
+        assert [%MessageDelta{}, %MessageDelta{status: :complete}] =
+                 ChatReqLLM.do_api_request(model, [Message.new_user!("hi")], [], 3)
+      end
+
+      test "leaves an empty stream alone" do
+        model = ChatReqLLM.new!(%{model: @live_model, stream: true})
+
+        stub(ReqLLM, :stream_text, fn _model, _context, _opts ->
+          {:ok, fake_stream_response([], :stop)}
+        end)
+
+        assert [] = ChatReqLLM.do_api_request(model, [Message.new_user!("hi")], [], 3)
+      end
+
+      test "a finished response missing its marker becomes one message through the chain" do
+        chunks = [
+          %ReqLLM.StreamChunk{type: :content, text: "Sounds like "},
+          %ReqLLM.StreamChunk{type: :content, text: "a shakedown run."}
+        ]
+
+        stub(ReqLLM, :stream_text, fn _model, _context, _opts ->
+          {:ok, fake_stream_response(chunks, :stop)}
+        end)
+
+        model = ChatReqLLM.new!(%{model: @live_model, stream: true})
+
+        assert {:ok, updated_chain} =
+                 %{llm: model}
+                 |> LLMChain.new!()
+                 |> LLMChain.add_message(Message.new_user!("Testing"))
+                 |> LLMChain.run()
+
+        assert updated_chain.delta == nil
+        assert [_user, %Message{role: :assistant} = answer] = updated_chain.messages
+        assert ContentPart.parts_to_string(answer.content) == "Sounds like a shakedown run."
+        assert updated_chain.needs_response == false
+      end
+
+      test "a stream that ended early is retried by the chain and never merged" do
+        # Each attempt streams its own text. The chain must discard the first
+        # rather than merge the second onto it.
+        stub(ReqLLM, :stream_text, fn _model, _context, _opts ->
+          {:ok,
+           fake_stream_response(
+             [%ReqLLM.StreamChunk{type: :content, text: "First generation."}],
+             :incomplete
+           )}
+        end)
+
+        model = ChatReqLLM.new!(%{model: @live_model, stream: true})
+
+        assert {:error, error_chain, %LangChainError{type: "incomplete_stream"}} =
+                 %{llm: model, max_retry_count: 2}
+                 |> LLMChain.new!()
+                 |> LLMChain.add_message(Message.new_user!("Testing"))
+                 |> LLMChain.run()
+
+        assert error_chain.delta == nil
+        assert [%Message{role: :user}] = error_chain.messages
+      end
+    end
+
+    describe "do_api_request/4 streaming transport failures" do
+      # Mirrors req_llm: the lazy stream yields chunks, then raises
+      # ReqLLM.Error.API.Stream when the transport fails mid-consumption.
+      defp failing_stream(chunks, cause) do
+        Stream.concat(
+          chunks,
+          Stream.map([:boom], fn _ ->
+            raise %ReqLLM.Error.API.Stream{
+              reason: "Stream failed: #{inspect(cause)}",
+              cause: cause
+            }
+          end)
+        )
+      end
+
+      defp failing_stream_response(chunks, cause) do
+        %ReqLLM.StreamResponse{
+          stream: failing_stream(chunks, cause),
+          metadata_handle: self(),
+          cancel: fn -> :ok end,
+          model: nil,
+          context: ReqLLM.Context.new([])
+        }
+      end
+
+      test "returns an error tuple when the transport refuses the connection" do
+        model = ChatReqLLM.new!(%{model: @live_model, stream: true, retry_count: 0})
+
+        stub(ReqLLM, :stream_text, fn _model, _context, _opts ->
+          {:ok,
+           failing_stream_response([], %Finch.TransportError{
+             reason: :econnrefused,
+             source: %Mint.TransportError{reason: :econnrefused}
+           })}
+        end)
+
+        assert {:error, %LangChainError{} = error} =
+                 ChatReqLLM.do_api_request(model, [Message.new_user!("hi")], [], 1)
+
+        assert error.original.reason == :econnrefused
+      end
+
+      test "call/3 returns an error tuple instead of raising" do
+        model = ChatReqLLM.new!(%{model: @live_model, stream: true, retry_count: 0})
+
+        stub(ReqLLM, :stream_text, fn _model, _context, _opts ->
+          {:ok,
+           failing_stream_response([], %Finch.TransportError{reason: :econnrefused, source: nil})}
+        end)
+
+        assert {:error, %LangChainError{}} = ChatReqLLM.call(model, "hi", [])
+      end
+
+      test "classifies a mid-stream timeout as a timeout error" do
+        model = ChatReqLLM.new!(%{model: @live_model, stream: true, retry_count: 0})
+
+        stub(ReqLLM, :stream_text, fn _model, _context, _opts ->
+          {:ok, failing_stream_response([], %Finch.TransportError{reason: :timeout, source: nil})}
+        end)
+
+        assert {:error, %LangChainError{type: "timeout"}} =
+                 ChatReqLLM.do_api_request(model, [Message.new_user!("hi")], [], 1)
+      end
+
+      # req_llm raises this when StreamServer.next/2 receives no chunk within
+      # the receive timeout: the cause is the bare atom, not a transport struct.
+      test "classifies a bare :timeout from the stream consumer as a timeout error" do
+        model = ChatReqLLM.new!(%{model: @live_model, stream: true, retry_count: 0})
+
+        stub(ReqLLM, :stream_text, fn _model, _context, _opts ->
+          {:ok, failing_stream_response([], :timeout)}
+        end)
+
+        assert {:error, %LangChainError{type: "timeout", original: :timeout}} =
+                 ChatReqLLM.do_api_request(model, [Message.new_user!("hi")], [], 1)
+      end
+
+      test "classifies an HTTP error surfaced mid-stream by status" do
+        model = ChatReqLLM.new!(%{model: @live_model, stream: true, retry_count: 0})
+
+        stub(ReqLLM, :stream_text, fn _model, _context, _opts ->
+          {:ok,
+           failing_stream_response(
+             [],
+             ReqLLM.Error.API.Request.exception(reason: "Unauthorized", status: 401)
+           )}
+        end)
+
+        assert {:error, %LangChainError{type: "authentication_error"}} =
+                 ChatReqLLM.do_api_request(model, [Message.new_user!("hi")], [], 1)
+      end
+
+      test "retries a closed connection when no deltas were delivered" do
+        call_count = :counters.new(1, [])
+
+        model = ChatReqLLM.new!(%{model: @live_model, stream: true})
+
+        stub(ReqLLM, :stream_text, fn _model, _context, _opts ->
+          count = :counters.get(call_count, 1) + 1
+          :counters.put(call_count, 1, count)
+
+          if count < 2 do
+            {:ok,
+             failing_stream_response([], %Finch.TransportError{reason: :closed, source: nil})}
+          else
+            {:ok,
+             fake_stream_response([
+               %ReqLLM.StreamChunk{type: :content, text: "Recovered!"},
+               %ReqLLM.StreamChunk{
+                 type: :meta,
+                 metadata: %{finish_reason: :stop, terminal?: true}
+               }
+             ])}
+          end
+        end)
+
+        assert [%MessageDelta{} | _] =
+                 ChatReqLLM.do_api_request(model, [Message.new_user!("hi")], [], 3)
+
+        assert :counters.get(call_count, 1) == 2
+      end
+
+      test "does not retry a closed connection after deltas were delivered" do
+        call_count = :counters.new(1, [])
+        test_pid = self()
+
+        model =
+          %{
+            ChatReqLLM.new!(%{model: @live_model, stream: true})
+            | callbacks: [%{on_llm_new_delta: fn deltas -> send(test_pid, {:delta, deltas}) end}]
+          }
+
+        stub(ReqLLM, :stream_text, fn _model, _context, _opts ->
+          count = :counters.get(call_count, 1) + 1
+          :counters.put(call_count, 1, count)
+
+          {:ok,
+           failing_stream_response(
+             [%ReqLLM.StreamChunk{type: :content, text: "partial"}],
+             %Finch.TransportError{reason: :closed, source: nil}
+           )}
+        end)
+
+        assert {:error, %LangChainError{}} =
+                 ChatReqLLM.do_api_request(model, [Message.new_user!("hi")], [], 3)
+
+        assert :counters.get(call_count, 1) == 1
+        assert_received {:delta, [%MessageDelta{content: _}]}
+      end
+
+      test "retries_exceeded surfaces as an error tuple, not a raised exception" do
+        model = ChatReqLLM.new!(%{model: @live_model, stream: true, retry_count: 0})
+
+        stub(ReqLLM, :stream_text, fn _model, _context, _opts ->
+          {:ok, failing_stream_response([], %Finch.TransportError{reason: :closed, source: nil})}
+        end)
+
+        assert {:error, %LangChainError{type: "retries_exceeded"}} =
+                 ChatReqLLM.call(model, "hi", [])
+      end
+    end
+
+    # ============================================================
+    # Live API Tests (tagged :live_call — excluded by default)
+    # ============================================================
+
+    @tag :live_call
+    @tag :live_anthropic
+    @tag live_api: :anthropic
+    test "live: simple text generation via Anthropic" do
+      model = ChatReqLLM.new!(%{model: @live_model})
+
+      messages = [Message.new_user!("Reply with exactly the text: HELLO_WORLD")]
+
+      assert {:ok, %Message{role: :assistant} = response} =
+               ChatReqLLM.call(model, messages, [])
+
+      content_text =
+        response.content
+        |> Enum.filter(&(&1.type == :text))
+        |> Enum.map_join("", & &1.content)
+
+      assert String.contains?(content_text, "HELLO_WORLD")
+
+      # Capture the raw response shape for offline test fixtures
+      IO.inspect(response, label: "LIVE RESPONSE SHAPE")
+    end
+
+    @tag :live_call
+    @tag :live_anthropic
+    test "live: token usage is populated" do
+      model = ChatReqLLM.new!(%{model: @live_model})
+      messages = [Message.new_user!("Say hi")]
+
+      assert {:ok, %Message{} = response} = ChatReqLLM.call(model, messages, [])
+
+      assert %TokenUsage{} = response.metadata[:usage]
+      assert response.metadata[:usage].input > 0
+      assert response.metadata[:usage].output > 0
+
+      IO.inspect(response.metadata[:usage], label: "LIVE TOKEN USAGE")
+    end
+
+    @tag :live_call
+    @tag :live_anthropic
+    test "live: tool calling round-trip" do
+      weather_fn =
+        Function.new!(%{
+          name: "get_weather",
+          description: "Get the current weather for a city",
+          parameters_schema: %{
+            "type" => "object",
+            "properties" => %{
+              "city" => %{"type" => "string", "description" => "The city name"}
+            },
+            "required" => ["city"]
+          },
+          function: fn %{"city" => city}, _ctx -> {:ok, "Sunny in #{city}, 22°C"} end
+        })
+
+      model = ChatReqLLM.new!(%{model: @live_model})
+
+      messages = [Message.new_user!("What's the weather in Paris? Use the get_weather tool.")]
+
+      assert {:ok, %Message{role: :assistant} = response} =
+               ChatReqLLM.call(model, messages, [weather_fn])
+
+      # Should have tool calls
+      assert is_list(response.tool_calls)
+      assert length(response.tool_calls) > 0
+
+      [tc | _] = response.tool_calls
+      assert tc.name == "get_weather"
+      assert is_map(tc.arguments)
+      assert Map.has_key?(tc.arguments, "city")
+
+      IO.inspect(response, label: "LIVE TOOL CALL RESPONSE SHAPE")
+    end
+
+    @tag :live_call
+    @tag :live_anthropic
+    test "live: LLMChain with tool use completes successfully" do
+      weather_fn =
+        Function.new!(%{
+          name: "get_weather",
+          description: "Get the current weather for a city",
+          parameters_schema: %{
+            "type" => "object",
+            "properties" => %{
+              "city" => %{"type" => "string"}
+            },
+            "required" => ["city"]
+          },
+          function: fn %{"city" => city}, _ctx -> {:ok, "Sunny in #{city}, 22°C"} end
+        })
+
+      model = ChatReqLLM.new!(%{model: @live_model})
+
+      {:ok, chain} =
+        %{llm: model}
+        |> LLMChain.new!()
+        |> LLMChain.add_tools([weather_fn])
+        |> LLMChain.add_message(Message.new_user!("What's the weather in Paris?"))
+        |> LLMChain.run(mode: :while_needs_response)
+
+      response = List.last(chain.messages)
+
+      # Final response should be text after tool execution
+      assert response.role == :assistant
+
+      content_text =
+        response.content
+        |> Enum.filter(&(&1.type == :text))
+        |> Enum.map_join("", & &1.content)
+
+      assert String.contains?(content_text, "Paris") or String.contains?(content_text, "22")
+      IO.inspect(response, label: "LIVE TOOL CHAIN FINAL RESPONSE")
+    end
+
+    @tag :live_call
+    @tag :live_anthropic
+    test "live: streaming simple text response via Anthropic" do
+      test_pid = self()
+
+      model =
+        ChatReqLLM.new!(%{
+          model: @live_model,
+          stream: true
+        })
+
+      # Set callbacks after construction — Ecto cast strips function values
+      model = %{
+        model
+        | callbacks: [%{on_llm_new_delta: fn deltas -> send(test_pid, {:delta, deltas}) end}]
+      }
+
+      assert {:ok, deltas} =
+               ChatReqLLM.call(model, [Message.new_user!("Reply with: STREAM_OK")], [])
+
+      assert is_list(deltas)
+      assert Enum.any?(deltas, &match?(%MessageDelta{}, &1))
+
+      # Verify callbacks fired
+      assert_received {:delta, _}
+
+      # Collect text from individual delta content parts
+      text =
+        deltas
+        |> Enum.flat_map(fn
+          %MessageDelta{content: %ContentPart{type: :text, content: c}} when is_binary(c) -> [c]
+          _ -> []
+        end)
+        |> Enum.join("")
+
+      assert String.contains?(text, "STREAM_OK")
+    end
+
+    @tag :live_call
+    @tag :live_anthropic
+    test "live: streaming LLMChain assembles complete message" do
+      model = ChatReqLLM.new!(%{model: @live_model, stream: true})
+
+      assert {:ok, chain} =
+               %{llm: model}
+               |> LLMChain.new!()
+               |> LLMChain.add_message(Message.new_user!("Reply with: ASSEMBLED"))
+               |> LLMChain.run()
+
+      last_msg = List.last(chain.messages)
+      assert last_msg.role == :assistant
+
+      text =
+        last_msg.content
+        |> Enum.filter(&(&1.type == :text))
+        |> Enum.map_join("", & &1.content)
+
+      assert String.contains?(text, "ASSEMBLED")
+
+      IO.inspect(last_msg, label: "LIVE STREAMING ASSEMBLED MESSAGE")
+    end
+
+    @tag :live_call
+    @tag :live_anthropic
+    test "live: streaming tool call" do
+      weather_fn =
+        Function.new!(%{
+          name: "get_weather",
+          description: "Get the current weather for a city",
+          parameters_schema: %{
+            "type" => "object",
+            "properties" => %{"city" => %{"type" => "string"}},
+            "required" => ["city"]
+          },
+          function: fn %{"city" => city}, _ctx -> {:ok, "Sunny in #{city}"} end
+        })
+
+      model = ChatReqLLM.new!(%{model: @live_model, stream: true})
+
+      assert {:ok, chain} =
+               %{llm: model}
+               |> LLMChain.new!()
+               |> LLMChain.add_tools([weather_fn])
+               |> LLMChain.add_message(
+                 Message.new_user!("What's the weather in Paris? Use get_weather.")
+               )
+               |> LLMChain.run(mode: :while_needs_response)
+
+      last_msg = List.last(chain.messages)
+      assert last_msg.role == :assistant
+
+      text =
+        last_msg.content
+        |> Enum.filter(&(&1.type == :text))
+        |> Enum.map_join("", & &1.content)
+
+      assert String.contains?(text, "Paris") or String.contains?(text, "Sunny")
+
+      IO.inspect(last_msg, label: "LIVE STREAMING TOOL CHAIN FINAL MESSAGE")
+    end
+
+    describe "do_api_request/4 streaming, a terminal chunk carrying reasoning details" do
+      # req_llm reports the reasoning details, the usage and the finish reason on
+      # one terminal chunk. Each has to reach the merged message.
+      defp terminal_chunk(details) do
+        %ReqLLM.StreamChunk{
+          type: :meta,
+          metadata: %{
+            terminal?: true,
+            finish_reason: :stop,
+            reasoning_details: details,
+            usage: %{input_tokens: 120, output_tokens: 30, total_tokens: 150}
+          }
+        }
+      end
+
+      defp stream_and_merge(chunks) do
+        stub(ReqLLM, :stream_text, fn _model, _context, _opts ->
+          {:ok, fake_stream_response(chunks)}
+        end)
+
+        %{model: @live_model, stream: true}
+        |> ChatReqLLM.new!()
+        |> ChatReqLLM.do_api_request([Message.new_user!("hi")], [], 3)
+        |> MessageDelta.merge_deltas()
+      end
+
+      test "signs the thinking part and still closes the turn with its usage" do
+        chunks = [
+          %ReqLLM.StreamChunk{type: :thinking, text: "Weighing the options."},
+          %ReqLLM.StreamChunk{type: :content, text: "Use the first one."},
+          terminal_chunk([%{signature: "SIG_FROM_DETAILS"}])
+        ]
+
+        {merged, log} = ExUnit.CaptureLog.with_log(fn -> stream_and_merge(chunks) end)
+
+        refute log =~ "carried no terminal chunk"
+        assert merged.status == :complete
+        assert %TokenUsage{input: 120, output: 30} = TokenUsage.get(merged)
+
+        assert {:ok, message} = MessageDelta.to_message(merged)
+
+        assert [%ContentPart{type: :thinking} = thinking, %ContentPart{type: :text}] =
+                 message.content
+
+        assert thinking.options[:signature] == "SIG_FROM_DETAILS"
+      end
+
+      test "keeps each streamed thinking block as its own signed part, in order" do
+        # Anthropic reports a thinking block's signature when the block stops,
+        # so a response with two thinking blocks streams two signature chunks.
+        block_signature = fn signature ->
+          %ReqLLM.StreamChunk{
+            type: :meta,
+            metadata: %{reasoning_details: [%{signature: signature}]}
+          }
+        end
+
+        chunks = [
+          %ReqLLM.StreamChunk{type: :thinking, text: "Find the issue."},
+          block_signature.("SIG_FIRST"),
+          %ReqLLM.StreamChunk{type: :content, text: "Looking it up."},
+          %ReqLLM.StreamChunk{type: :thinking, text: "Then assign it."},
+          block_signature.("SIG_SECOND"),
+          %ReqLLM.StreamChunk{type: :content, text: "Assigning now."},
+          terminal_chunk([])
+        ]
+
+        assert {:ok, message} = chunks |> stream_and_merge() |> MessageDelta.to_message()
+
+        assert [
+                 %ContentPart{type: :thinking, content: "Find the issue."} = first,
+                 %ContentPart{type: :text, content: "Looking it up."},
+                 %ContentPart{type: :thinking, content: "Then assign it."} = second,
+                 %ContentPart{type: :text, content: "Assigning now."}
+               ] = message.content
+
+        assert first.options[:signature] == "SIG_FIRST"
+        assert second.options[:signature] == "SIG_SECOND"
+      end
+
+      test "a turn whose only output is reasoning closes rather than coming back empty" do
+        # A reasoning item with no summary streams no thinking text, so there
+        # is no thinking slot for the details to sign.
+        merged = stream_and_merge([terminal_chunk([%{encrypted_content: "gAAAA"}])])
+
+        assert %MessageDelta{status: :complete} = merged
+        assert %TokenUsage{input: 120, output: 30} = TokenUsage.get(merged)
+      end
+
+      test "keeps the details as a reasoning part a tool loop sends back" do
+        chunks = [
+          %ReqLLM.StreamChunk{type: :content, text: "Searching."},
+          terminal_chunk(openai_reasoning_details())
+        ]
+
+        assert {:ok, message} = chunks |> stream_and_merge() |> MessageDelta.to_message()
+        assert [%ContentPart{type: :text}, part] = message.content
+        assert part == openai_reasoning_part()
+
+        assert [%ReqLLM.Message{reasoning_details: details}] =
+                 ChatReqLLM.message_to_req_llm_messages(message)
+
+        assert details == openai_reasoning_details()
+      end
+
+      test "a reasoning-only turn keeps its details" do
+        merged = stream_and_merge([terminal_chunk(openai_reasoning_details())])
+
+        assert %MessageDelta{status: :complete} = merged
+        assert {:ok, message} = MessageDelta.to_message(merged)
+        assert [part] = message.content
+        assert part == openai_reasoning_part()
+      end
+    end
+
+    describe "streamed token usage" do
+      # req_llm hands usage over as a complete snapshot of the message so far,
+      # and a provider may report more than one. Anthropic reports two: one
+      # opening the message and one closing it.
+      defp usage_snapshot(input, output, opts \\ []) do
+        %{
+          input_tokens: input,
+          output_tokens: output,
+          total_tokens: input + output,
+          cached_tokens: Keyword.get(opts, :cache_read, 0),
+          cache_read_input_tokens: Keyword.get(opts, :cache_read, 0),
+          cache_creation_input_tokens: Keyword.get(opts, :cache_creation, 0),
+          reasoning_tokens: 0
+        }
+      end
+
+      defp merge_usage_chunks(snapshots) do
+        snapshots
+        |> Enum.map(&%ReqLLM.StreamChunk{type: :meta, metadata: %{usage: &1}})
+        |> Enum.flat_map(&ChatReqLLM.translate_stream_chunk/1)
+        |> MessageDelta.merge_deltas()
+        |> TokenUsage.get()
+      end
+
+      test "two snapshots report the later reading, not their sum" do
+        usage =
+          merge_usage_chunks([
+            usage_snapshot(10, 1, cache_creation: 31_350),
+            usage_snapshot(10, 93, cache_creation: 31_350)
+          ])
+
+        assert usage.input == 10
+        assert usage.output == 93
+        assert usage.raw[:cache_creation_input_tokens] == 31_350
+      end
+
+      test "a zero-filled snapshot does not erase a class an earlier one reported" do
+        # req_llm normalizes an unreported class to zero rather than omitting it,
+        # so a closing snapshot that only carries output tokens arrives with
+        # every other count set to 0.
+        usage =
+          merge_usage_chunks([
+            usage_snapshot(25, 1, cache_creation: 4096, cache_read: 128),
+            usage_snapshot(0, 15)
+          ])
+
+        assert usage.input == 25
+        assert usage.output == 15
+        assert usage.raw[:cache_creation_input_tokens] == 4096
+        assert usage.raw[:cache_read_input_tokens] == 128
+      end
+
+      test "no count exceeds the largest single snapshot reporting it" do
+        first = usage_snapshot(10, 1, cache_creation: 31_350)
+        second = usage_snapshot(10, 93, cache_creation: 31_350)
+
+        usage = merge_usage_chunks([first, second])
+
+        for key <- [:input_tokens, :output_tokens, :cache_creation_input_tokens] do
+          largest = max(first[key], second[key])
+
+          assert usage.raw[key] <= largest,
+                 "#{key} accumulated to #{usage.raw[key]}, above the largest snapshot of #{largest}"
+        end
+      end
+
+      test "a whole non-streamed response reports its usage once" do
+        usage = ChatReqLLM.translate_usage(usage_snapshot(100, 20))
+
+        assert %TokenUsage{input: 100, output: 20} = usage
+        assert usage.raw[:total_tokens] == 120
+      end
+    end
+
+    # ============================================================
+    # Narration marker (assistant phase)
+    # ============================================================
+
+    describe "narration marker, inbound non-streaming" do
+      setup do
+        {:ok, model: ChatReqLLM.new!(%{model: "openai:gpt-5.4"})}
+      end
+
+      defp phased_response(content, metadata \\ %{}) do
+        struct!(
+          ReqLLM.Response,
+          Map.merge(base_response_fields(), %{
+            message: %ReqLLM.Message{
+              role: :assistant,
+              content: content,
+              tool_calls: nil,
+              metadata: metadata
+            },
+            finish_reason: :stop,
+            usage: nil
+          })
+        )
+      end
+
+      test "marks each part from its own phase metadata", %{model: model} do
+        response =
+          phased_response([
+            ReqLLM.Message.ContentPart.text("I'll check the logs.", %{phase: "commentary"}),
+            ReqLLM.Message.ContentPart.text("The job ran out of memory.", %{phase: "final_answer"})
+          ])
+
+        result = ChatReqLLM.do_process_response(model, response)
+
+        assert [narration, answer] = result.content
+        assert ContentPart.utterance(narration) == "narration"
+        assert ContentPart.utterance(answer) == "answer"
+        refute Message.narration?(result)
+        assert Message.answer_content(result) == "The job ran out of memory."
+      end
+
+      test "a part-marked commentary-only message is narration", %{model: model} do
+        response =
+          phased_response([
+            ReqLLM.Message.ContentPart.text("Let me look that up.", %{phase: "commentary"})
+          ])
+
+        result = ChatReqLLM.do_process_response(model, response)
+
+        assert Message.narration?(result)
+      end
+
+      test "part-level metadata wins over message-level metadata", %{model: model} do
+        response =
+          phased_response(
+            [ReqLLM.Message.ContentPart.text("Answering.", %{phase: "final_answer"})],
+            %{phase: "commentary"}
+          )
+
+        result = ChatReqLLM.do_process_response(model, response)
+
+        assert [part] = result.content
+        assert ContentPart.utterance(part) == "answer"
+      end
+
+      test "a message-level phase alone does not mark a part", %{model: model} do
+        # req_llm labels each part it decodes, so an unlabelled part is
+        # unmarked whatever the message reports.
+        response =
+          phased_response(
+            [ReqLLM.Message.ContentPart.text("Checking that now.")],
+            %{phase: "commentary"}
+          )
+
+        result = ChatReqLLM.do_process_response(model, response)
+
+        assert [part] = result.content
+        assert ContentPart.utterance(part) == nil
+      end
+
+      test "an unlabelled response is unmarked", %{model: model} do
+        result = ChatReqLLM.do_process_response(model, req_llm_text_response("Hello there!"))
+
+        assert [part] = result.content
+        assert ContentPart.utterance(part) == nil
+        refute Message.narration?(result)
+      end
+
+      test "an unknown phase value leaves the part unmarked", %{model: model} do
+        response =
+          phased_response([ReqLLM.Message.ContentPart.text("Hi", %{phase: "something_new"})])
+
+        result = ChatReqLLM.do_process_response(model, response)
+
+        assert [part] = result.content
+        assert ContentPart.utterance(part) == nil
+      end
+    end
+
+    describe "narration marker, outbound" do
+      # The assistant message items req_llm's Responses encoder sends for a
+      # message, as `{phase, text}`, and whether a function call follows them.
+      defp sent_openai_items(%Message{} = message) do
+        context = ChatReqLLM.messages_to_req_llm_context([Message.new_user!("hi"), message])
+
+        body =
+          ReqLLM.Providers.OpenAI.ResponsesAPI.build_request_body(context, "gpt-5.4", [], nil)
+
+        for item <- body["input"],
+            item["role"] == "assistant" or item["type"] == "function_call" do
+          case item do
+            %{"type" => "function_call", "name" => name} ->
+              {:function_call, name}
+
+            %{"content" => content} ->
+              {item["phase"], Enum.map_join(content, "", & &1["text"])}
+          end
+        end
+      end
+
+      test "a marked part carries its phase, and the message carries none" do
+        msg =
+          Message.new_assistant!(%{content: [ContentPart.narration!("Checking that now.")]})
+
+        [req_msg] = ChatReqLLM.message_to_req_llm_messages(msg)
+
+        assert req_msg.metadata == %{}
+        assert [%ReqLLM.Message.ContentPart{metadata: %{phase: "commentary"}}] = req_msg.content
+        assert sent_openai_items(msg) == [{"commentary", "Checking that now."}]
+      end
+
+      test "consecutive parts sharing a phase go back as one item" do
+        msg =
+          Message.new_assistant!(%{
+            content: [
+              ContentPart.narration!("I'll check the logs."),
+              ContentPart.narration!(" Reading them now."),
+              ContentPart.answer!("The job ran out of memory.")
+            ]
+          })
+
+        assert sent_openai_items(msg) == [
+                 {"commentary", "I'll check the logs. Reading them now."},
+                 {"final_answer", "The job ran out of memory."}
+               ]
+      end
+
+      test "an unmarked assistant message sends no metadata and no part metadata" do
+        msg = Message.new_assistant!(%{content: [ContentPart.text!("Just an answer.")]})
+
+        [req_msg] = ChatReqLLM.message_to_req_llm_messages(msg)
+
+        assert req_msg.metadata == %{}
+        assert [%ReqLLM.Message.ContentPart{metadata: %{}}] = req_msg.content
+      end
+
+      test "a message mixing marked and unmarked text keeps both, labelling only the marked" do
+        msg =
+          Message.new_assistant!(%{
+            content: [
+              ContentPart.narration!("I'll check."),
+              ContentPart.text!("Unlabelled text.")
+            ]
+          })
+
+        assert sent_openai_items(msg) == [
+                 {"commentary", "I'll check."},
+                 {nil, "Unlabelled text."}
+               ]
+      end
+
+      test "narration ahead of a tool call goes back labelled, before the call" do
+        msg =
+          Message.new_assistant!(%{
+            content: [ContentPart.narration!("Calling the tool.")],
+            tool_calls: [
+              ToolCall.new!(%{call_id: "call_1", name: "get_weather", arguments: %{}})
+            ]
+          })
+
+        assert sent_openai_items(msg) == [
+                 {"commentary", "Calling the tool."},
+                 {:function_call, "get_weather"}
+               ]
+      end
+
+      test "a user message is untouched" do
+        [req_msg] = ChatReqLLM.message_to_req_llm_messages(Message.new_user!("hi"))
+
+        assert req_msg.metadata == %{}
+      end
+
+      test "a decoded message re-encodes to the phases it arrived with" do
+        model = ChatReqLLM.new!(%{model: "openai:gpt-5.4"})
+
+        response =
+          struct!(
+            ReqLLM.Response,
+            Map.merge(base_response_fields(), %{
+              message: %ReqLLM.Message{
+                role: :assistant,
+                content: [
+                  ReqLLM.Message.ContentPart.text("I'll check.", %{phase: "commentary"}),
+                  ReqLLM.Message.ContentPart.text("Out of memory.", %{phase: "final_answer"})
+                ],
+                tool_calls: nil,
+                metadata: %{}
+              },
+              finish_reason: :stop,
+              usage: nil
+            })
+          )
+
+        message = ChatReqLLM.do_process_response(model, response)
+
+        assert sent_openai_items(message) == [
+                 {"commentary", "I'll check."},
+                 {"final_answer", "Out of memory."}
+               ]
+      end
+    end
+
+    describe "narration marker, streaming" do
+      test "per-chunk labels give each output item its own marked part" do
+        model = ChatReqLLM.new!(%{model: "openai:gpt-5.4", stream: true})
+
+        chunks = [
+          %ReqLLM.StreamChunk{
+            type: :content,
+            text: "I'll check",
+            metadata: %{phase: "commentary", output_index: 0}
+          },
+          %ReqLLM.StreamChunk{
+            type: :content,
+            text: " the logs.",
+            metadata: %{phase: "commentary", output_index: 0}
+          },
+          %ReqLLM.StreamChunk{
+            type: :content,
+            text: "Out of memory.",
+            metadata: %{phase: "final_answer", output_index: 1}
+          },
+          %ReqLLM.StreamChunk{type: :meta, metadata: %{finish_reason: :stop, terminal?: true}}
+        ]
+
+        stub(ReqLLM, :stream_text, fn _model, _context, _opts ->
+          {:ok, fake_stream_response(chunks)}
+        end)
+
+        merged =
+          model
+          |> ChatReqLLM.do_api_request([Message.new_user!("why did it fail")], [], 3)
+          |> MessageDelta.merge_deltas()
+
+        assert [narration, answer] = merged.merged_content
+        assert narration.content == "I'll check the logs."
+        assert ContentPart.utterance(narration) == "narration"
+        assert answer.content == "Out of memory."
+        assert ContentPart.utterance(answer) == "answer"
+      end
+
+      test "the marker is not concatenated across the chunks of one item" do
+        model = ChatReqLLM.new!(%{model: "openai:gpt-5.4", stream: true})
+
+        chunks =
+          for text <- ["a", "b", "c"] do
+            %ReqLLM.StreamChunk{
+              type: :content,
+              text: text,
+              metadata: %{phase: "commentary", output_index: 0}
+            }
+          end ++
+            [%ReqLLM.StreamChunk{type: :meta, metadata: %{finish_reason: :stop, terminal?: true}}]
+
+        stub(ReqLLM, :stream_text, fn _model, _context, _opts ->
+          {:ok, fake_stream_response(chunks)}
+        end)
+
+        merged =
+          model
+          |> ChatReqLLM.do_api_request([Message.new_user!("hi")], [], 3)
+          |> MessageDelta.merge_deltas()
+
+        assert [part] = merged.merged_content
+        assert part.content == "abc"
+        assert ContentPart.utterance(part) == "narration"
+      end
+
+      test "message-level labels on the terminal chunk mark nothing and close the turn" do
+        # req_llm repeats the message's labels on the terminal chunk after
+        # labelling each streamed chunk. Only the per-chunk labels mark text.
+        model = ChatReqLLM.new!(%{model: "openai:gpt-5.4", stream: true})
+
+        chunks = [
+          %ReqLLM.StreamChunk{type: :content, text: "Checking that now."},
+          %ReqLLM.StreamChunk{
+            type: :meta,
+            metadata: %{
+              phase: "commentary",
+              phase_items: [%{"phase" => "commentary", "content" => []}],
+              finish_reason: :stop,
+              terminal?: true
+            }
+          }
+        ]
+
+        stub(ReqLLM, :stream_text, fn _model, _context, _opts ->
+          {:ok, fake_stream_response(chunks)}
+        end)
+
+        deltas = ChatReqLLM.do_api_request(model, [Message.new_user!("hi")], [], 3)
+        merged = MessageDelta.merge_deltas(deltas)
+
+        assert [part] = merged.merged_content
+        assert part.content == "Checking that now."
+        assert ContentPart.utterance(part) == nil
+        assert List.last(deltas).status == :complete
+      end
+
+      test "an unlabelled stream still merges into one part" do
+        model = ChatReqLLM.new!(%{model: @live_model, stream: true})
+
+        chunks = [
+          %ReqLLM.StreamChunk{type: :content, text: "Hello"},
+          %ReqLLM.StreamChunk{type: :content, text: " world"},
+          %ReqLLM.StreamChunk{type: :meta, metadata: %{finish_reason: :stop, terminal?: true}}
+        ]
+
+        stub(ReqLLM, :stream_text, fn _model, _context, _opts ->
+          {:ok, fake_stream_response(chunks)}
+        end)
+
+        merged =
+          model
+          |> ChatReqLLM.do_api_request([Message.new_user!("hi")], [], 3)
+          |> MessageDelta.merge_deltas()
+
+        assert [part] = merged.merged_content
+        assert part.content == "Hello world"
+        assert ContentPart.utterance(part) == nil
+      end
+    end
+
+    describe "live: reasoning continuity across a tool loop" do
+      # Each test runs the first step of a tool loop against the real provider,
+      # then sends the second step with that assistant message stored and
+      # reloaded through JSON. The contexts handed to req_llm are recorded so
+      # the reasoning that went out can be compared.
+      #
+      # A provider accepting the turn proves little on its own, since neither
+      # requires the reasoning to come back. Each test also sends the reloaded
+      # turn with its reasoning signature corrupted, which the provider refuses
+      # only when it actually reads the reasoning part. OpenAI runs without
+      # stored responses so it decrypts what it is sent instead of looking the
+      # item up by id.
+
+      defp order_tool() do
+        Function.new!(%{
+          name: "lookup_order",
+          description: "Look up the shipping status of an order by its id.",
+          parameters_schema: %{
+            "type" => "object",
+            "properties" => %{"order_id" => %{"type" => "string"}},
+            "required" => ["order_id"]
+          },
+          function: fn _args, _ctx -> {:ok, "shipped"} end
+        })
+      end
+
+      defp record_req_llm_contexts() do
+        test_pid = self()
+        original = Mimic.Module.original(ReqLLM)
+
+        stub(ReqLLM, :generate_text, fn model, context, opts ->
+          send(test_pid, {:req_llm_context, context})
+          original.generate_text(model, context, opts)
+        end)
+
+        stub(ReqLLM, :stream_text, fn model, context, opts ->
+          send(test_pid, {:req_llm_context, context})
+          original.stream_text(model, context, opts)
+        end)
+      end
+
+      defp sent_context() do
+        assert_received {:req_llm_context, context}
+        context
+      end
+
+      # One step of the loop, as a complete message in either mode.
+      defp live_step(model, messages) do
+        assert {:ok, result} = ChatReqLLM.call(model, messages, [order_tool()])
+
+        case result do
+          %Message{} = message ->
+            message
+
+          deltas when is_list(deltas) ->
+            assert {:ok, message} =
+                     deltas
+                     |> List.flatten()
+                     |> MessageDelta.merge_deltas()
+                     |> MessageDelta.to_message()
+
+            message
+        end
+      end
+
+      defp sent_assistant_reasoning(%ReqLLM.Context{messages: messages}) do
+        assert [%ReqLLM.Message{reasoning_details: details}] =
+                 Enum.filter(messages, &(&1.role == :assistant))
+
+        details
+      end
+
+      defp tool_result_for(%Message{tool_calls: [%ToolCall{call_id: call_id} | _]}) do
+        Message.new_tool_result!(%{
+          tool_results: [
+            ToolResult.new!(%{tool_call_id: call_id, name: "lookup_order", content: "shipped"})
+          ]
+        })
+      end
+
+      # The message with every kept reasoning signature, on the reasoning part
+      # and on its thinking parts, replaced by one the provider cannot verify.
+      # Nothing else in the message changes.
+      defp corrupt_reasoning(%Message{content: parts} = message) do
+        corrupted =
+          Enum.map(parts, fn
+            %ContentPart{type: :unsupported, options: [reasoning_details: details]} = part ->
+              details = Enum.map(details, &Map.put(&1, "signature", "not-a-valid-signature"))
+              %ContentPart{part | options: [reasoning_details: details]}
+
+            %ContentPart{type: :thinking, options: options} = part when is_list(options) ->
+              if Keyword.has_key?(options, :signature),
+                do: %ContentPart{
+                  part
+                  | options: Keyword.put(options, :signature, "not-a-valid-signature")
+                },
+                else: part
+
+            part ->
+              part
+          end)
+
+        %Message{message | content: corrupted}
+      end
+
+      defp reasoning_part?(%ContentPart{type: :unsupported, options: options}),
+        do: Keyword.has_key?(options || [], :reasoning_details)
+
+      defp reasoning_part?(_part), do: false
+
+      defp run_openai_loop(stream?) do
+        record_req_llm_contexts()
+
+        model =
+          ChatReqLLM.new!(%{
+            model: "openai:gpt-5.4-mini",
+            stream: stream?,
+            provider_opts: %{reasoning_effort: :low, store: false}
+          })
+
+        user = Message.new_user!("Use lookup_order to check the status of order A-1001.")
+
+        assistant = live_step(model, [user])
+        _first = sent_context()
+
+        assert [%ToolCall{name: "lookup_order"} | _] = assistant.tool_calls
+        assert Enum.any?(assistant.content, &reasoning_part?/1)
+
+        tool_result = tool_result_for(assistant)
+
+        fresh = live_step(model, [user, assistant, tool_result])
+        fresh_reasoning = sent_assistant_reasoning(sent_context())
+
+        assert [%ReqLLM.Message.ReasoningDetails{provider: :openai, encrypted?: true} | _] =
+                 fresh_reasoning
+
+        assert fresh.role == :assistant
+
+        reloaded = live_step(model, [user, json_round_trip(assistant), tool_result])
+        reloaded_context = sent_context()
+
+        assert sent_assistant_reasoning(reloaded_context) == fresh_reasoning
+        assert reloaded.role == :assistant
+
+        # The encoder req_llm uses for this request puts the reasoning item, with
+        # its encrypted content, ahead of the function call it led to.
+        input =
+          ReqLLM.Providers.OpenAI.ResponsesAPI.build_request_body(
+            reloaded_context,
+            "gpt-5.4-mini",
+            [],
+            nil
+          )["input"]
+
+        reasoning = Enum.find_index(input, &(&1["type"] == "reasoning"))
+        call = Enum.find_index(input, &(&1["type"] == "function_call"))
+
+        assert %{"encrypted_content" => encrypted} = Enum.at(input, reasoning)
+        assert is_binary(encrypted) and encrypted != ""
+        assert reasoning < call
+
+        # Control: without stored responses, OpenAI decrypts the reasoning it is
+        # sent rather than looking the item up by id. Corrupting it only
+        # inside the reasoning part gets the turn refused, so the reasoning part
+        # is what reached the provider.
+        tampered = assistant |> json_round_trip() |> corrupt_reasoning()
+
+        assert {:error,
+                %LangChainError{original: %ReqLLM.Error.API.Request{status: 400, reason: reason}}} =
+                 ChatReqLLM.call(model, [user, tampered, tool_result], [order_tool()])
+
+        assert reason =~ "encrypted content"
+      end
+
+      @tag :live_call
+      @tag :live_open_ai
+      @tag live_api: :open_ai
+      test "OpenAI non-streaming: reasoning goes back fresh and after a reload" do
+        run_openai_loop(false)
+      end
+
+      @tag :live_call
+      @tag :live_open_ai
+      @tag live_api: :open_ai
+      test "OpenAI streaming: reasoning goes back fresh and after a reload" do
+        run_openai_loop(true)
+      end
+
+      # A thinking block whose signature matches its own part goes back as that
+      # part, in place, rather than rebuilt from the details. Anthropic checks
+      # each block it is sent against its signature, so a turn it accepts sent
+      # the block intact.
+      defp run_anthropic_loop(stream?) do
+        record_req_llm_contexts()
+
+        model =
+          ChatReqLLM.new!(%{
+            model: @live_model,
+            stream: stream?,
+            max_tokens: 4000,
+            provider_opts: %{thinking: %{type: "enabled", budget_tokens: 1024}}
+          })
+
+        user = Message.new_user!("Use lookup_order to check the status of order A-1001.")
+
+        assistant = live_step(model, [user])
+        _first = sent_context()
+
+        assert [%ToolCall{name: "lookup_order"} | _] = assistant.tool_calls
+        assert Enum.any?(assistant.content, &reasoning_part?/1)
+
+        tool_result = tool_result_for(assistant)
+
+        reloaded = live_step(model, [user, json_round_trip(assistant), tool_result])
+
+        assert %ReqLLM.Context{messages: sent} = sent_context()
+
+        assert [%ReqLLM.Message{reasoning_details: nil, content: content}] =
+                 Enum.filter(sent, &(&1.role == :assistant))
+
+        assert [%ReqLLM.Message.ContentPart{type: :thinking, metadata: %{signature: signature}}] =
+                 Enum.filter(content, &(&1.type == :thinking))
+
+        assert is_binary(signature) and signature != ""
+        assert reloaded.role == :assistant
+
+        # Control: the same turn with the signature corrupted on both the
+        # thinking part and its detail still goes back in place, as the
+        # recorded context above shows, and Anthropic refuses it.
+        tampered = assistant |> json_round_trip() |> corrupt_reasoning()
+
+        assert {:error,
+                %LangChainError{original: %ReqLLM.Error.API.Request{status: 400, reason: reason}}} =
+                 ChatReqLLM.call(model, [user, tampered, tool_result], [order_tool()])
+
+        assert reason =~ "signature"
+      end
+
+      @tag :live_call
+      @tag :live_anthropic
+      @tag live_api: :anthropic
+      test "Anthropic non-streaming with thinking: a reloaded turn sends its thinking in place" do
+        run_anthropic_loop(false)
+      end
+
+      @tag :live_call
+      @tag :live_anthropic
+      @tag live_api: :anthropic
+      test "Anthropic streaming with thinking: a reloaded turn sends its thinking in place" do
+        run_anthropic_loop(true)
+      end
+    end
+
+    describe "do_api_request/4 streaming, several thinking blocks" do
+      # The chunks req_llm's Anthropic stream decoder produces for a response's
+      # server-sent events, in order, including any it holds until the stream
+      # is flushed.
+      defp anthropic_stream_chunks(events) do
+        {:ok, model} = ReqLLM.model("anthropic:claude-haiku-4-5")
+        decoder = ReqLLM.Providers.Anthropic.Response
+
+        {chunks, state} =
+          Enum.flat_map_reduce(events, decoder.init_stream_state(), fn data, state ->
+            decoder.decode_stream_event(%{data: data}, model, state)
+          end)
+
+        {flushed, _state} = decoder.flush_stream_state(model, state)
+        chunks ++ flushed
+      end
+
+      defp thinking_block_events(index, text, signature) do
+        [
+          %{
+            "type" => "content_block_start",
+            "index" => index,
+            "content_block" => %{"type" => "thinking", "thinking" => ""}
+          },
+          %{
+            "type" => "content_block_delta",
+            "index" => index,
+            "delta" => %{"type" => "thinking_delta", "thinking" => text}
+          },
+          %{
+            "type" => "content_block_delta",
+            "index" => index,
+            "delta" => %{"type" => "signature_delta", "signature" => signature}
+          },
+          %{"type" => "content_block_stop", "index" => index}
+        ]
+      end
+
+      defp text_block_events(index, text) do
+        [
+          %{
+            "type" => "content_block_start",
+            "index" => index,
+            "content_block" => %{"type" => "text", "text" => ""}
+          },
+          %{
+            "type" => "content_block_delta",
+            "index" => index,
+            "delta" => %{"type" => "text_delta", "text" => text}
+          },
+          %{"type" => "content_block_stop", "index" => index}
+        ]
+      end
+
+      defp tool_use_block_events(index) do
+        [
+          %{
+            "type" => "content_block_start",
+            "index" => index,
+            "content_block" => %{
+              "type" => "tool_use",
+              "id" => "toolu_1",
+              "name" => "assign_issue",
+              "input" => %{}
+            }
+          },
+          %{
+            "type" => "content_block_delta",
+            "index" => index,
+            "delta" => %{"type" => "input_json_delta", "partial_json" => "{}"}
+          },
+          %{"type" => "content_block_stop", "index" => index}
+        ]
+      end
+
+      # A response that thinks, narrates, thinks again and calls a tool.
+      defp interleaved_thinking_events() do
+        [
+          %{
+            "type" => "message_start",
+            "message" => %{
+              "id" => "msg_1",
+              "usage" => %{"input_tokens" => 50, "output_tokens" => 1}
+            }
+          }
+        ] ++
+          thinking_block_events(0, "Find the issue.", "SIG_FIRST") ++
+          text_block_events(1, "Looking it up.") ++
+          thinking_block_events(2, "Then assign it.", "SIG_SECOND") ++
+          tool_use_block_events(3) ++
+          [
+            %{
+              "type" => "message_delta",
+              "delta" => %{"stop_reason" => "tool_use"},
+              "usage" => %{"output_tokens" => 40}
+            },
+            %{"type" => "message_stop"}
+          ]
+      end
+
+      test "keeps each thinking block as its own signed part, in order" do
+        assert {:ok, message} =
+                 interleaved_thinking_events()
+                 |> anthropic_stream_chunks()
+                 |> stream_and_merge()
+                 |> MessageDelta.to_message()
+
+        assert [
+                 %ContentPart{type: :thinking, content: "Find the issue."} = first,
+                 %ContentPart{type: :unsupported} = reasoning,
+                 %ContentPart{type: :text, content: "Looking it up."},
+                 %ContentPart{type: :thinking, content: "Then assign it."} = second
+               ] = message.content
+
+        assert first.options[:signature] == "SIG_FIRST"
+        assert second.options[:signature] == "SIG_SECOND"
+
+        assert [%{"signature" => "SIG_FIRST"}, %{"signature" => "SIG_SECOND"}] =
+                 reasoning.options[:reasoning_details]
+
+        assert [%ToolCall{name: "assign_issue"}] = message.tool_calls
+      end
+
+      test "sends every thinking block back as it was produced, after a reload" do
+        assert {:ok, message} =
+                 interleaved_thinking_events()
+                 |> anthropic_stream_chunks()
+                 |> stream_and_merge()
+                 |> MessageDelta.to_message()
+
+        assert [
+                 %{type: "thinking", thinking: "Find the issue.", signature: "SIG_FIRST"},
+                 %{type: "text", text: "Looking it up."},
+                 %{type: "thinking", thinking: "Then assign it.", signature: "SIG_SECOND"},
+                 %{type: "tool_use", name: "assign_issue"}
+               ] = message |> json_round_trip() |> anthropic_assistant_blocks()
+      end
+    end
+  end
+end

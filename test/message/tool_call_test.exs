@@ -97,6 +97,25 @@ defmodule LangChain.Message.ToolCallTest do
 
       assert msg.arguments == four_spaces
     end
+
+    test "accepts metadata field with thought_signature" do
+      assert {:ok, %ToolCall{} = call} =
+               ToolCall.new(%{
+                 "status" => :complete,
+                 "type" => "function",
+                 "call_id" => "call_123",
+                 "name" => "test_function",
+                 "arguments" => "{}",
+                 "metadata" => %{thought_signature: "abc123signature"}
+               })
+
+      assert call.metadata == %{thought_signature: "abc123signature"}
+    end
+
+    test "metadata defaults to nil" do
+      {:ok, call} = ToolCall.new(%{})
+      assert call.metadata == nil
+    end
   end
 
   describe "complete/1" do
@@ -148,6 +167,25 @@ defmodule LangChain.Message.ToolCallTest do
 
       {:error, changeset} = ToolCall.complete(call)
       assert {"invalid json", _} = changeset.errors[:arguments]
+    end
+  end
+
+  describe "arguments_as_map/1" do
+    test "returns a map unchanged" do
+      call = %ToolCall{arguments: %{"a" => 1}}
+      assert ToolCall.arguments_as_map(call) == %{"a" => 1}
+    end
+
+    test "decodes a JSON-object string" do
+      call = %ToolCall{status: :incomplete, arguments: ~s({"title":"x"})}
+      assert ToolCall.arguments_as_map(call) == %{"title" => "x"}
+    end
+
+    test "returns an empty map for nil, empty, invalid, or non-object arguments" do
+      for arguments <- [nil, "", "not json", "[1, 2, 3]", "\"just a string\""] do
+        call = %ToolCall{status: :incomplete, arguments: arguments}
+        assert ToolCall.arguments_as_map(call) == %{}
+      end
     end
   end
 
@@ -312,6 +350,116 @@ defmodule LangChain.Message.ToolCallTest do
       end
     end
 
+    test "preserves display_text from primary when delta has none" do
+      primary = %ToolCall{
+        status: :incomplete,
+        type: :function,
+        call_id: "call_123",
+        name: "file_write",
+        arguments: "{\"path\":",
+        display_text: "Writing file",
+        index: 0
+      }
+
+      delta = %ToolCall{
+        status: :incomplete,
+        type: :function,
+        name: "file_write",
+        arguments: " \"test.txt\"}",
+        index: 0
+      }
+
+      result = ToolCall.merge(primary, delta)
+      assert result.display_text == "Writing file"
+      assert result.arguments == "{\"path\": \"test.txt\"}"
+    end
+
+    test "delta display_text overwrites primary display_text" do
+      primary = %ToolCall{
+        status: :incomplete,
+        name: "file_write",
+        display_text: "Old text",
+        index: 0
+      }
+
+      delta = %ToolCall{
+        status: :incomplete,
+        name: "file_write",
+        display_text: "New text",
+        index: 0
+      }
+
+      result = ToolCall.merge(primary, delta)
+      assert result.display_text == "New text"
+    end
+
+    test "preserves metadata from primary when delta has none" do
+      primary = %ToolCall{
+        status: :incomplete,
+        name: "file_write",
+        metadata: %{"execution_status" => "identified"},
+        index: 0
+      }
+
+      delta = %ToolCall{
+        status: :incomplete,
+        name: "file_write",
+        arguments: "{\"path\": \"test.txt\"}",
+        index: 0
+      }
+
+      result = ToolCall.merge(primary, delta)
+      assert result.metadata == %{"execution_status" => "identified"}
+    end
+
+    test "merges delta metadata into primary metadata" do
+      primary = %ToolCall{
+        status: :incomplete,
+        name: "file_write",
+        metadata: %{"execution_status" => "identified", "custom" => "value"},
+        index: 0
+      }
+
+      delta = %ToolCall{
+        status: :incomplete,
+        name: "file_write",
+        metadata: %{"execution_status" => "executing"},
+        index: 0
+      }
+
+      result = ToolCall.merge(primary, delta)
+      assert result.metadata == %{"execution_status" => "executing", "custom" => "value"}
+    end
+
+    test "preserves display_text and metadata through multiple merges" do
+      call_1 = %ToolCall{
+        status: :incomplete,
+        name: "file_write",
+        arguments: "{\"pa",
+        index: 0
+      }
+
+      # Simulate what handle_tool_call_identified does: set display_text and metadata
+      call_1 = %{
+        call_1
+        | display_text: "Writing file",
+          metadata: %{"execution_status" => "identified"}
+      }
+
+      # More argument data arrives via streaming
+      call_2 = %ToolCall{status: :incomplete, name: "file_write", arguments: "th\":", index: 0}
+      call_3 = %ToolCall{status: :incomplete, name: "file_write", arguments: " \"x\"}", index: 0}
+
+      result =
+        call_1
+        |> ToolCall.merge(call_2)
+        |> ToolCall.merge(call_3)
+
+      assert result.display_text == "Writing file"
+      assert result.metadata == %{"execution_status" => "identified"}
+      assert result.arguments == "{\"path\": \"x\"}"
+    end
+
     test "preserves empty spaces when merging arguments" do
       call_1 = %ToolCall{
         status: :incomplete,
@@ -346,6 +494,28 @@ defmodule LangChain.Message.ToolCallTest do
         |> ToolCall.merge(call_3)
 
       assert result.arguments == "{\"code\": \"def my_function(x):\n    return x + 1\"}"
+    end
+
+    test "handles binary arguments delta when primary arguments is already a map" do
+      primary = %ToolCall{
+        status: :complete,
+        call_id: "call_123",
+        name: "my_tool",
+        arguments: %{"key" => "value"},
+        index: 0
+      }
+
+      delta = %ToolCall{
+        status: :incomplete,
+        call_id: "call_123",
+        name: "my_tool",
+        arguments: "{\"key\":",
+        index: 0
+      }
+
+      result = ToolCall.merge(primary, delta)
+      assert result.arguments == %{"key" => "value"}
+      assert result.status == :complete
     end
   end
 end

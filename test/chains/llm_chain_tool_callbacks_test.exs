@@ -1,0 +1,1272 @@
+defmodule LangChain.Chains.LLMChainToolCallbacksTest do
+  use ExUnit.Case
+
+  alias LangChain.Chains.LLMChain
+  alias LangChain.{Function, Message}
+  alias LangChain.Message.ToolCall
+  alias LangChain.ChatModels.ChatAnthropic
+
+  describe "tool execution callbacks" do
+    test "fires on_tool_execution_started callback" do
+      test_pid = self()
+
+      # Create a tool with display_text
+      tool =
+        Function.new!(%{
+          name: "test_tool",
+          description: "A test tool",
+          display_text: "Testing something",
+          parameters_schema: %{type: "object", properties: %{}},
+          function: fn _args, _ctx -> {:ok, "result"} end
+        })
+
+      # Create callback handler
+      callbacks = %{
+        on_tool_execution_started: fn _chain, tool_call, function ->
+          send(test_pid, {:started, tool_call.name, function.display_text})
+        end
+      }
+
+      # Create chain with tool and callback
+      chain =
+        LLMChain.new!(%{
+          llm: ChatAnthropic.new!(%{model: "claude-sonnet-4-5-20250929"}),
+          tools: [tool],
+          callbacks: [callbacks]
+        })
+
+      # Simulate a message with tool call
+      message =
+        Message.new_assistant!(%{
+          content: "Let me test",
+          tool_calls: [
+            ToolCall.new!(%{call_id: "call_1", name: "test_tool", arguments: %{}})
+          ]
+        })
+
+      chain = LLMChain.add_message(chain, message)
+
+      # Execute tools
+      _updated_chain = LLMChain.execute_tool_calls(chain)
+
+      # Verify callback was fired
+      assert_received {:started, "test_tool", "Testing something"}
+    end
+
+    test "fires on_tool_execution_completed callback on success" do
+      test_pid = self()
+
+      # Create a successful tool
+      tool =
+        Function.new!(%{
+          name: "success_tool",
+          description: "Always succeeds",
+          display_text: "Running success tool",
+          parameters_schema: %{type: "object", properties: %{}},
+          function: fn _args, _ctx -> {:ok, "success!"} end
+        })
+
+      callbacks = %{
+        on_tool_execution_completed: fn _chain, tool_call, tool_result ->
+          send(test_pid, {:completed, tool_call.name, tool_result})
+        end
+      }
+
+      chain =
+        LLMChain.new!(%{
+          llm: ChatAnthropic.new!(%{model: "claude-sonnet-4-5-20250929"}),
+          tools: [tool],
+          callbacks: [callbacks]
+        })
+
+      message =
+        Message.new_assistant!(%{
+          content: "Test",
+          tool_calls: [
+            ToolCall.new!(%{call_id: "call_2", name: "success_tool", arguments: %{}})
+          ]
+        })
+
+      chain = LLMChain.add_message(chain, message)
+      _updated_chain = LLMChain.execute_tool_calls(chain)
+
+      assert_received {:completed, "success_tool", tool_result}
+      assert tool_result.is_error == false
+    end
+
+    test "fires on_tool_execution_failed callback when tool raises error" do
+      test_pid = self()
+
+      # Create a failing tool
+      tool =
+        Function.new!(%{
+          name: "fail_tool",
+          description: "Always fails",
+          display_text: "Running fail tool",
+          parameters_schema: %{type: "object", properties: %{}},
+          function: fn _args, _ctx -> {:error, "Something went wrong"} end
+        })
+
+      callbacks = %{
+        on_tool_execution_failed: fn _chain, tool_call, error ->
+          send(test_pid, {:failed, tool_call.name, error})
+        end,
+        on_tool_execution_completed: fn _chain, tool_call, _tool_result ->
+          send(test_pid, {:completed, tool_call.name})
+        end
+      }
+
+      chain =
+        LLMChain.new!(%{
+          llm: ChatAnthropic.new!(%{model: "claude-sonnet-4-5-20250929"}),
+          tools: [tool],
+          callbacks: [callbacks]
+        })
+
+      message =
+        Message.new_assistant!(%{
+          content: "Test",
+          tool_calls: [
+            ToolCall.new!(%{call_id: "call_3", name: "fail_tool", arguments: %{}})
+          ]
+        })
+
+      chain = LLMChain.add_message(chain, message)
+      _updated_chain = LLMChain.execute_tool_calls(chain)
+
+      # Error can be a string or list of ContentParts
+      assert_received {:failed, "fail_tool", _error}
+
+      # Ensure on_tool_execution_completed did NOT fire
+      refute_received {:completed, "fail_tool"}
+    end
+
+    test "fires on_tool_execution_failed callback for invalid tool" do
+      test_pid = self()
+
+      callbacks = %{
+        on_tool_execution_failed: fn _chain, tool_call, error ->
+          send(test_pid, {:failed, tool_call.name, error})
+        end
+      }
+
+      chain =
+        LLMChain.new!(%{
+          llm: ChatAnthropic.new!(%{model: "claude-sonnet-4-5-20250929"}),
+          tools: [],
+          callbacks: [callbacks]
+        })
+
+      message =
+        Message.new_assistant!(%{
+          content: "Test",
+          tool_calls: [
+            ToolCall.new!(%{call_id: "call_4", name: "nonexistent_tool", arguments: %{}})
+          ]
+        })
+
+      chain = LLMChain.add_message(chain, message)
+      _updated_chain = LLMChain.execute_tool_calls(chain)
+
+      assert_received {:failed, "nonexistent_tool", _error}
+    end
+
+    test "fires callbacks for multiple tools in correct order" do
+      test_pid = self()
+
+      tool1 =
+        Function.new!(%{
+          name: "tool1",
+          description: "First tool",
+          display_text: "Tool 1",
+          parameters_schema: %{type: "object", properties: %{}},
+          function: fn _args, _ctx -> {:ok, "result1"} end
+        })
+
+      tool2 =
+        Function.new!(%{
+          name: "tool2",
+          description: "Second tool",
+          display_text: "Tool 2",
+          parameters_schema: %{type: "object", properties: %{}},
+          function: fn _args, _ctx -> {:ok, "result2"} end
+        })
+
+      callbacks = %{
+        on_tool_execution_started: fn _chain, tool_call, _function ->
+          send(test_pid, {:started, tool_call.name})
+        end,
+        on_tool_execution_completed: fn _chain, tool_call, _tool_result ->
+          send(test_pid, {:completed, tool_call.name})
+        end
+      }
+
+      chain =
+        LLMChain.new!(%{
+          llm: ChatAnthropic.new!(%{model: "claude-sonnet-4-5-20250929"}),
+          tools: [tool1, tool2],
+          callbacks: [callbacks]
+        })
+
+      message =
+        Message.new_assistant!(%{
+          content: "Test",
+          tool_calls: [
+            ToolCall.new!(%{call_id: "call_5", name: "tool1", arguments: %{}}),
+            ToolCall.new!(%{call_id: "call_6", name: "tool2", arguments: %{}})
+          ]
+        })
+
+      chain = LLMChain.add_message(chain, message)
+      _updated_chain = LLMChain.execute_tool_calls(chain)
+
+      # All started callbacks should fire before completed callbacks
+      assert_received {:started, "tool1"}
+      assert_received {:started, "tool2"}
+      assert_received {:completed, "tool1"}
+      assert_received {:completed, "tool2"}
+    end
+
+    test "fires callbacks in execute_tool_calls_with_decisions for approved tools" do
+      test_pid = self()
+
+      tool =
+        Function.new!(%{
+          name: "test_tool",
+          description: "A test tool",
+          display_text: "Testing with decisions",
+          parameters_schema: %{type: "object", properties: %{}},
+          function: fn _args, _ctx -> {:ok, "result"} end
+        })
+
+      callbacks = %{
+        on_tool_execution_started: fn _chain, tool_call, function ->
+          send(test_pid, {:started, tool_call.name, function.display_text})
+        end,
+        on_tool_execution_completed: fn _chain, tool_call, _tool_result ->
+          send(test_pid, {:completed, tool_call.name})
+        end
+      }
+
+      chain =
+        LLMChain.new!(%{
+          llm: ChatAnthropic.new!(%{model: "claude-sonnet-4-5-20250929"}),
+          tools: [tool],
+          callbacks: [callbacks]
+        })
+
+      tool_calls = [
+        ToolCall.new!(%{call_id: "call_7", name: "test_tool", arguments: %{}})
+      ]
+
+      decisions = [%{type: :approve}]
+
+      _updated_chain = LLMChain.execute_tool_calls_with_decisions(chain, tool_calls, decisions)
+
+      assert_received {:started, "test_tool", "Testing with decisions"}
+      assert_received {:completed, "test_tool"}
+    end
+
+    test "fires on_tool_execution_failed callback for rejected tools in HITL" do
+      test_pid = self()
+
+      tool =
+        Function.new!(%{
+          name: "test_tool",
+          description: "A test tool",
+          display_text: "Testing rejection",
+          parameters_schema: %{type: "object", properties: %{}},
+          function: fn _args, _ctx -> {:ok, "should not execute"} end
+        })
+
+      callbacks = %{
+        on_tool_execution_failed: fn _chain, tool_call, error ->
+          send(test_pid, {:failed, tool_call.name, error})
+        end
+      }
+
+      chain =
+        LLMChain.new!(%{
+          llm: ChatAnthropic.new!(%{model: "claude-sonnet-4-5-20250929"}),
+          tools: [tool],
+          callbacks: [callbacks]
+        })
+
+      tool_calls = [
+        ToolCall.new!(%{call_id: "call_8", name: "test_tool", arguments: %{}})
+      ]
+
+      decisions = [%{type: :reject}]
+
+      _updated_chain = LLMChain.execute_tool_calls_with_decisions(chain, tool_calls, decisions)
+
+      assert_received {:failed, "test_tool", error}
+      assert error =~ "rejected by a human reviewer"
+    end
+
+    test "fires callbacks for edited tool calls in HITL" do
+      test_pid = self()
+
+      tool =
+        Function.new!(%{
+          name: "test_tool",
+          description: "A test tool",
+          display_text: "Testing editing",
+          parameters_schema: %{
+            type: "object",
+            properties: %{value: %{type: "string"}}
+          },
+          function: fn args, _ctx -> {:ok, "received: #{args["value"]}"} end
+        })
+
+      callbacks = %{
+        on_tool_execution_started: fn _chain, tool_call, _function ->
+          send(test_pid, {:started, tool_call.arguments})
+        end,
+        on_tool_execution_completed: fn _chain, _tool_call, tool_result ->
+          send(test_pid, {:completed, tool_result})
+        end
+      }
+
+      chain =
+        LLMChain.new!(%{
+          llm: ChatAnthropic.new!(%{model: "claude-sonnet-4-5-20250929"}),
+          tools: [tool],
+          callbacks: [callbacks]
+        })
+
+      tool_calls = [
+        ToolCall.new!(%{
+          call_id: "call_9",
+          name: "test_tool",
+          arguments: %{"value" => "original"}
+        })
+      ]
+
+      decisions = [%{type: :edit, arguments: %{"value" => "edited"}}]
+
+      _updated_chain = LLMChain.execute_tool_calls_with_decisions(chain, tool_calls, decisions)
+
+      # Should receive the edited arguments
+      assert_received {:started, %{"value" => "edited"}}
+      assert_received {:completed, _tool_result}
+    end
+
+    test "async tools fire callbacks after all complete" do
+      test_pid = self()
+
+      async_tool =
+        Function.new!(%{
+          name: "async_tool",
+          description: "An async tool",
+          display_text: "Async processing",
+          async: true,
+          parameters_schema: %{type: "object", properties: %{}},
+          function: fn _args, _ctx ->
+            # Simulate async work
+            Process.sleep(10)
+            {:ok, "async result"}
+          end
+        })
+
+      callbacks = %{
+        on_tool_execution_started: fn _chain, tool_call, _function ->
+          send(test_pid, {:started, tool_call.name, System.monotonic_time(:millisecond)})
+        end,
+        on_tool_execution_completed: fn _chain, tool_call, _tool_result ->
+          send(test_pid, {:completed, tool_call.name, System.monotonic_time(:millisecond)})
+        end
+      }
+
+      chain =
+        LLMChain.new!(%{
+          llm: ChatAnthropic.new!(%{model: "claude-sonnet-4-5-20250929"}),
+          tools: [async_tool],
+          callbacks: [callbacks]
+        })
+
+      message =
+        Message.new_assistant!(%{
+          content: "Test",
+          tool_calls: [
+            ToolCall.new!(%{call_id: "call_10", name: "async_tool", arguments: %{}})
+          ]
+        })
+
+      chain = LLMChain.add_message(chain, message)
+      _updated_chain = LLMChain.execute_tool_calls(chain)
+
+      assert_received {:started, "async_tool", _start_time}
+      assert_received {:completed, "async_tool", _end_time}
+    end
+  end
+
+  describe "tool identification callbacks during streaming" do
+    test "fires on_tool_call_identified when tool name detected in streaming delta" do
+      test_pid = self()
+
+      tool =
+        Function.new!(%{
+          name: "search_web",
+          display_text: "Searching web",
+          description: "Search the web",
+          parameters_schema: %{type: "object", properties: %{}},
+          function: fn _args, _ctx -> {:ok, "results"} end
+        })
+
+      callbacks = %{
+        on_tool_call_identified: fn _chain, tool_call, function ->
+          send(test_pid, {:identified, tool_call.name, function.display_text})
+        end
+      }
+
+      chain =
+        LLMChain.new!(%{
+          llm: ChatAnthropic.new!(%{model: "claude-sonnet-4-5-20250929"}),
+          tools: [tool],
+          callbacks: [callbacks]
+        })
+
+      # Simulate streaming: first delta has tool name but no call_id
+      delta =
+        LangChain.MessageDelta.new!(%{
+          role: :assistant,
+          tool_calls: [
+            LangChain.Message.ToolCall.new!(%{index: 0, name: "search_web"})
+          ]
+        })
+
+      _updated_chain = LLMChain.merge_delta(chain, delta)
+
+      assert_received {:identified, "search_web", "Searching web"}
+    end
+
+    test "does not fire on_tool_call_identified twice for same tool" do
+      test_pid = self()
+
+      tool =
+        Function.new!(%{
+          name: "file_read",
+          display_text: "Reading file",
+          description: "Read a file",
+          parameters_schema: %{type: "object", properties: %{}},
+          function: fn _args, _ctx -> {:ok, "content"} end
+        })
+
+      callbacks = %{
+        on_tool_call_identified: fn _chain, tool_call, _function ->
+          send(test_pid, {:identified, tool_call.name})
+        end
+      }
+
+      chain =
+        LLMChain.new!(%{
+          llm: ChatAnthropic.new!(%{model: "claude-sonnet-4-5-20250929"}),
+          tools: [tool],
+          callbacks: [callbacks]
+        })
+
+      # First delta with tool name
+      delta1 =
+        LangChain.MessageDelta.new!(%{
+          role: :assistant,
+          tool_calls: [
+            LangChain.Message.ToolCall.new!(%{index: 0, name: "file_read"})
+          ]
+        })
+
+      chain = LLMChain.merge_delta(chain, delta1)
+
+      # Second delta with same tool (adding arguments)
+      delta2 =
+        LangChain.MessageDelta.new!(%{
+          role: :assistant,
+          tool_calls: [
+            LangChain.Message.ToolCall.new!(%{
+              index: 0,
+              name: "file_read",
+              arguments: "{\"path\":"
+            })
+          ]
+        })
+
+      _updated_chain = LLMChain.merge_delta(chain, delta2)
+
+      # Should only receive one identification
+      assert_received {:identified, "file_read"}
+      refute_received {:identified, "file_read"}
+    end
+
+    test "fires both on_tool_call_identified and on_tool_execution_started in sequence" do
+      test_pid = self()
+
+      tool =
+        Function.new!(%{
+          name: "calculator",
+          display_text: "Calculating",
+          description: "Do math",
+          parameters_schema: %{type: "object", properties: %{}},
+          function: fn _args, _ctx -> {:ok, "42"} end
+        })
+
+      callbacks = %{
+        on_tool_call_identified: fn _chain, tool_call, function ->
+          send(test_pid, {:identified, tool_call.name, function.display_text})
+        end,
+        on_tool_execution_started: fn _chain, tool_call, function ->
+          send(test_pid, {:started, tool_call.name, function.display_text})
+        end
+      }
+
+      chain =
+        LLMChain.new!(%{
+          llm: ChatAnthropic.new!(%{model: "claude-sonnet-4-5-20250929"}),
+          tools: [tool],
+          callbacks: [callbacks]
+        })
+
+      # Simulate streaming delta
+      delta =
+        LangChain.MessageDelta.new!(%{
+          role: :assistant,
+          tool_calls: [
+            LangChain.Message.ToolCall.new!(%{index: 0, name: "calculator"})
+          ]
+        })
+
+      chain = LLMChain.merge_delta(chain, delta)
+
+      # Should receive identification callback
+      assert_received {:identified, "calculator", "Calculating"}
+
+      # Now simulate execution
+      message =
+        Message.new_assistant!(%{
+          content: "Let me calculate",
+          tool_calls: [
+            LangChain.Message.ToolCall.new!(%{
+              call_id: "call_123",
+              name: "calculator",
+              arguments: %{}
+            })
+          ]
+        })
+
+      chain = LLMChain.add_message(chain, message)
+      _updated_chain = LLMChain.execute_tool_calls(chain)
+
+      # Should also receive execution started callback
+      assert_received {:started, "calculator", "Calculating"}
+    end
+
+    test "handles tool not found in tool map during identification" do
+      test_pid = self()
+
+      callbacks = %{
+        on_tool_call_identified: fn _chain, tool_call, _function ->
+          send(test_pid, {:identified, tool_call.name})
+        end
+      }
+
+      chain =
+        LLMChain.new!(%{
+          llm: ChatAnthropic.new!(%{model: "claude-sonnet-4-5-20250929"}),
+          tools: [],
+          callbacks: [callbacks]
+        })
+
+      # Delta with unknown tool
+      delta =
+        LangChain.MessageDelta.new!(%{
+          role: :assistant,
+          tool_calls: [
+            LangChain.Message.ToolCall.new!(%{index: 0, name: "unknown_tool"})
+          ]
+        })
+
+      _updated_chain = LLMChain.merge_delta(chain, delta)
+
+      # Should not fire callback for unknown tool
+      refute_received {:identified, _}
+    end
+  end
+
+  describe ":on_tool_pre_execution callback" do
+    test "fires inside the per-tool Task for async tools" do
+      test_pid = self()
+      chain_pid = self()
+
+      tool =
+        Function.new!(%{
+          name: "async_marker",
+          description: "Reports the PID it ran in",
+          async: true,
+          parameters_schema: %{type: "object", properties: %{}},
+          function: fn _args, _ctx ->
+            send(test_pid, {:tool_ran_in, self()})
+            {:ok, "ok"}
+          end
+        })
+
+      callbacks = %{
+        on_tool_pre_execution: fn _chain, tool_call, _function ->
+          send(test_pid, {:pre_execution_in, tool_call.name, self()})
+        end
+      }
+
+      chain =
+        LLMChain.new!(%{
+          llm: ChatAnthropic.new!(%{model: "claude-sonnet-4-5-20250929"}),
+          tools: [tool],
+          callbacks: [callbacks]
+        })
+
+      message =
+        Message.new_assistant!(%{
+          content: nil,
+          tool_calls: [
+            ToolCall.new!(%{call_id: "call_async", name: "async_marker", arguments: %{}})
+          ]
+        })
+
+      chain = LLMChain.add_message(chain, message)
+      _ = LLMChain.execute_tool_calls(chain)
+
+      assert_received {:pre_execution_in, "async_marker", pre_pid}
+      assert_received {:tool_ran_in, run_pid}
+
+      # The decisive assertion: callback ran in the same process as the tool,
+      # NOT in the chain's parent process.
+      assert pre_pid == run_pid
+      refute pre_pid == chain_pid
+    end
+
+    test "fires in the chain's process for sync tools" do
+      test_pid = self()
+      chain_pid = self()
+
+      tool =
+        Function.new!(%{
+          name: "sync_marker",
+          description: "Reports the PID it ran in",
+          async: false,
+          parameters_schema: %{type: "object", properties: %{}},
+          function: fn _args, _ctx ->
+            send(test_pid, {:tool_ran_in, self()})
+            {:ok, "ok"}
+          end
+        })
+
+      callbacks = %{
+        on_tool_pre_execution: fn _chain, tool_call, _function ->
+          send(test_pid, {:pre_execution_in, tool_call.name, self()})
+        end
+      }
+
+      chain =
+        LLMChain.new!(%{
+          llm: ChatAnthropic.new!(%{model: "claude-sonnet-4-5-20250929"}),
+          tools: [tool],
+          callbacks: [callbacks]
+        })
+
+      message =
+        Message.new_assistant!(%{
+          content: nil,
+          tool_calls: [
+            ToolCall.new!(%{call_id: "call_sync", name: "sync_marker", arguments: %{}})
+          ]
+        })
+
+      chain = LLMChain.add_message(chain, message)
+      _ = LLMChain.execute_tool_calls(chain)
+
+      assert_received {:pre_execution_in, "sync_marker", pre_pid}
+      assert_received {:tool_ran_in, run_pid}
+
+      # Sync path runs in the chain's own process.
+      assert pre_pid == run_pid
+      assert pre_pid == chain_pid
+    end
+
+    test "fires before :on_tool_execution_completed" do
+      test_pid = self()
+
+      tool =
+        Function.new!(%{
+          name: "ordered_tool",
+          description: "Ordering check",
+          async: true,
+          parameters_schema: %{type: "object", properties: %{}},
+          function: fn _args, _ctx -> {:ok, "ok"} end
+        })
+
+      callbacks = %{
+        on_tool_pre_execution: fn _chain, _tc, _f -> send(test_pid, :pre) end,
+        on_tool_execution_completed: fn _chain, _tc, _r -> send(test_pid, :completed) end
+      }
+
+      chain =
+        LLMChain.new!(%{
+          llm: ChatAnthropic.new!(%{model: "claude-sonnet-4-5-20250929"}),
+          tools: [tool],
+          callbacks: [callbacks]
+        })
+
+      message =
+        Message.new_assistant!(%{
+          content: nil,
+          tool_calls: [
+            ToolCall.new!(%{call_id: "call_order", name: "ordered_tool", arguments: %{}})
+          ]
+        })
+
+      chain = LLMChain.add_message(chain, message)
+      _ = LLMChain.execute_tool_calls(chain)
+
+      assert_received :pre
+      assert_received :completed
+    end
+
+    test "is optional - chain runs normally without a handler" do
+      tool =
+        Function.new!(%{
+          name: "plain_tool",
+          description: "No callback registered",
+          parameters_schema: %{type: "object", properties: %{}},
+          function: fn _args, _ctx -> {:ok, "ok"} end
+        })
+
+      chain =
+        LLMChain.new!(%{
+          llm: ChatAnthropic.new!(%{model: "claude-sonnet-4-5-20250929"}),
+          tools: [tool],
+          callbacks: []
+        })
+
+      message =
+        Message.new_assistant!(%{
+          content: nil,
+          tool_calls: [
+            ToolCall.new!(%{call_id: "call_plain", name: "plain_tool", arguments: %{}})
+          ]
+        })
+
+      chain = LLMChain.add_message(chain, message)
+      updated_chain = LLMChain.execute_tool_calls(chain)
+
+      # Last message should be the tool result, no errors raised.
+      assert %Message{role: :tool} = List.last(updated_chain.messages)
+    end
+
+    test "fires for tools executed via execute_tool_calls_with_decisions/3" do
+      test_pid = self()
+
+      tool =
+        Function.new!(%{
+          name: "decided_tool",
+          description: "Run via decisions path",
+          parameters_schema: %{type: "object", properties: %{}},
+          function: fn _args, _ctx -> {:ok, "ok"} end
+        })
+
+      callbacks = %{
+        on_tool_pre_execution: fn _chain, tool_call, _function ->
+          send(test_pid, {:pre, tool_call.name, tool_call.arguments})
+        end
+      }
+
+      chain =
+        LLMChain.new!(%{
+          llm: ChatAnthropic.new!(%{model: "claude-sonnet-4-5-20250929"}),
+          tools: [tool],
+          callbacks: [callbacks]
+        })
+
+      tool_call =
+        ToolCall.new!(%{call_id: "call_dec", name: "decided_tool", arguments: %{"x" => 1}})
+
+      _ =
+        LLMChain.execute_tool_calls_with_decisions(
+          chain,
+          [tool_call],
+          [%{type: :approve}]
+        )
+
+      assert_received {:pre, "decided_tool", %{"x" => 1}}
+    end
+
+    test "fires with edited arguments in the :edit decision path" do
+      test_pid = self()
+
+      tool =
+        Function.new!(%{
+          name: "decided_tool",
+          description: "Run via decisions path with edits",
+          parameters_schema: %{type: "object", properties: %{}},
+          function: fn _args, _ctx -> {:ok, "ok"} end
+        })
+
+      callbacks = %{
+        on_tool_pre_execution: fn _chain, tool_call, _function ->
+          send(test_pid, {:pre, tool_call.arguments})
+        end
+      }
+
+      chain =
+        LLMChain.new!(%{
+          llm: ChatAnthropic.new!(%{model: "claude-sonnet-4-5-20250929"}),
+          tools: [tool],
+          callbacks: [callbacks]
+        })
+
+      tool_call =
+        ToolCall.new!(%{call_id: "call_edit", name: "decided_tool", arguments: %{"x" => 1}})
+
+      _ =
+        LLMChain.execute_tool_calls_with_decisions(
+          chain,
+          [tool_call],
+          [%{type: :edit, arguments: %{"x" => 99}}]
+        )
+
+      assert_received {:pre, %{"x" => 99}}
+    end
+  end
+
+  describe "on_tool_execution_exception" do
+    defp raising_chain(callbacks, opts \\ []) do
+      tool =
+        Function.new!(
+          Enum.into(opts, %{
+            name: "raising_tool",
+            description: "Always raises",
+            parameters_schema: %{type: "object", properties: %{}},
+            function: fn _args, _ctx -> raise RuntimeError, "tool blew up" end
+          })
+        )
+
+      LLMChain.new!(%{
+        llm: ChatAnthropic.new!(%{model: "claude-sonnet-4-5-20250929"}),
+        tools: [tool],
+        callbacks: [callbacks]
+      })
+    end
+
+    defp tool_call_message(call_id) do
+      Message.new_assistant!(%{
+        content: "calling",
+        tool_calls: [
+          ToolCall.new!(%{call_id: call_id, name: "raising_tool", arguments: %{}})
+        ]
+      })
+    end
+
+    defp exception_callbacks(test_pid) do
+      %{
+        on_tool_execution_exception: fn _chain, tool_call, exception, stacktrace ->
+          send(test_pid, {:exception, tool_call.name, exception, stacktrace})
+        end,
+        on_tool_execution_failed: fn _chain, tool_call, error ->
+          send(test_pid, {:failed, tool_call.name, error})
+        end,
+        on_tool_execution_completed: fn _chain, tool_call, _result ->
+          send(test_pid, {:completed, tool_call.name})
+        end
+      }
+    end
+
+    test "fires with the exception and stacktrace for a sync tool" do
+      test_pid = self()
+
+      updated_chain =
+        exception_callbacks(test_pid)
+        |> raising_chain()
+        |> LLMChain.add_message(tool_call_message("call_sync"))
+        |> LLMChain.execute_tool_calls()
+
+      assert_received {:exception, "raising_tool", %RuntimeError{message: "tool blew up"},
+                       stacktrace}
+
+      assert [_ | _] = stacktrace
+
+      # The lifecycle callback still fires, with the message the model sees.
+      assert_received {:failed, "raising_tool", failed_content}
+      assert [%LangChain.Message.ContentPart{type: :text, content: text}] = failed_content
+      assert text =~ "RuntimeError"
+      refute_received {:completed, "raising_tool"}
+
+      assert [%{is_error: true, is_exception: true, exception: {%RuntimeError{}, [_ | _]}}] =
+               updated_chain.last_message.tool_results
+    end
+
+    test "fires in the calling process for an async tool" do
+      test_pid = self()
+
+      updated_chain =
+        exception_callbacks(test_pid)
+        |> raising_chain(async: true)
+        |> LLMChain.add_message(tool_call_message("call_async"))
+        |> LLMChain.execute_tool_calls()
+
+      assert_received {:exception, "raising_tool", %RuntimeError{message: "tool blew up"},
+                       [_ | _]}
+
+      assert [%{is_exception: true, exception: {%RuntimeError{}, [_ | _]}}] =
+               updated_chain.last_message.tool_results
+    end
+
+    test "fires for an approved tool in human review" do
+      test_pid = self()
+
+      tool_call =
+        ToolCall.new!(%{call_id: "call_hitl", name: "raising_tool", arguments: %{}})
+
+      updated_chain =
+        exception_callbacks(test_pid)
+        |> raising_chain()
+        |> LLMChain.execute_tool_calls_with_decisions([tool_call], [%{type: :approve}])
+
+      assert_received {:exception, "raising_tool", %RuntimeError{message: "tool blew up"},
+                       [_ | _]}
+
+      assert [%{is_exception: true}] = updated_chain.last_message.tool_results
+    end
+
+    test "fires for an edited tool call in human review" do
+      test_pid = self()
+
+      tool_call =
+        ToolCall.new!(%{call_id: "call_edited", name: "raising_tool", arguments: %{}})
+
+      decisions = [%{type: :edit, args: %{"x" => 1}}]
+
+      updated_chain =
+        exception_callbacks(test_pid)
+        |> raising_chain()
+        |> LLMChain.execute_tool_calls_with_decisions([tool_call], decisions)
+
+      assert_received {:exception, "raising_tool", %RuntimeError{message: "tool blew up"},
+                       [_ | _]}
+
+      assert [%{is_exception: true}] = updated_chain.last_message.tool_results
+    end
+
+    test "fires when a :parse_args parser raises" do
+      test_pid = self()
+
+      tool =
+        Function.new!(%{
+          name: "raising_tool",
+          parse_args: fn _args -> raise ArgumentError, "unparseable" end,
+          function: fn _args, _ctx -> {:ok, "unreachable"} end
+        })
+
+      updated_chain =
+        LLMChain.new!(%{
+          llm: ChatAnthropic.new!(%{model: "claude-sonnet-4-5-20250929"}),
+          tools: [tool],
+          callbacks: [exception_callbacks(test_pid)]
+        })
+        |> LLMChain.add_message(tool_call_message("call_parse"))
+        |> LLMChain.execute_tool_calls()
+
+      assert_received {:exception, "raising_tool", %ArgumentError{message: "unparseable"},
+                       [_ | _]}
+
+      assert [%{is_exception: true}] = updated_chain.last_message.tool_results
+    end
+
+    test "does not fire for an error the tool returns deliberately" do
+      test_pid = self()
+
+      tool =
+        Function.new!(%{
+          name: "returns_error",
+          function: fn _args, _ctx -> {:error, "not found"} end
+        })
+
+      updated_chain =
+        LLMChain.new!(%{
+          llm: ChatAnthropic.new!(%{model: "claude-sonnet-4-5-20250929"}),
+          tools: [tool],
+          callbacks: [exception_callbacks(test_pid)]
+        })
+        |> LLMChain.add_message(
+          Message.new_assistant!(%{
+            tool_calls: [
+              ToolCall.new!(%{call_id: "call_err", name: "returns_error", arguments: %{}})
+            ]
+          })
+        )
+        |> LLMChain.execute_tool_calls()
+
+      assert_received {:failed, "returns_error", _content}
+      refute_received {:exception, "returns_error", _exception, _stacktrace}
+
+      assert [%{is_error: true, is_exception: false, exception: nil}] =
+               updated_chain.last_message.tool_results
+    end
+
+    test "does not fire for a tool call naming a tool that does not exist" do
+      test_pid = self()
+
+      updated_chain =
+        exception_callbacks(test_pid)
+        |> raising_chain()
+        |> LLMChain.add_message(
+          Message.new_assistant!(%{
+            tool_calls: [
+              ToolCall.new!(%{call_id: "call_missing", name: "nope", arguments: %{}})
+            ]
+          })
+        )
+        |> LLMChain.execute_tool_calls()
+
+      assert_received {:failed, "nope", _content}
+      refute_received {:exception, "nope", _exception, _stacktrace}
+
+      assert [%{is_error: true, is_exception: false}] = updated_chain.last_message.tool_results
+    end
+
+    test "does not fire for a tool rejected in human review" do
+      test_pid = self()
+
+      tool_call =
+        ToolCall.new!(%{call_id: "call_reject", name: "raising_tool", arguments: %{}})
+
+      updated_chain =
+        exception_callbacks(test_pid)
+        |> raising_chain()
+        |> LLMChain.execute_tool_calls_with_decisions([tool_call], [%{type: :reject}])
+
+      assert_received {:failed, "raising_tool", _content}
+      refute_received {:exception, "raising_tool", _exception, _stacktrace}
+
+      assert [%{is_exception: false}] = updated_chain.last_message.tool_results
+    end
+  end
+
+  describe "display_text_from_args" do
+    import ExUnit.CaptureLog
+
+    alias LangChain.MessageDelta
+
+    defp labelling_tool(resolver) do
+      Function.new!(%{
+        name: "search_software",
+        description: "Search software",
+        display_text: "Searching software",
+        display_text_from_args: resolver,
+        parameters_schema: %{
+          type: "object",
+          properties: %{query: %{type: "string"}},
+          required: ["query"]
+        },
+        function: fn _args, _ctx -> {:ok, "found"} end
+      })
+    end
+
+    defp search_label(%{"query" => query}), do: "Searching for #{query}"
+
+    defp labelling_chain(tool) do
+      test_pid = self()
+
+      callbacks = %{
+        on_tool_call_identified: fn _chain, tool_call, _function ->
+          send(test_pid, {:identified, tool_call.call_id, tool_call.display_text})
+        end,
+        on_tool_execution_started: fn _chain, tool_call, _function ->
+          send(test_pid, {:started, tool_call.call_id, tool_call.display_text})
+        end
+      }
+
+      LLMChain.new!(%{
+        llm: ChatAnthropic.new!(%{model: "claude-sonnet-4-5-20250929"}),
+        tools: [tool],
+        callbacks: [callbacks]
+      })
+    end
+
+    # Streams a call to `search_software` with `query`, then completes the
+    # message the way a chat model's stream ends.
+    defp stream_search(chain, query) do
+      opening =
+        MessageDelta.new!(%{
+          role: :assistant,
+          status: :incomplete,
+          tool_calls: [
+            ToolCall.new!(%{
+              index: 0,
+              call_id: "call_1",
+              name: "search_software",
+              arguments: "{\"query\":"
+            })
+          ]
+        })
+
+      closing =
+        MessageDelta.new!(%{
+          role: :assistant,
+          status: :complete,
+          tool_calls: [ToolCall.new!(%{index: 0, arguments: ~s("#{query}"})})]
+        })
+
+      chain = chain |> LLMChain.merge_delta(opening) |> LLMChain.merge_delta(closing)
+      {:ok, chain} = LLMChain.delta_to_message_when_complete(chain)
+      chain
+    end
+
+    defp whole_search_message(query) do
+      Message.new_assistant!(%{
+        tool_calls: [
+          ToolCall.new!(%{
+            call_id: "call_1",
+            name: "search_software",
+            arguments: %{"query" => query}
+          })
+        ]
+      })
+    end
+
+    test "a streamed call is relabelled from its arguments when the message completes" do
+      chain =
+        labelling_tool(&search_label/1)
+        |> labelling_chain()
+        |> stream_search("Chrome")
+
+      assert_received {:identified, "call_1", "Searching software"}
+      assert_received {:identified, "call_1", "Searching for Chrome"}
+      refute_received {:identified, _, _}
+
+      assert %Message{tool_calls: [%ToolCall{display_text: "Searching for Chrome"}]} =
+               chain.last_message
+    end
+
+    test "a call received whole is identified once, with the label from its arguments" do
+      chain =
+        labelling_tool(&search_label/1)
+        |> labelling_chain()
+        |> LLMChain.process_message(whole_search_message("Chrome"))
+
+      assert_received {:identified, "call_1", "Searching for Chrome"}
+      refute_received {:identified, _, _}
+
+      assert %Message{tool_calls: [%ToolCall{display_text: "Searching for Chrome"}]} =
+               chain.last_message
+    end
+
+    test "tool execution starts with the label from the arguments" do
+      labelling_tool(&search_label/1)
+      |> labelling_chain()
+      |> stream_search("Chrome")
+      |> LLMChain.execute_tool_calls()
+
+      assert_received {:started, "call_1", "Searching for Chrome"}
+    end
+
+    for {description, result} <- [
+          {"nil", nil},
+          {"an empty string", ""},
+          {"only whitespace", "   "},
+          {"a non-string", :not_a_label}
+        ] do
+      test "a resolver returning #{description} keeps the static label" do
+        result = unquote(Macro.escape(result))
+
+        chain =
+          labelling_tool(fn _args -> result end)
+          |> labelling_chain()
+          |> stream_search("Chrome")
+
+        assert_received {:identified, "call_1", "Searching software"}
+        refute_received {:identified, _, _}
+
+        assert %Message{tool_calls: [%ToolCall{display_text: "Searching software"}]} =
+                 chain.last_message
+      end
+    end
+
+    test "a resolver that raises keeps the static label and the run continues" do
+      log =
+        capture_log(fn ->
+          chain =
+            labelling_tool(fn _args -> raise "boom" end)
+            |> labelling_chain()
+            |> stream_search("Chrome")
+
+          assert %Message{tool_calls: [%ToolCall{display_text: "Searching software"}]} =
+                   chain.last_message
+
+          LLMChain.execute_tool_calls(chain)
+        end)
+
+      assert log =~ "search_software :display_text_from_args raised an exception"
+      assert_received {:identified, "call_1", "Searching software"}
+      refute_received {:identified, _, _}
+      assert_received {:started, "call_1", "Searching software"}
+    end
+
+    test "the resolved label is trimmed" do
+      chain =
+        labelling_tool(fn _args -> "  Searching for Chrome \n" end)
+        |> labelling_chain()
+        |> stream_search("Chrome")
+
+      assert %Message{tool_calls: [%ToolCall{display_text: "Searching for Chrome"}]} =
+               chain.last_message
+    end
+
+    test "a resolved label equal to the static one is not announced again" do
+      labelling_tool(fn _args -> "Searching software" end)
+      |> labelling_chain()
+      |> stream_search("Chrome")
+
+      assert_received {:identified, "call_1", "Searching software"}
+      refute_received {:identified, _, _}
+    end
+
+    test "a labelled call added with add_message/2 keeps its label and is not announced" do
+      message =
+        Message.new_assistant!(%{
+          tool_calls: [
+            ToolCall.new!(%{
+              call_id: "call_1",
+              name: "search_software",
+              arguments: %{"query" => "Chrome"},
+              display_text: "Restored label"
+            })
+          ]
+        })
+
+      chain =
+        labelling_tool(&search_label/1)
+        |> labelling_chain()
+        |> LLMChain.add_message(message)
+
+      refute_received {:identified, _, _}
+
+      assert %Message{tool_calls: [%ToolCall{display_text: "Restored label"}]} =
+               chain.last_message
+    end
+
+    test "a tool without a resolver keeps its static label" do
+      tool =
+        Function.new!(%{
+          name: "search_software",
+          description: "Search software",
+          display_text: "Searching software",
+          parameters_schema: %{type: "object", properties: %{}},
+          function: fn _args, _ctx -> {:ok, "found"} end
+        })
+
+      chain = tool |> labelling_chain() |> stream_search("Chrome")
+
+      assert_received {:identified, "call_1", "Searching software"}
+      refute_received {:identified, _, _}
+
+      assert %Message{tool_calls: [%ToolCall{display_text: "Searching software"}]} =
+               chain.last_message
+    end
+  end
+end

@@ -1,11 +1,13 @@
 defmodule LangChain.ChatModels.ChatMistralAITest do
   use LangChain.BaseCase
+  use Mimic
 
   alias LangChain.ChatModels.ChatMistralAI
   alias LangChain.Message
   alias LangChain.MessageDelta
   alias LangChain.Message.ContentPart
   alias LangChain.Message.ToolCall
+  alias LangChain.Message.ToolResult
   alias LangChain.LangChainError
   alias LangChain.TokenUsage
   alias LangChain.Function
@@ -40,6 +42,27 @@ defmodule LangChain.ChatModels.ChatMistralAITest do
 
       assert model.endpoint == override_url
     end
+
+    test "supports verbose_api option" do
+      model = ChatMistralAI.new!(%{model: "mistral-tiny", verbose_api: true})
+      assert model.verbose_api == true
+
+      model = ChatMistralAI.new!(%{model: "mistral-tiny", verbose_api: false})
+      assert model.verbose_api == false
+    end
+
+    test "supports passing parallel_tool_calls" do
+      # defaults to true (Mistral API default)
+      %ChatMistralAI{} = mistral_ai = ChatMistralAI.new!(%{"model" => "mistral-tiny"})
+      assert mistral_ai.parallel_tool_calls == true
+
+      # can override the default to false
+      %ChatMistralAI{} =
+        mistral_ai =
+        ChatMistralAI.new!(%{"model" => "mistral-tiny", "parallel_tool_calls" => false})
+
+      assert mistral_ai.parallel_tool_calls == false
+    end
   end
 
   describe "for_api/3" do
@@ -69,8 +92,21 @@ defmodule LangChain.ChatModels.ChatMistralAITest do
                  stream: false,
                  max_tokens: 100,
                  safe_prompt: true,
-                 random_seed: 42
+                 random_seed: 42,
+                 parallel_tool_calls: true
                }
+    end
+
+    test "generates a map for an API call with parallel_tool_calls set to false" do
+      {:ok, mistral_ai} =
+        ChatMistralAI.new(%{
+          model: "mistral-tiny",
+          parallel_tool_calls: false
+        })
+
+      data = ChatMistralAI.for_api(mistral_ai, [], [])
+      assert data.model == "mistral-tiny"
+      assert data.parallel_tool_calls == false
     end
 
     test "generates a map containing user and assistant messages", %{mistral_ai: mistral_ai} do
@@ -88,6 +124,92 @@ defmodule LangChain.ChatModels.ChatMistralAITest do
       assert get_in(data, [:messages, Access.at(0), "content"]) == user_message
       assert get_in(data, [:messages, Access.at(1), "role"]) == :assistant
       assert get_in(data, [:messages, Access.at(1), "content"]) == assistant_message
+    end
+
+    test "converts ToolResult with string content correctly", %{mistral_ai: mistral_ai} do
+      tool_result = ToolResult.new!(%{tool_call_id: "call_123", content: "Hello World!"})
+
+      result = ChatMistralAI.for_api(mistral_ai, tool_result)
+
+      assert result == %{
+               "role" => :tool,
+               "tool_call_id" => "call_123",
+               "content" => "Hello World!"
+             }
+    end
+
+    test "converts ToolResult with ContentParts to string", %{mistral_ai: mistral_ai} do
+      tool_result =
+        ToolResult.new!(%{
+          tool_call_id: "call_456",
+          content: [ContentPart.text!("Result: 42"), ContentPart.text!(" and more")]
+        })
+
+      result = ChatMistralAI.for_api(mistral_ai, tool_result)
+
+      # ContentPart.parts_to_string/1 joins parts with "\n\n"
+      assert result == %{
+               "role" => :tool,
+               "tool_call_id" => "call_456",
+               "content" => "Result: 42\n\n and more"
+             }
+    end
+
+    test "converts Message with tool role and ContentParts to list of tool messages", %{
+      mistral_ai: mistral_ai
+    } do
+      tool_result =
+        ToolResult.new!(%{
+          tool_call_id: "call_789",
+          content: [ContentPart.text!("Tool executed successfully")]
+        })
+
+      message = Message.new_tool_result!(%{tool_results: [tool_result]})
+
+      result = ChatMistralAI.for_api(mistral_ai, message)
+
+      # Returns a list of tool messages, one per tool result
+      assert result == [
+               %{
+                 "role" => :tool,
+                 "tool_call_id" => "call_789",
+                 "content" => "Tool executed successfully"
+               }
+             ]
+    end
+
+    test "converts Message with multiple tool results to list of tool messages", %{
+      mistral_ai: mistral_ai
+    } do
+      tool_result_1 =
+        ToolResult.new!(%{
+          tool_call_id: "call_abc",
+          content: "Result 1"
+        })
+
+      tool_result_2 =
+        ToolResult.new!(%{
+          tool_call_id: "call_def",
+          content: "Result 2"
+        })
+
+      message = Message.new_tool_result!(%{tool_results: [tool_result_1, tool_result_2]})
+
+      result = ChatMistralAI.for_api(mistral_ai, message)
+
+      # Each tool result becomes a separate tool message
+      assert result == [
+               %{
+                 "role" => :tool,
+                 "tool_call_id" => "call_abc",
+                 "content" => "Result 1"
+               },
+               %{
+                 "role" => :tool,
+                 "tool_call_id" => "call_def",
+                 "content" => "Result 2"
+               }
+             ]
     end
   end
 
@@ -116,6 +238,62 @@ defmodule LangChain.ChatModels.ChatMistralAITest do
       assert msg.role == :assistant
       assert msg.content == [ContentPart.text!("Hello User!")]
       assert msg.index == 0
+      assert msg.status == :complete
+    end
+
+    test "handles complete message without tool_calls key", %{model: model} do
+      response = %{
+        "choices" => [
+          %{
+            "message" => %{
+              "role" => "assistant",
+              "content" => "Hello User!"
+            },
+            "finish_reason" => "stop",
+            "index" => 0
+          }
+        ],
+        "usage" => %{
+          "prompt_tokens" => 7,
+          "completion_tokens" => 10,
+          "total_tokens" => 17
+        }
+      }
+
+      assert [%Message{} = msg] = ChatMistralAI.do_process_response(model, response)
+      assert msg.role == :assistant
+      assert msg.content == [ContentPart.text!("Hello User!")]
+      assert msg.index == 0
+      assert msg.status == :complete
+    end
+
+    test "handles complete message without tool_calls key and extra fields", %{model: model} do
+      # Simulates Azure Foundry response with content_filter_results
+      response = %{
+        "choices" => [
+          %{
+            "content_filter_results" => %{
+              "hate" => %{"filtered" => false, "severity" => "safe"},
+              "self_harm" => %{"filtered" => false, "severity" => "safe"}
+            },
+            "finish_reason" => "stop",
+            "index" => 0,
+            "message" => %{
+              "content" => "Hello from Azure!",
+              "role" => "assistant"
+            }
+          }
+        ],
+        "usage" => %{
+          "prompt_tokens" => 10,
+          "completion_tokens" => 5,
+          "total_tokens" => 15
+        }
+      }
+
+      assert [%Message{} = msg] = ChatMistralAI.do_process_response(model, response)
+      assert msg.role == :assistant
+      assert msg.content == [ContentPart.text!("Hello from Azure!")]
       assert msg.status == :complete
     end
 
@@ -158,8 +336,151 @@ defmodule LangChain.ChatModels.ChatMistralAITest do
 
       assert delta.role == :assistant
       assert delta.content == "This is the first part of a mes"
+      assert delta.index == 1
+      assert delta.status == :incomplete
+    end
+
+    test "streaming: attaches token usage to the final delta so it reaches telemetry",
+         %{model: model} do
+      # Mistral's terminal streaming chunk carries the final delta in "choices" AND
+      # the token totals in "usage". The usage must be attached to the delta
+      # metadata so `token_usage_from_result` (the LLM-call `:stop` enrich_stop) can
+      # surface it for streamed calls — the streaming counterpart to the
+      # non-streaming `attach_token_usage/2` fix. Without it, streamed Mistral calls
+      # fired the `:on_llm_token_usage` callback but reported no tokens to telemetry.
+      response = %{
+        "choices" => [
+          %{
+            "delta" => %{"role" => "assistant", "content" => "done"},
+            "finish_reason" => "stop",
+            "index" => 0
+          }
+        ],
+        "usage" => %{"prompt_tokens" => 12, "completion_tokens" => 8, "total_tokens" => 20}
+      }
+
+      assert [%MessageDelta{} = delta] = ChatMistralAI.do_process_response(model, response)
+      assert %TokenUsage{input: 12, output: 8} = TokenUsage.get(delta)
+
+      # ...and therefore the enrich_stop path that feeds the :stop telemetry event
+      # and OTEL span finds it.
+      assert %{token_usage: %TokenUsage{input: 12, output: 8}} =
+               LangChain.ChatModels.ChatModel.token_usage_from_result({:ok, [delta]})
+    end
+
+    test "handles receiving MessageDeltas with thinking content", %{model: model} do
+      response = %{
+        "choices" => [
+          %{
+            "delta" => %{
+              "role" => "assistant",
+              "content" => [
+                %{
+                  "type" => "thinking",
+                  "thinking" => [
+                    %{"type" => "text", "text" => "Let me think about this"}
+                  ]
+                }
+              ]
+            },
+            "finish_reason" => nil,
+            "index" => 0
+          }
+        ]
+      }
+
+      assert [%MessageDelta{} = delta] =
+               ChatMistralAI.do_process_response(model, response)
+
+      assert delta.role == :assistant
+      assert %ContentPart{type: :thinking, content: "Let me think about this"} = delta.content
       assert delta.index == 0
       assert delta.status == :incomplete
+    end
+
+    test "handles receiving MessageDeltas with multiple thinking text parts", %{model: model} do
+      response = %{
+        "choices" => [
+          %{
+            "delta" => %{
+              "role" => "assistant",
+              "content" => [
+                %{
+                  "type" => "thinking",
+                  "thinking" => [
+                    %{"type" => "text", "text" => "First part "},
+                    %{"type" => "text", "text" => "second part"}
+                  ]
+                }
+              ]
+            },
+            "finish_reason" => nil,
+            "index" => 0
+          }
+        ]
+      }
+
+      assert [%MessageDelta{} = delta] =
+               ChatMistralAI.do_process_response(model, response)
+
+      assert delta.role == :assistant
+      assert %ContentPart{type: :thinking, content: "First part second part"} = delta.content
+      assert delta.index == 0
+      assert delta.status == :incomplete
+    end
+
+    test "handles receiving MessageDeltas with text content in list format", %{model: model} do
+      response = %{
+        "choices" => [
+          %{
+            "delta" => %{
+              "role" => "assistant",
+              "content" => [
+                %{
+                  "type" => "text",
+                  "text" => "This is regular text"
+                }
+              ]
+            },
+            "finish_reason" => nil,
+            "index" => 0
+          }
+        ]
+      }
+
+      assert [%MessageDelta{} = delta] =
+               ChatMistralAI.do_process_response(model, response)
+
+      assert delta.role == :assistant
+      assert %ContentPart{type: :text, content: "This is regular text"} = delta.content
+      # Text content at index 0 is shifted to index 1 to avoid merging with thinking at index 0
+      assert delta.index == 1
+      assert delta.status == :incomplete
+    end
+
+    test "handles delta with finish_reason='tool_calls' but no tool_calls", %{model: model} do
+      # This simulates the Mistral streaming bug where finish_reason="tool_calls"
+      # but no actual tool_calls are present in the delta
+      response = %{
+        "choices" => [
+          %{
+            "delta" => %{
+              "role" => "assistant",
+              "content" => "some malformed content"
+            },
+            "finish_reason" => "tool_calls",
+            "index" => 0
+          }
+        ]
+      }
+
+      assert [{:error, %LangChainError{} = error}] =
+               ChatMistralAI.do_process_response(model, response)
+
+      assert error.type == "invalid_tool_calls"
+
+      assert error.message =~
+               "Mistral API returned finish_reason='tool_calls' in delta but tool_calls is empty"
     end
 
     test "handles API error messages", %{model: model} do
@@ -291,6 +612,30 @@ defmodule LangChain.ChatModels.ChatMistralAITest do
       assert error.type == "changeset"
       assert error.message =~ "invalid json"
     end
+
+    test "handles empty tool_calls array when finish_reason is 'tool_calls'", %{
+      model: model
+    } do
+      response = %{
+        "choices" => [
+          %{
+            "message" => %{
+              "role" => "assistant",
+              "content" => "some content",
+              "tool_calls" => []
+            },
+            "finish_reason" => "tool_calls",
+            "index" => 0
+          }
+        ]
+      }
+
+      assert [{:error, %LangChainError{} = error}] =
+               ChatMistralAI.do_process_response(model, response)
+
+      assert error.type == "invalid_tool_calls"
+      assert error.message =~ "finish_reason='tool_calls' but tool_calls is empty"
+    end
   end
 
   describe "do_process_response/2 with token usage" do
@@ -321,6 +666,66 @@ defmodule LangChain.ChatModels.ChatMistralAITest do
     end
   end
 
+  describe "call/3 token usage persistence (regression)" do
+    setup :verify_on_exit!
+
+    # Regression for the Mistral-specific fix: Mistral fires the
+    # `:on_llm_token_usage` callback but historically did NOT persist usage onto
+    # the returned message metadata. As a result token usage never reached the
+    # `[:langchain, :llm, :call, :stop]` telemetry (via the
+    # `enrich_stop`/`token_usage_from_result` path) or the OTEL span. The
+    # `attach_token_usage/2` step in `do_api_request` fixes it.
+    test "non-streaming call persists token usage onto the message and stop event" do
+      test_pid = self()
+
+      model = ChatMistralAI.new!(%{model: "mistral-tiny", api_key: "test-key"})
+
+      response_body = %{
+        "choices" => [
+          %{
+            "message" => %{
+              "role" => "assistant",
+              "content" => "Hello from Mistral!",
+              "tool_calls" => []
+            },
+            "finish_reason" => "stop",
+            "index" => 0
+          }
+        ],
+        "usage" => %{
+          "prompt_tokens" => 7,
+          "completion_tokens" => 10,
+          "total_tokens" => 17
+        }
+      }
+
+      expect(Req, :post, fn _req ->
+        {:ok, %Req.Response{status: 200, body: response_body}}
+      end)
+
+      :telemetry.attach(
+        "test-mistral-token-usage-stop",
+        [:langchain, :llm, :call, :stop],
+        fn _name, _measurements, metadata, _config ->
+          send(test_pid, {:stop, metadata})
+        end,
+        nil
+      )
+
+      assert {:ok, [%Message{} = message]} =
+               ChatMistralAI.call(model, [Message.new_user!("Hi")], [])
+
+      # Usage is now on the returned message metadata...
+      assert %TokenUsage{input: 7, output: 10} = TokenUsage.get(message)
+
+      # ...and therefore reaches the LLM call :stop telemetry event.
+      assert_received {:stop, stop_metadata}
+      assert %TokenUsage{input: 7, output: 10} = stop_metadata.token_usage
+
+      :telemetry.detach("test-mistral-token-usage-stop")
+    end
+  end
+
   describe "serialize_config/2" do
     test "does not include the API key or callbacks" do
       model = ChatMistralAI.new!(%{model: "mistral-tiny"})
@@ -328,6 +733,12 @@ defmodule LangChain.ChatModels.ChatMistralAITest do
       assert result["version"] == 1
       refute Map.has_key?(result, "api_key")
       refute Map.has_key?(result, "callbacks")
+    end
+
+    test "includes verbose_api field" do
+      model = ChatMistralAI.new!(%{model: "mistral-tiny", verbose_api: true})
+      result = ChatMistralAI.serialize_config(model)
+      assert result["verbose_api"] == true
     end
 
     test "creates expected map" do
@@ -356,7 +767,8 @@ defmodule LangChain.ChatModels.ChatMistralAITest do
                "top_p" => 1.0,
                "version" => 1,
                "json_response" => false,
-               "json_schema" => nil
+               "json_schema" => nil,
+               "verbose_api" => false
              }
     end
   end
@@ -535,7 +947,8 @@ defmodule LangChain.ChatModels.ChatMistralAITest do
         end
       }
 
-      chat =
+      %ChatMistralAI{} =
+        chat =
         ChatMistralAI.new!(%{
           temperature: 0,
           model: "mistral-small-2503",
@@ -580,7 +993,8 @@ defmodule LangChain.ChatModels.ChatMistralAITest do
         end
       }
 
-      chat =
+      %ChatMistralAI{} =
+        chat =
         ChatMistralAI.new!(%{
           temperature: 0,
           model: "mistral-small-2503",

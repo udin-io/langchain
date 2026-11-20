@@ -5,8 +5,14 @@ defmodule LangChain.Message.ToolResult do
   application back to the AI.
 
   ## Content
-  The `content` can be a string or a list of ContentParts for multi-modal
-  responses (text, images, etc.) that gets returned to the LLM as the result.
+  The `content` is a list of `LangChain.Message.ContentPart` structs returned to
+  the LLM as the result. It can hold text, images, and other multi-modal parts.
+
+  `new/1` and `new!/1` also accept a string or a single `ContentPart` and convert
+  it to a list of content parts. Code that sets `content` directly on the struct,
+  as in `%ToolResult{result | content: ...}`, skips that conversion and must
+  supply the list itself, for example `[ContentPart.text!("done")]`. Some chat
+  model encoders accept only content parts and raise on a string.
 
   ## Processed Content
   The `processed_content` field is optional. When you want to keep the results
@@ -16,13 +22,54 @@ defmodule LangChain.Message.ToolResult do
   Advanced use: You can use the `options` field for LLM-specific features like
   cache control.
 
+  ## Errors and rescued exceptions
+
+  `is_error` marks any failed result: a tool that returned `{:error, reason}`, a
+  tool call naming a tool that doesn't exist, a rejected human review, or a tool
+  that raised.
+
+  `is_exception` narrows that to results where LangChain rescued an exception, and
+  `exception` holds the `{exception, stacktrace}` pair it rescued. The exception is
+  never sent to the LLM — only the formatted message in `content` is — and it is
+  never persisted: `exception` is a virtual field, so a result restored from
+  storage carries `is_exception: true` with `exception: nil`. Code that needs the
+  exception itself should read it during the run, most conveniently through the
+  `:on_tool_execution_exception` callback.
+
+  Because `content` carries LangChain's formatted exception message and source
+  location, tools should not put secrets in exception messages.
+
+  ## Refusals
+
+  `is_refusal` narrows `is_error` to a call that was turned down before it changed
+  anything, so resending a corrected call is safe. A refusal is always also an
+  error, so every check of `is_error` still sees it as one. LangChain sets it for
+  arguments the required-key check or a `:parse_args` parser turned down, for a
+  call naming a tool that doesn't exist, and for a rejected human review reported
+  as an error. A tool sets it on a `ToolResult` it returns, and should do so only
+  when it has written nothing.
+
+  A rescued exception is never a refusal: code that raised may have done part of
+  its work. A refusal is also not a review denial. A call turned away by an
+  `:on_tool_call_review` handler reports `is_error: false`, because it is a
+  decision about the call, not a fault in it.
+
+  ## Message expansion
+
+  `message_expansion` holds a `LangChain.MessageExpansion`: a request to insert
+  messages into the conversation before the next LLM call, and to trim what this
+  result keeps once they are in. It is applied by
+  `LangChain.Chains.LLMChain.Mode.Steps.expand_tool_results/2`, so it does
+  nothing under a mode that does not compose that step. Like `interrupt_data` it
+  is virtual: it is never sent to the LLM and does not survive storage, which is
+  what keeps a restored conversation from inserting the same material twice.
+
   To do this, the Elixir function's result should be a `{:ok, "String response
   for LLM", native_elixir_data}`. See `LangChain.Function` for details and
   examples.
   """
   use Ecto.Schema
   import Ecto.Changeset
-  require Logger
   alias __MODULE__
   alias LangChain.LangChainError
   alias LangChain.Utils
@@ -35,7 +82,8 @@ defmodule LangChain.Message.ToolResult do
     field :tool_call_id, :string
     # the name of the tool that was run.
     field :name, :string
-    # the content returned to the LLM/AI.
+    # the content returned to the LLM/AI: a list of ContentParts. `new/1` converts
+    # a given string; a direct struct update must supply the list itself.
     field :content, :any, virtual: true
     # optional stored results of tool result
     field :processed_content, :any, virtual: true
@@ -43,6 +91,21 @@ defmodule LangChain.Message.ToolResult do
     field :display_text, :string
     # flag if the result is an error
     field :is_error, :boolean, default: false
+    # flag if the result came from an exception LangChain rescued
+    field :is_exception, :boolean, default: false
+    # flag if the call was turned down before it changed anything. Always also
+    # an error.
+    field :is_refusal, :boolean, default: false
+    # the rescued `{exception, stacktrace}`. Not sent to the LLM, virtual only, and
+    # absent from a result restored from storage even when `is_exception` is true.
+    field :exception, :any, virtual: true
+    # flag indicating this tool result represents a paused/interrupted tool
+    field :is_interrupt, :boolean, default: false
+    # opaque interrupt data (not sent to LLM, virtual only)
+    field :interrupt_data, :any, virtual: true
+    # a `LangChain.MessageExpansion` this result asks to have applied to the
+    # conversation before the next LLM call. Not sent to the LLM, virtual only.
+    field :message_expansion, :any, virtual: true
     # options potentially LLM specific (i.e. cache control for Anthropic)
     field :options, :any, virtual: true
   end
@@ -57,6 +120,12 @@ defmodule LangChain.Message.ToolResult do
     :processed_content,
     :display_text,
     :is_error,
+    :is_exception,
+    :is_refusal,
+    :exception,
+    :is_interrupt,
+    :interrupt_data,
+    :message_expansion,
     :options
   ]
   @create_fields @update_fields
@@ -89,6 +158,21 @@ defmodule LangChain.Message.ToolResult do
   end
 
   defp common_validations(changeset) do
-    validate_required(changeset, @required_fields)
+    changeset
+    |> validate_required(@required_fields)
+    |> validate_refusal()
+  end
+
+  defp validate_refusal(changeset) do
+    cond do
+      get_field(changeset, :is_refusal) != true ->
+        changeset
+
+      get_field(changeset, :is_exception) == true ->
+        add_error(changeset, :is_refusal, "cannot be set on a rescued exception")
+
+      true ->
+        put_change(changeset, :is_error, true)
+    end
   end
 end

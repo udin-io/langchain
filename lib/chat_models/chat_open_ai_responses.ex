@@ -1,0 +1,2780 @@
+defmodule LangChain.ChatModels.ChatOpenAIResponses do
+  @moduledoc """
+  Represents the OpenAI Responses API
+
+  Parses and validates inputs for making requests to the OpenAI Responses API.
+
+  Converts responses into more specialized `LangChain` data structures.
+
+  ## ContentPart Types
+
+  OpenAI's Responses API supports several types of content parts that can be combined in a single message:
+
+  ### Text Content
+  Basic text content is the default and most common type:
+
+      Message.new_user!("Hello, how are you?")
+
+  ### Image Content
+  OpenAI supports both base64-encoded images and image URLs:
+
+      # Using a base64 encoded image
+      Message.new_user!([
+        ContentPart.text!("What's in this image?"),
+        ContentPart.image!("base64_encoded_image_data", media: :jpg)
+      ])
+
+      # Using an image URL
+      Message.new_user!([
+        ContentPart.text!("Describe this image:"),
+        ContentPart.image_url!("https://example.com/image.jpg")
+      ])
+
+      # Using a file ID (after uploading to OpenAI)
+      Message.new_user!([
+        ContentPart.text!("Describe this image:"),
+        ContentPart.image!("file-1234", type: :file_id)
+      ])
+
+  For images, you can specify the detail level which affects token usage:
+  - `detail: "low"` - Lower resolution, fewer tokens
+  - `detail: "high"` - Higher resolution, more tokens
+  - `detail: "auto"` - Let the model decide
+
+  ### File Content
+  OpenAI supports both base64-encoded files and file IDs:
+
+      # Using a base64 encoded file
+      Message.new_user!([
+        ContentPart.text!("Process this file:"),
+        ContentPart.file!("base64_encoded_file_data",
+          type: :base64,
+          filename: "document.pdf"
+        )
+      ])
+
+      # Using a file ID (after uploading to OpenAI)
+      Message.new_user!([
+        ContentPart.text!("Process this file:"),
+        ContentPart.file!("file-1234", type: :file_id)
+      ])
+
+  ## Callbacks
+
+  See the set of available callbacks: `LangChain.Chains.ChainCallbacks`
+
+  ### Rate Limit API Response Headers
+
+  OpenAI returns rate limit information in the response headers. Those can be
+  accessed using the LLM callback `on_llm_ratelimit_info` like this:
+
+      handlers = %{
+        on_llm_ratelimit_info: fn headers ->
+          IO.inspect(headers)
+        end
+      }
+
+      {:ok, chat} = ChatOpenAIResponses.new(%{callbacks: [handlers]})
+
+  Handlers assigned to the model are fired by the model itself and receive only
+  the event's argument. Handlers assigned to an `LangChain.Chains.LLMChain`
+  receive the chain as an additional first argument.
+
+  When a request is received, something similar to the following will be output
+  to the console.
+
+      %{
+        "x-ratelimit-limit-requests" => ["5000"],
+        "x-ratelimit-limit-tokens" => ["160000"],
+        "x-ratelimit-remaining-requests" => ["4999"],
+        "x-ratelimit-remaining-tokens" => ["159973"],
+        "x-ratelimit-reset-requests" => ["12ms"],
+        "x-ratelimit-reset-tokens" => ["10ms"],
+        "x-request-id" => ["req_1234"]
+      }
+
+  ### Token Usage
+
+  OpenAI returns token usage information as part of the response body. The
+  `LangChain.TokenUsage` is added to the `metadata` of the `LangChain.Message`
+  and `LangChain.MessageDelta` structs that are processed under the `:usage`
+  key.
+
+  The OpenAI documentation instructs to provide the `stream_options` with the
+  `include_usage: true` for the information to be provided.
+
+  The `TokenUsage` data is accumulated for `MessageDelta` structs and the final usage information will be on the `LangChain.Message`.
+
+  NOTE: Of special note is that the `TokenUsage` information is returned once
+  for all "choices" in the response. The `LangChain.TokenUsage` data is added to
+  each message, but if your usage requests multiple choices, you will see the
+  same usage information for each choice but it is duplicated and only one
+  response is meaningful.
+
+  ## Reasoning Continuity
+
+  Reasoning models such as `gpt-5` and the o-series return a `reasoning` output
+  item alongside their text and tool calls. Handing that item back on the next
+  request lets the model resume the reasoning it already did instead of
+  re-deriving it, which matters most inside a tool loop where every tool result
+  is another round trip.
+
+  The item is only replayable when it carries its `encrypted_content`, and the
+  API only returns that when the request asks for it:
+
+      ChatOpenAIResponses.new!(%{
+        model: "gpt-5",
+        include: ["reasoning.encrypted_content"],
+        reasoning: %{effort: :high}
+      })
+
+  With that set, reasoning items are captured off the response and sent back as
+  their own `input` items on subsequent requests. Nothing else is required. A
+  reasoning item that arrived without `encrypted_content` is omitted rather than
+  sent as a stub, so leaving `:include` alone keeps the previous behavior.
+
+  This is the stateless path, and it works whether or not responses are stored.
+  `:previous_response_id` covers the stored case instead, and is unavailable to
+  a Zero Data Retention organization, which the API treats as stateless by
+  definition.
+
+  ## Narration (Assistant Phase)
+
+  A response can hold several assistant `message` items, each labelled with a
+  `phase`. `"commentary"` is the model narrating what it is about to do, often
+  just before a tool call. `"final_answer"` is its reply. Each item becomes its
+  own text `LangChain.Message.ContentPart`, marked as `"narration"` or
+  `"answer"` (see `LangChain.Message.ContentPart.utterance/1`). An item with no
+  `phase` leaves its part unmarked.
+
+  When streaming, the marker is set from the item's opening
+  `response.output_item.added` event, so a consumer knows a part is narration
+  from its first token.
+
+  A message whose text is entirely narration and has no tool calls is not an
+  answer (`LangChain.Message.narration?/1`), so `LangChain.Chains.LLMChain`
+  calls the model again to finish its turn.
+
+  A completed response that carries `end_turn` states the turn boundary
+  outright. The value is stored as `metadata[:end_turn]` on the message
+  (`LangChain.Message.end_turn/1`) and decides whether the chain continues,
+  ahead of the narration marker. The public Responses API does not send it
+  today, so most messages have none and the narration rule applies.
+
+  The marker is sent back with assistant history, and the output items go
+  back in the order the API produced them: consecutive text parts with the
+  same marker become one `message` item carrying the matching `phase`, and a
+  reasoning item between two of them stays between them. The
+  model degrades when its own commentary is replayed unlabelled, so the marker
+  should be kept wherever the conversation is stored. Unmarked assistant text
+  is sent as a single `message` item with no `phase`.
+
+  ## Native Tools (Web Search)
+
+  Open AI's Responses API also supports built-in tools. Among those, we support Web Search currently.
+
+  ### Example
+  To optionally permit the model to use web search:
+
+      native_web_tool = NativeTool.new!(%{name: "web_search_preview", configuration: %{}})
+
+      %{llm: ChatOpenAIResponses.new!(%{model: "gpt-4o"})}
+      |> LLMChain.new!()
+      |> LLMChain.add_message(Message.new_user!("Can you tell me something that happened today in Texas?"))
+      |> LLMChain.add_tools(web_tool)
+      |> LLMChain.run()
+
+  You may provide additional configuration per the OpenAI documentation:
+
+      web_config = %{
+        search_context_size: "medium",
+        user_location: %{
+          type: "approximate",
+          city: "Humble",
+          country: "US",
+          region: "Texas",
+          timezone: "America/Chicago"
+        }
+      }
+      native_web_tool = NativeTool.new!(%{name: "web_search_preview", configuration: web_config)
+
+  You may reference a prior web_search_call in subsequent runs as:
+
+      Message.new_assistant!([
+        ContentPart.new!(%{
+          type: :unsupported,
+          options: [
+            id: "ws_123456789", # ID as provided from Open AI
+            status: "completed",
+            type: "web_search_call"
+          ]
+        }),
+        ContentPart.text!("The Astros won today 5-4...")
+      ])
+
+  Note: Not all Open AI models support `web_search_preview`. OpenAI will return an error if you request web_search_preview for when using a model that doesn't support it.
+
+  ## Tool Search
+
+  Functions marked `defer_loading: true` (see "Tool search options" in
+  `LangChain.Function`) are declared on every request but kept out of the
+  model's context until it finds them with OpenAI's hosted search tool. Add
+  the search tool to the chain's tools:
+
+      %{llm: ChatOpenAIResponses.new!(%{model: "gpt-5.4"})}
+      |> LLMChain.new!()
+      |> LLMChain.add_tools([NativeTool.tool_search(), deferred_functions, other_tools])
+
+  - `LangChain.NativeTool.tool_search/1` becomes the `tool_search` tool. The
+    `:variant` option does not apply; OpenAI has one kind of search.
+  - A deferred function without the search tool is an error before the
+    request is sent, because the API rejects it.
+  - Functions that share a `:namespace` option are sent as one `namespace`
+    tool, in the position of the first of them. The API requires a
+    description for every namespace; set `:namespace_description` on one of
+    the functions. Without one, the description is "Tools for <namespace>.".
+    The namespace never changes a function's `name`, so tool calls match the
+    function as declared.
+
+  ### Search items in the conversation
+
+  A search adds `tool_search_call` and `tool_search_output` items to the
+  response. Each becomes a `LangChain.Message.ContentPart` of type
+  `:provider_item` in the position it arrived, and goes back unchanged, in
+  place, on every later request. Keep these parts wherever the conversation
+  is stored.
+
+  A call to a function that a search loaded carries a `namespace`: the
+  namespace's name, or the function's own name when it has none. It is kept
+  in the `LangChain.Message.ToolCall`'s `metadata` under `"namespace"` and
+  sent back with the call. Once the search items are in the history, the API
+  rejects a call that comes back without its namespace.
+
+  This works with `store: false`. The items carry everything the API needs.
+  Client-executed search (`execution: "client"`) is not supported, so a
+  `:tool_reference` part in a tool result is sent as text naming the tool.
+
+  ## Tool Choice
+
+  OpenAI's ChatGPT API supports forcing a tool to be used.
+  - https://platform.openai.com/docs/api-reference/chat/create#chat-create-tool_choice
+
+  This is supported through the `tool_choice` options. It takes a plain Elixir
+  map to provide the configuration.
+
+  By default, the LLM will choose a tool call if a tool is available and it
+  determines it is needed. That's the "auto" mode.
+
+  ### Example
+  For the LLM's response to make a tool call of the "get_weather" function.
+
+      ChatOpenAI.new(%{
+        model: "...",
+        tool_choice: %{"type" => "function", "function" => %{"name" => "get_weather"}}
+      })
+
+  ...or to force a native tool (such as web search):
+
+      ChatOpenAI.new(%{
+        model: "...",
+        tool_choice: "web_search_preview"
+      })
+
+  ## Verbosity
+
+  The `verbosity` option controls the length of the model's response. Accepted
+  values are `"low"`, `"medium"`, and `"high"`. When omitted, the API uses its
+  default behavior.
+
+  This is sent as part of the `text` parameter in the Responses API and can be
+  combined with JSON response formats.
+
+  Only supported for gpt-5 or newer models
+
+  ### Example
+
+      ChatOpenAIResponses.new!(%{model: "gpt-5", verbosity: "low"})
+
+  ## Context Management
+
+  The `context_management` option configures server-side context compaction for
+  long-running conversations. When the rendered token count crosses the
+  threshold, the server compacts the context before continuing inference.
+
+  For example, compact the context after it reaches 200,000 tokens:
+
+      ChatOpenAIResponses.new!(%{
+        context_management: [%{type: "compaction", compact_threshold: 200_000}]
+      })
+
+  `compact_threshold` is optional. When omitted, the server picks a threshold:
+
+      ChatOpenAIResponses.new!(%{context_management: [%{type: "compaction"}]})
+
+  Only the `"compaction"` type is supported today, but entries are passed
+  through to the API as given, so new types and options work without a library
+  change.
+
+  ## Service Tier
+
+  The `service_tier` option asks OpenAI to serve the request with a particular
+  processing tier, such as `"flex"` or `"priority"`:
+
+      ChatOpenAIResponses.new!(%{model: "gpt-5", service_tier: "priority"})
+
+  The tier that actually served the request can differ from the one requested.
+  It is kept in the token usage's `raw` map under `"service_tier"`.
+
+  ## Prompt Caching
+
+  `prompt_cache_key` groups requests for prompt caching. `prompt_cache_options`
+  configures caching on supported models (GPT-5.6 and later):
+
+      ChatOpenAIResponses.new!(%{
+        model: "gpt-5.6",
+        prompt_cache_key: "shared-reference-v1",
+        prompt_cache_options: %{mode: "explicit", ttl: "30m"}
+      })
+
+  Add an explicit breakpoint to a text, image, or file input block through its
+  `ContentPart` options:
+
+      ContentPart.text!("Stable reference material",
+        prompt_cache_breakpoint: %{mode: "explicit"}
+      )
+
+  These options also work on content blocks in tool results. Assistant output
+  text and reasoning items don't support breakpoints. Caching settings are
+  omitted unless supplied. Option maps are passed through to OpenAI, which
+  validates supported values and model availability. `extra_body` can override
+  the request-level settings.
+
+  See the [OpenAI prompt caching guide](https://developers.openai.com/api/docs/guides/prompt-caching)
+  for caching modes, cache lifetimes, and breakpoint limits.
+
+  ## Provider-Specific Parameters
+
+  `extra_body` is a map of values merged into the request body last, so they
+  override anything the model computed. Use it for parameters this module has
+  no field for:
+
+      ChatOpenAIResponses.new!(%{
+        model: "gpt-5",
+        extra_body: %{"safety_identifier" => "user-123"}
+      })
+
+  A `nil` value removes the key from the body. The WebSocket transport always
+  removes `stream`, `background`, `temperature` and `top_p` from the payload,
+  including values supplied through `extra_body`. See
+  `LangChain.Utils.merge_extra_body/2` for the full merge rules.
+
+  ## WebSocket Transport
+
+  Instead of HTTP, requests can be sent over a persistent WebSocket connection
+  for lower latency. Use `connect_websocket!/1` to open a connection and
+  `disconnect_websocket!/1` to close it:
+
+      model =
+        ChatOpenAIResponses.new!(%{model: "gpt-4o"})
+        |> ChatOpenAIResponses.connect_websocket!()
+
+      {:ok, chain} =
+        %{llm: model}
+        |> LLMChain.new!()
+        |> LLMChain.add_message(Message.new_user!("Hello"))
+        |> LLMChain.run()
+
+      ChatOpenAIResponses.disconnect_websocket!(model)
+
+  The WebSocket connection is reused across multiple LLM calls within the same
+  chain run (e.g. multi-turn tool calling with `:while_needs_response`).
+
+  ### Lifecycle Management
+
+  **The application is responsible for managing the WebSocket lifecycle.**
+  `connect_websocket!/1` starts a `LangChain.WebSocket` GenServer via
+  `start_link/1`, linking it to the calling process. The PID is stored in
+  the model struct's `:websocket` field. There is no supervisor, automatic
+  reconnection, or health monitoring built in.
+
+  This means:
+
+  - If the calling process exits, the WebSocket is terminated (process link).
+  - The WebSocket PID cannot be serialized. If the model struct is persisted
+    to a database and restored later, the `:websocket` field will be stale.
+  - The server may close idle connections at any time. There is no automatic
+    reconnection.
+  - There is no retry logic for WebSocket failures (unlike the HTTP transport).
+
+  **The WebSocket transport is best suited for short-lived, synchronous
+  sessions** where you control the full lifecycle. It is not currently safe
+  for long-lived agent processes, human-in-the-loop workflows with
+  interruptions, or any scenario where the model struct is serialized and
+  restored across process boundaries.
+
+  For long-running or interruptible workloads, use the default HTTP transport.
+
+  ### Known Limitation: temperature and top_p
+
+  The `:temperature` and `:top_p` parameters are currently excluded from
+  WebSocket payloads due to an
+  [OpenAI bug](https://community.openai.com/t/1375536) that silently closes
+  the connection when these are sent as decimals. A `Logger.warning` is
+  emitted when these values are dropped. This workaround will be removed
+  once OpenAI resolves the issue.
+
+  ## Connection Retry Behavior
+
+  The `retry_count` option controls how many times a request is retried when
+  a pooled HTTP connection turns out to be stale (server closed it between
+  requests). This is a transport-level issue where retrying with a fresh
+  connection is the correct response.
+
+  **Only closed-connection errors are retried.** Timeouts, rate limits (429),
+  overloaded (529), authentication errors, and invalid requests all return
+  immediately -- they are not problems that a simple retry will fix.
+
+  | `retry_count` | Total HTTP requests |
+  |---|---|
+  | `0` | 1 (no retries) |
+  | `1` | 2 (1 initial + 1 retry) |
+  | `2` (default) | 3 (1 initial + 2 retries) |
+
+  Req's built-in HTTP retry is disabled to prevent the two retry layers from
+  compounding. See [GitHub issue #503](https://github.com/brainlid/langchain/issues/503).
+
+  When running LLM calls from a background job queue (e.g., Oban) that has its
+  own retry logic, set `retry_count: 0` so there are no hidden retries:
+
+      ChatOpenAIResponses.new!(%{model: "...", retry_count: 0})
+
+  """
+  use Ecto.Schema
+  require Logger
+  import Ecto.Changeset
+  alias __MODULE__
+  alias LangChain.Config
+  alias LangChain.ChatModels.ChatModel
+  alias LangChain.PromptTemplate
+  alias LangChain.Message
+  alias LangChain.Message.Citation
+  alias LangChain.Message.ContentPart
+  alias LangChain.Message.ToolCall
+  alias LangChain.Message.ToolResult
+  alias LangChain.TokenUsage
+  alias LangChain.Function
+  alias LangChain.NativeTool
+  alias LangChain.FunctionParam
+  alias LangChain.LangChainError
+  alias LangChain.Utils
+  alias LangChain.MessageDelta
+  alias LangChain.Callbacks
+  alias LangChain.ChatModels.ReasoningOptions
+
+  @behaviour ChatModel
+
+  @current_config_version 1
+
+  # The provider recorded on the items this model keeps for replay. It names
+  # the API, not this module, so items that `LangChain.ChatModels.ChatReqLLM`
+  # keeps from an OpenAI model replay here too, and the other way around.
+  @provider_item_name "openai"
+
+  @tool_search_item_types ["tool_search_call", "tool_search_output"]
+
+  @receive_timeout 60_000
+
+  @primary_key false
+
+  # https://platform.openai.com/docs/api-reference/responses/create
+  embedded_schema do
+    field :receive_timeout, :integer, default: @receive_timeout
+    field :api_key, :string, redact: true
+    field :endpoint, :string, default: "https://api.openai.com/v1/responses"
+
+    field :model, :string, default: "gpt-3.5-turbo"
+
+    field :include, {:array, :string}, default: []
+    field :context_management, {:array, :map}, default: nil
+    # omit instructions becasue langchain assumes statelessness
+    field :max_output_tokens, :integer, default: nil
+    # omit metadata because chat_open_ai also omits it
+    # omit parallel_tool_calls because chat_open_ai also omits it
+    field :previous_response_id, :string, default: nil
+    field :prompt_cache_key, :string, default: nil
+    field :prompt_cache_options, :map, default: nil
+    # Reasoning options for gpt-5 and o-series models
+    embeds_one(:reasoning, ReasoningOptions)
+    # The processing tier to serve the request with. Known values include
+    # "auto", "default", "flex", "scale", "priority" and "fast"; the set changes
+    # over time, so it is not validated here. The tier that actually served the
+    # request is reported in the token usage's `raw` map under "service_tier".
+    field :service_tier, :string
+    field :store, :boolean, default: false
+    field :stream, :boolean, default: false
+    field :temperature, :float, default: nil
+    field :json_response, :boolean, default: false
+    field :json_schema, :map, default: nil
+    field :json_schema_name, :string, default: nil
+
+    # This can be a string or object. We will need to allow ["none", "auto", "required", "file_search", "web_search_preview", and "computer_use_preview"] and take any other string and turn it to %{name: value, type: "function"}
+    field :tool_choice, :any, default: nil, virtual: true
+    field :top_p, :float, default: 1.0
+    field :truncation, :string
+    field :verbosity, :string, default: nil
+    field :user, :string
+
+    field :callbacks, {:array, :map}, default: []
+    field :verbose_api, :boolean, default: false
+
+    # Number of retries on closed-connection errors (stale pool). The initial
+    # request always runs; this controls additional attempts only.
+    field :retry_count, :integer, default: 2
+
+    # Req options to merge into the request.
+    # Refer to `https://hexdocs.pm/req/Req.html#new/1-options` for
+    # `Req.new` supported set of options.
+    field :req_config, :map, default: %{}
+
+    # Provider-specific values merged into the request body last, overriding
+    # anything the model computed. A `nil` value removes that key from the
+    # body. See `LangChain.Utils.merge_extra_body/2` for the merge rules.
+    field :extra_body, :map, default: nil
+
+    # Optional WebSocket transport. When set to a PID of a
+    # `LangChain.WebSocket` process, requests will be sent over the
+    # persistent WebSocket connection instead of HTTP.
+    field :websocket, :any, virtual: true, default: nil
+  end
+
+  @type t :: %ChatOpenAIResponses{}
+
+  # Omits callbacks. Otherwise identical to above.
+  @create_fields [
+    :receive_timeout,
+    :api_key,
+    :endpoint,
+    :model,
+    :include,
+    :context_management,
+    :max_output_tokens,
+    :previous_response_id,
+    :prompt_cache_key,
+    :prompt_cache_options,
+    :store,
+    :stream,
+    :temperature,
+    :json_response,
+    :json_schema,
+    :json_schema_name,
+    :tool_choice,
+    :top_p,
+    :truncation,
+    :verbosity,
+    :user,
+    :verbose_api,
+    :retry_count,
+    :req_config,
+    :service_tier,
+    :extra_body,
+    :websocket,
+    :callbacks
+  ]
+  @required_fields [:endpoint, :model]
+
+  @spec get_api_key(t()) :: String.t()
+  defp get_api_key(%ChatOpenAIResponses{api_key: api_key}) do
+    # if no API key is set default to `""` which will raise a OpenAI API error
+    api_key || Config.resolve(:openai_key, "")
+  end
+
+  @spec get_org_id() :: String.t() | nil
+  defp get_org_id() do
+    Config.resolve(:openai_org_id)
+  end
+
+  @spec get_proj_id() :: String.t() | nil
+  defp get_proj_id() do
+    Config.resolve(:openai_proj_id)
+  end
+
+  @doc """
+  Setup a ChatOpenAI client configuration.
+  """
+  @spec new(attrs :: map()) :: {:ok, t} | {:error, Ecto.Changeset.t()}
+  def new(%{} = attrs \\ %{}) do
+    %ChatOpenAIResponses{}
+    |> cast(attrs, @create_fields)
+    |> cast_embed(:reasoning)
+    |> common_validation()
+    |> apply_action(:insert)
+  end
+
+  @doc """
+  Setup a ChatOpenAI client configuration and return it or raise an error if invalid.
+  """
+  @spec new!(attrs :: map()) :: t() | no_return()
+  def new!(attrs \\ %{}) do
+    case new(attrs) do
+      {:ok, chain} ->
+        chain
+
+      {:error, changeset} ->
+        raise LangChainError, changeset
+    end
+  end
+
+  @doc """
+  Open a `LangChain.WebSocket` connection using the model's endpoint and API key.
+
+  Returns `{:ok, model}` with the `:websocket` field set to the WebSocket PID,
+  or `{:error, reason}` on failure.
+
+  Requires the optional `mint_web_socket` dependency.
+
+  ## Example
+
+      {:ok, model} = ChatOpenAIResponses.connect_websocket(model)
+
+  """
+  @spec connect_websocket(t()) :: {:ok, t()} | {:error, String.t()}
+  if Code.ensure_loaded?(Mint.WebSocket) do
+    def connect_websocket(%ChatOpenAIResponses{} = model) do
+      api_key = model.api_key || Config.resolve(:openai_key, nil)
+
+      if api_key do
+        ws_url =
+          model.endpoint
+          |> String.replace_leading("https://", "wss://")
+          |> String.replace_leading("http://", "ws://")
+
+        case LangChain.WebSocket.start_link(
+               url: ws_url,
+               headers: [{"authorization", "Bearer #{api_key}"}],
+               receive_timeout: model.receive_timeout
+             ) do
+          {:ok, pid} ->
+            {:ok, %{model | websocket: pid}}
+
+          {:error, reason} ->
+            {:error, "Failed to connect WebSocket: #{inspect(reason)}"}
+        end
+      else
+        {:error, "API key is required to open a WebSocket connection"}
+      end
+    end
+  else
+    def connect_websocket(%ChatOpenAIResponses{}) do
+      {:error, "WebSocket support requires the :mint_web_socket dependency"}
+    end
+  end
+
+  @doc """
+  Like `connect_websocket/1` but raises on failure.
+
+  ## Example
+
+      model =
+        ChatOpenAIResponses.new!(%{model: "gpt-4o"})
+        |> ChatOpenAIResponses.connect_websocket!()
+
+      # ... use model in chains ...
+
+      ChatOpenAIResponses.disconnect_websocket!(model)
+
+  """
+  @spec connect_websocket!(t()) :: t() | no_return()
+  if Code.ensure_loaded?(Mint.WebSocket) do
+    def connect_websocket!(%ChatOpenAIResponses{} = model) do
+      case connect_websocket(model) do
+        {:ok, model} -> model
+        {:error, reason} -> raise LangChainError, reason
+      end
+    end
+  else
+    def connect_websocket!(%ChatOpenAIResponses{}) do
+      raise LangChainError, "WebSocket support requires the :mint_web_socket dependency"
+    end
+  end
+
+  @doc """
+  Close the WebSocket connection associated with this model.
+
+  Returns the model with `:websocket` set to `nil`.
+  Safe to call even if the WebSocket is already closed.
+  """
+  @spec disconnect_websocket!(t()) :: t()
+  if Code.ensure_loaded?(Mint.WebSocket) do
+    def disconnect_websocket!(%ChatOpenAIResponses{websocket: pid} = model) when is_pid(pid) do
+      if Process.alive?(pid), do: LangChain.WebSocket.close(pid)
+      %{model | websocket: nil}
+    end
+  else
+    def disconnect_websocket!(%ChatOpenAIResponses{websocket: pid} = model) when is_pid(pid) do
+      %{model | websocket: nil}
+    end
+  end
+
+  def disconnect_websocket!(%ChatOpenAIResponses{} = model), do: model
+
+  defp common_validation(changeset) do
+    changeset
+    |> normalize_context_management()
+    |> validate_required(@required_fields)
+    |> validate_number(:temperature, greater_than_or_equal_to: 0, less_than_or_equal_to: 2)
+    |> validate_number(:top_p, greater_than_or_equal_to: 0, less_than_or_equal_to: 1)
+    |> validate_number(:receive_timeout, greater_than_or_equal_to: 0)
+    |> validate_inclusion(:verbosity, ~w(low medium high))
+    |> validate_context_management()
+  end
+
+  # Accept entries with atom or string keys and normalize to string keys. Keys
+  # other than the documented ones are passed through untouched so that new
+  # options added to the API can be used without a library change.
+  defp normalize_context_management(changeset) do
+    update_change(changeset, :context_management, fn entries ->
+      Enum.map(entries, fn entry ->
+        Map.new(entry, fn
+          {key, value} when is_atom(key) -> {Atom.to_string(key), value}
+          {key, value} -> {key, value}
+        end)
+      end)
+    end)
+  end
+
+  # The API documents `type` as a string (only "compaction" is supported today,
+  # but that set is expected to grow) and `compact_threshold` as optional. Only
+  # validate what the API actually constrains.
+  defp validate_context_management(changeset) do
+    validate_change(changeset, :context_management, fn :context_management, entries ->
+      Enum.flat_map(entries, fn entry ->
+        type = entry["type"]
+        threshold = entry["compact_threshold"]
+
+        cond do
+          not is_binary(type) or type == "" ->
+            [context_management: "entries must have a string \"type\""]
+
+          is_nil(threshold) ->
+            []
+
+          not is_integer(threshold) or threshold <= 0 ->
+            [context_management: "compact_threshold must be a positive integer"]
+
+          true ->
+            []
+        end
+      end)
+    end)
+  end
+
+  @doc """
+  Return the params formatted for an API request.
+  """
+  @spec for_api(t | Message.t() | Function.t(), message :: [map()], ChatModel.tools()) :: %{
+          atom() => any()
+        }
+  def for_api(%ChatOpenAIResponses{} = openai, messages, tools) do
+    %{
+      model: openai.model,
+      stream: openai.stream,
+      store: if(openai.previous_response_id, do: true, else: openai.store),
+      input:
+        messages
+        |> Enum.reduce([], fn m, acc ->
+          case for_api(openai, m) do
+            %{} = data ->
+              [data | acc]
+
+            data when is_list(data) ->
+              Enum.reverse(data) ++ acc
+          end
+        end)
+        |> Enum.reverse()
+    }
+    |> Utils.conditionally_add_to_map(:context_management, openai.context_management)
+    |> Utils.conditionally_add_to_map(:include, openai.include)
+    |> Utils.conditionally_add_to_map(:max_output_tokens, openai.max_output_tokens)
+    |> Utils.conditionally_add_to_map(:previous_response_id, openai.previous_response_id)
+    |> Utils.conditionally_add_to_map(:prompt_cache_key, openai.prompt_cache_key)
+    |> Utils.conditionally_add_to_map(:prompt_cache_options, openai.prompt_cache_options)
+    |> Utils.conditionally_add_to_map(:reasoning, ReasoningOptions.to_api_map(openai.reasoning))
+    |> Utils.conditionally_add_to_map(:text, set_text_format(openai))
+    |> Utils.conditionally_add_to_map(:tool_choice, get_tool_choice(openai))
+    |> Utils.conditionally_add_to_map(:truncation, openai.truncation)
+    |> Utils.conditionally_add_to_map(:service_tier, openai.service_tier)
+    |> Utils.conditionally_add_to_map(:tools, get_tools_for_api(openai, tools))
+    |> Utils.conditionally_add_to_map(:user, openai.user)
+    |> Utils.conditionally_add_to_map(:temperature, openai.temperature)
+    |> maybe_add_top_p(openai)
+    |> Utils.merge_extra_body(openai.extra_body)
+  end
+
+  # Build the payload for WebSocket mode. Wraps the standard API payload
+  # in a response.create envelope and removes transport-specific fields.
+  #
+  # NOTE: :temperature and :top_p are dropped because the WebSocket endpoint
+  # silently closes the connection (code 1000) when these are sent as decimals.
+  # This is an OpenAI bug — see:
+  # https://community.openai.com/t/responses-websocket-v1-responses-closes-with-code-1000-and-no-events-when-temperature-is-a-decimal-e-g-1-2/1375536
+  if Code.ensure_loaded?(Mint.WebSocket) do
+    defp for_api_websocket(%ChatOpenAIResponses{} = openai, messages, tools) do
+      payload = for_api(openai, messages, tools)
+
+      # Matched by string form, so the same keys supplied as strings through
+      # `extra_body` are dropped too.
+      dropped = ["stream", "background", "temperature", "top_p"]
+
+      sampling_values_present? =
+        Enum.any?(payload, fn {key, value} ->
+          to_string(key) in ["temperature", "top_p"] and value != nil
+        end)
+
+      if sampling_values_present? do
+        Logger.warning(
+          "WebSocket transport: dropping :temperature and :top_p from payload " <>
+            "due to an OpenAI bug that silently closes the connection when these " <>
+            "are sent as decimals. See: https://community.openai.com/t/1375536"
+        )
+      end
+
+      payload
+      |> Map.reject(fn {key, _value} -> to_string(key) in dropped end)
+      |> Map.put(:type, "response.create")
+      |> Jason.encode!()
+    end
+  end
+
+  # gpt-5.2 and newer do not support the top_p parameter.
+  # Earlier models (gpt-4.x, gpt-5.0, gpt-5.1) accept top_p.
+  defp maybe_add_top_p(map, %ChatOpenAIResponses{model: model, top_p: top_p}) do
+    if supports_top_p?(model) do
+      Utils.conditionally_add_to_map(map, :top_p, top_p)
+    else
+      map
+    end
+  end
+
+  @doc false
+  @spec supports_top_p?(String.t()) :: boolean()
+  def supports_top_p?(model) when is_binary(model) do
+    # Match models known to support top_p. This set is fixed and won't grow.
+    cond do
+      String.starts_with?(model, "gpt-4") -> true
+      String.starts_with?(model, "gpt-5.0") -> true
+      String.starts_with?(model, "gpt-5.1") -> true
+      true -> false
+    end
+  end
+
+  defp get_tools_for_api(%ChatOpenAIResponses{} = _model, nil), do: []
+
+  # Functions that share a `:namespace` go out as one `namespace` tool holding
+  # them, in the position of the first one. Every other tool keeps its place,
+  # so the list is the same on every request and the cached prefix holds.
+  defp get_tools_for_api(%ChatOpenAIResponses{} = model, tools) do
+    validate_deferred_tools!(tools)
+
+    {entries, namespaces} =
+      Enum.reduce(tools, {[], %{}}, fn
+        %Function{} = function, {entries, namespaces} ->
+          encoded = for_api(model, function)
+
+          case Function.namespace(function) do
+            nil ->
+              {[{:tool, encoded} | entries], namespaces}
+
+            name ->
+              description = Function.namespace_description(function)
+
+              case namespaces do
+                %{^name => {group_description, group_tools}} ->
+                  {entries,
+                   Map.put(
+                     namespaces,
+                     name,
+                     {group_description || description, [encoded | group_tools]}
+                   )}
+
+                _new ->
+                  {[{:namespace, name} | entries],
+                   Map.put(namespaces, name, {description, [encoded]})}
+              end
+          end
+
+        %NativeTool{} = tool, {entries, namespaces} ->
+          {[{:tool, for_api(model, tool)} | entries], namespaces}
+      end)
+
+    entries
+    |> Enum.reverse()
+    |> Enum.map(fn
+      {:tool, encoded} ->
+        encoded
+
+      {:namespace, name} ->
+        {description, group_tools} = Map.fetch!(namespaces, name)
+
+        %{
+          "type" => "namespace",
+          "name" => name,
+          # The API requires a description on every namespace.
+          "description" => description || "Tools for #{name}.",
+          "tools" => Enum.reverse(group_tools)
+        }
+    end)
+  end
+
+  # The API rejects a deferred function unless the request also declares the
+  # search tool.
+  defp validate_deferred_tools!(tools) do
+    if Enum.any?(tools, &(match?(%Function{}, &1) and Function.deferred?(&1))) and
+         not Enum.any?(tools, &NativeTool.tool_search?/1) do
+      raise LangChainError,
+        type: "invalid_tools",
+        message:
+          "OpenAI requires the search tool when a function is deferred. " <>
+            "Add `LangChain.NativeTool.tool_search/1` or leave every function undeferred."
+    end
+
+    :ok
+  end
+
+  # JSON schema + optional verbosity
+  defp set_text_format(%ChatOpenAIResponses{
+         json_response: true,
+         json_schema: json_schema,
+         json_schema_name: json_schema_name,
+         verbosity: verbosity
+       })
+       when not is_nil(json_schema) and not is_nil(json_schema_name) do
+    %{
+      "format" => %{
+        "type" => "json_schema",
+        "name" => json_schema_name,
+        "schema" => json_schema,
+        "strict" => true
+      }
+    }
+    |> maybe_add_verbosity(verbosity)
+  end
+
+  # JSON object + optional verbosity
+  defp set_text_format(%ChatOpenAIResponses{json_response: true, verbosity: verbosity}) do
+    %{"format" => %{"type" => "json_object"}}
+    |> maybe_add_verbosity(verbosity)
+  end
+
+  # Plain text with verbosity
+  defp set_text_format(%ChatOpenAIResponses{json_response: false, verbosity: verbosity})
+       when is_binary(verbosity) do
+    %{"verbosity" => verbosity}
+  end
+
+  # Plain text, no verbosity (default)
+  defp set_text_format(%ChatOpenAIResponses{json_response: false}) do
+    # NOTE: The default handling when unspecified is `%{"type" => "text"}`
+    # This returns a `nil` which has the same effect.
+    nil
+  end
+
+  defp maybe_add_verbosity(map, nil), do: map
+
+  defp maybe_add_verbosity(map, verbosity) when is_binary(verbosity),
+    do: Map.put(map, "verbosity", verbosity)
+
+  defp get_tool_choice(%ChatOpenAIResponses{tool_choice: choice})
+       when choice in ["none", "auto", "required"],
+       do: choice
+
+  defp get_tool_choice(%ChatOpenAIResponses{tool_choice: choice})
+       when choice in ["file_search", "web_search_preview", "computer_use_preview"],
+       do: %{"type" => choice}
+
+  defp get_tool_choice(%ChatOpenAIResponses{tool_choice: choice})
+       when is_binary(choice) and byte_size(choice) > 0,
+       do: %{"type" => "function", "name" => choice}
+
+  defp get_tool_choice(%ChatOpenAIResponses{}), do: nil
+
+  @spec for_api(
+          struct(),
+          Message.t()
+          | PromptTemplate.t()
+          | ToolCall.t()
+          | ToolResult.t()
+          | ContentPart.t()
+          | Function.t()
+          | NativeTool.t()
+        ) ::
+          %{String.t() => any()} | [%{String.t() => any()}]
+
+  # Function support
+  def for_api(%ChatOpenAIResponses{} = _model, %Function{} = fun) do
+    %{
+      "name" => fun.name,
+      "parameters" => get_parameters(fun),
+      "type" => "function"
+    }
+    |> Utils.conditionally_add_to_map("description", fun.description)
+    |> Utils.conditionally_add_to_map("strict", fun.strict)
+    |> Utils.conditionally_add_to_map("defer_loading", if(Function.deferred?(fun), do: true))
+  end
+
+  # OpenAI's hosted search has a single kind of search, so the variant that
+  # `NativeTool.tool_search/1` records is not sent. The API rejects it.
+  def for_api(%ChatOpenAIResponses{} = _model, %NativeTool{name: "tool_search"}) do
+    %{"type" => "tool_search"}
+  end
+
+  def for_api(
+        %ChatOpenAIResponses{} = _model,
+        %NativeTool{name: name, configuration: config}
+      ) do
+    Map.put_new(config, :type, name)
+  end
+
+  def for_api(%ChatOpenAIResponses{} = model, %Message{role: :system, content: content})
+      when is_list(content) do
+    %{
+      "role" => "system",
+      "type" => "message",
+      "content" => content_parts_for_api(model, content)
+    }
+  end
+
+  def for_api(%ChatOpenAIResponses{} = model, %Message{role: :user, content: content})
+      when is_list(content) do
+    %{
+      "role" => "user",
+      "type" => "message",
+      "content" => content_parts_for_api(model, content)
+    }
+  end
+
+  def for_api(
+        %ChatOpenAIResponses{} = model,
+        %Message{role: :tool, tool_results: tool_results}
+      )
+      when is_list(tool_results) do
+    Enum.map(tool_results, &for_api(model, &1))
+  end
+
+  # Reasoning items and native tool calls (such as web_search_call) are their own
+  # entries in the API's `output` array, so they get plucked out of the content
+  # parts and go back as their own input items.
+  def for_api(
+        %ChatOpenAIResponses{} = model,
+        %Message{role: :assistant, content: content} = msg
+      )
+      when is_list(content) do
+    # The content parts go back as the items the API produced, in the order it
+    # produced them. A reasoning part or native tool call is its own item.
+    # Text goes back inside "output" message items, which only support
+    # `output_text` and `refusal` content parts, so anything else is omitted.
+    #
+    # The API labels each message item with a `phase`, so consecutive text
+    # parts sharing an utterance marker go back as one item carrying that
+    # phase. Unmarked parts form one item with no `phase`. A stand-alone item
+    # between two text parts ends the message item before it, so
+    # `[commentary, reasoning, commentary]` replays as three items, not two.
+    items =
+      content
+      |> Enum.flat_map(fn part ->
+        case stand_alone_item_for_api(model, part) do
+          nil ->
+            case content_part_for_api(model, part, :assistant) do
+              nil -> []
+              api_part -> [{:text, ContentPart.utterance(part), api_part}]
+            end
+
+          item ->
+            [{:item, item}]
+        end
+      end)
+      |> Enum.chunk_by(fn
+        {:text, utterance, _api_part} -> {:text, utterance}
+        {:item, item} -> {:item, item}
+      end)
+      |> Enum.flat_map(fn
+        [{:text, utterance, _} | _] = group ->
+          [
+            %{
+              "role" => "assistant",
+              "type" => "message",
+              "content" => Enum.map(group, fn {:text, _utterance, api_part} -> api_part end)
+            }
+            |> Utils.conditionally_add_to_map("phase", phase_for_utterance(utterance))
+          ]
+
+        items ->
+          Enum.map(items, fn {:item, item} -> item end)
+      end)
+
+    items ++ Enum.map(msg.tool_calls || [], &for_api(model, &1))
+  end
+
+  def for_api(
+        %ChatOpenAIResponses{} = model,
+        %Message{role: :assistant, tool_calls: tool_calls}
+      )
+      when is_list(tool_calls) do
+    Enum.map(tool_calls, &for_api(model, &1))
+  end
+
+  def for_api(%ChatOpenAIResponses{} = model, %ToolResult{type: :function} = result) do
+    output =
+      case content_parts_for_api(model, result.content) do
+        [%{"type" => "input_text", "text" => text} = part] when map_size(part) == 2 -> text
+        parts -> parts
+      end
+
+    %{
+      "call_id" => result.tool_call_id,
+      "output" => output,
+      "type" => "function_call_output"
+    }
+  end
+
+  # ToolCall support. A call to a function loaded by tool search goes back with
+  # the `namespace` the API gave it, which the API requires once the search
+  # items are in the history.
+  def for_api(%ChatOpenAIResponses{} = _model, %ToolCall{type: :function} = fun) do
+    %{
+      "arguments" => Jason.encode!(fun.arguments),
+      "call_id" => fun.call_id,
+      "name" => fun.name,
+      "type" => "function_call"
+    }
+    |> Utils.conditionally_add_to_map("namespace", tool_call_namespace(fun))
+    |> Utils.conditionally_add_to_map("status", "completed")
+  end
+
+  def for_api(%ChatOpenAIResponses{} = _model, %PromptTemplate{} = _template) do
+    raise LangChainError, "PromptTemplates must be converted to messages."
+  end
+
+  def native_tool_calls_for_api(%ChatOpenAIResponses{} = model, content_parts)
+      when is_list(content_parts) do
+    Enum.map(content_parts, &native_tool_call_for_api(model, &1))
+    |> Enum.reject(&is_nil/1)
+  end
+
+  @spec native_tool_call_for_api(any(), any()) ::
+          nil | %{id: any(), status: any(), type: <<_::120>>}
+  def native_tool_call_for_api(%ChatOpenAIResponses{} = _model, %ContentPart{
+        type: :unsupported,
+        options: options
+      })
+      when is_list(options) do
+    if Keyword.get(options, :type) == "web_search_call" do
+      %{
+        id: Keyword.get(options, :id),
+        type: "web_search_call",
+        status: Keyword.get(options, :status)
+      }
+    else
+      nil
+    end
+  end
+
+  def native_tool_call_for_api(_, _), do: nil
+
+  @doc """
+  Convert the content parts of an assistant message into the stand-alone items
+  the API expects in `input`, preserving their original order.
+
+  Some content parts do not belong to the assistant message item at all. A
+  reasoning item and a native tool call are each their own entry in the
+  `output` array the API returned, and each must go back as its own entry in
+  `input`. Order matters: the API expects a reasoning item to precede the
+  message or function call it produced.
+  """
+  def stand_alone_items_for_api(%ChatOpenAIResponses{} = model, content_parts)
+      when is_list(content_parts) do
+    Enum.flat_map(content_parts, fn part ->
+      case stand_alone_item_for_api(model, part) do
+        nil -> []
+        item -> [item]
+      end
+    end)
+  end
+
+  # The stand-alone input item a content part represents, or `nil` when the
+  # part is not one.
+  defp stand_alone_item_for_api(%ChatOpenAIResponses{} = model, %ContentPart{} = part) do
+    reasoning_item_for_api(part) || native_tool_call_for_api(model, part) ||
+      provider_item_for_api(part)
+  end
+
+  defp stand_alone_item_for_api(%ChatOpenAIResponses{}, _part), do: nil
+
+  # An item OpenAI produced and expects back unchanged, such as a
+  # `tool_search_call` or `tool_search_output`. Items from any other provider
+  # are not replayed.
+  defp provider_item_for_api(%ContentPart{type: :provider_item} = part) do
+    if ContentPart.provider_item?(part, @provider_item_name),
+      do: ContentPart.provider_item_block(part)
+  end
+
+  defp provider_item_for_api(%ContentPart{}), do: nil
+
+  # The namespace kept on a tool call, under a string key or, after a round
+  # trip through storage that restores atoms, an atom key.
+  defp tool_call_namespace(%ToolCall{metadata: %{"namespace" => namespace}})
+       when is_binary(namespace),
+       do: namespace
+
+  defp tool_call_namespace(%ToolCall{metadata: %{namespace: namespace}})
+       when is_binary(namespace),
+       do: namespace
+
+  defp tool_call_namespace(%ToolCall{}), do: nil
+
+  @doc """
+  Convert a content part holding a reasoning item back into the reasoning entry
+  the API accepts in `input`. Returns `nil` for any other content part.
+
+  A reasoning item is only accepted back when it carries its
+  `encrypted_content`, which the API returns when the request asked for it with
+  `include: ["reasoning.encrypted_content"]`. Without that payload there is
+  nothing to hand back, so the item is omitted rather than sent as a stub.
+
+  Both shapes a reasoning item arrives as are recognized: the `:unsupported`
+  part built from a non-streamed response, and the `:thinking` part the
+  streaming events build.
+  """
+  def reasoning_item_for_api(%ContentPart{type: type, options: options})
+      when type in [:unsupported, :thinking] and is_list(options) do
+    with "reasoning" <- Keyword.get(options, :type),
+         id when is_binary(id) <- Keyword.get(options, :id),
+         encrypted when is_binary(encrypted) <- Keyword.get(options, :encrypted_content) do
+      %{
+        "type" => "reasoning",
+        "id" => id,
+        "summary" => Keyword.get(options, :summary) || [],
+        "encrypted_content" => encrypted
+      }
+    else
+      _ -> nil
+    end
+  end
+
+  def reasoning_item_for_api(%ContentPart{}), do: nil
+
+  # The API only returns `encrypted_content` when the request asked for it with
+  # `include: ["reasoning.encrypted_content"]`. Leave the key out entirely when
+  # it is absent so a reasoning item without a payload is recognizably
+  # unreplayable.
+  defp maybe_put_encrypted_content(options, encrypted_content)
+       when is_binary(encrypted_content) do
+    Keyword.put(options, :encrypted_content, encrypted_content)
+  end
+
+  defp maybe_put_encrypted_content(options, _encrypted_content), do: options
+
+  @doc """
+  Convert a list of ContentParts to the expected map of data for the OpenAI API.
+
+  The `role` of the message being converted determines which content part types
+  the API accepts. Input messages (`:system`, `:developer`, and `:user`) use the
+  `input_*` part types. Assistant messages are "output" messages and only
+  support `output_text`; unsupported parts are omitted.
+  """
+  def content_parts_for_api(%ChatOpenAIResponses{} = model, content_parts, role \\ :user)
+      when is_list(content_parts) do
+    Enum.map(content_parts, &content_part_for_api(model, &1, role))
+    |> Enum.reject(&is_nil/1)
+  end
+
+  @doc """
+  Convert a ContentPart to the expected map of data for the OpenAI API.
+
+  See `content_parts_for_api/3` for how `role` affects the conversion.
+  """
+  def content_part_for_api(model, content_part, role \\ :user)
+
+  def content_part_for_api(
+        %ChatOpenAIResponses{} = _model,
+        %ContentPart{type: :text} = part,
+        :assistant
+      ) do
+    %{"type" => "output_text", "text" => part.content, "annotations" => []}
+  end
+
+  # Assistant messages only support `output_text` and `refusal` parts. Anything
+  # else has no valid representation and is omitted.
+  def content_part_for_api(%ChatOpenAIResponses{} = _model, %ContentPart{}, :assistant), do: nil
+
+  def content_part_for_api(
+        %ChatOpenAIResponses{} = _model,
+        %ContentPart{type: :text} = part,
+        _role
+      ) do
+    %{"type" => "input_text", "text" => part.content}
+    |> add_prompt_cache_breakpoint(part)
+  end
+
+  def content_part_for_api(
+        %ChatOpenAIResponses{} = _model,
+        %ContentPart{type: :file_url} = part,
+        _role
+      ) do
+    %{
+      "type" => "input_file",
+      "file_url" => part.content
+    }
+    |> add_prompt_cache_breakpoint(part)
+  end
+
+  def content_part_for_api(
+        %ChatOpenAIResponses{} = _model,
+        %ContentPart{type: :file, options: opts} = part,
+        _role
+      ) do
+    case Keyword.get(opts, :type, :base64) do
+      :file_id ->
+        %{
+          "type" => "input_file",
+          "file_id" => part.content
+        }
+
+      :base64 ->
+        %{
+          "type" => "input_file",
+          "filename" => Keyword.get(opts, :filename, "file.pdf"),
+          "file_data" => "data:application/pdf;base64," <> part.content
+        }
+    end
+    |> add_prompt_cache_breakpoint(part)
+  end
+
+  def content_part_for_api(
+        %ChatOpenAIResponses{} = _model,
+        %ContentPart{type: image} = part,
+        _role
+      )
+      when image in [:image, :image_url] do
+    output =
+      if Keyword.get(part.options, :type) == :file_id do
+        %{"type" => "input_image", "file_id" => part.content}
+      else
+        media_prefix =
+          case Keyword.get(part.options, :media, nil) do
+            nil ->
+              ""
+
+            type when is_binary(type) ->
+              "data:#{type};base64,"
+
+            type when type in [:jpeg, :jpg] ->
+              "data:image/jpg;base64,"
+
+            :png ->
+              "data:image/png;base64,"
+
+            :gif ->
+              "data:image/gif;base64,"
+
+            :webp ->
+              "data:image/webp;base64,"
+
+            other ->
+              raise LangChainError,
+                    "Received unsupported media type for ContentPart: #{inspect(other)}"
+          end
+
+        %{
+          "type" => "input_image",
+          "image_url" => media_prefix <> part.content
+        }
+      end
+
+    detail_option = Keyword.get(part.options, :detail, nil)
+
+    output
+    |> Utils.conditionally_add_to_map("detail", detail_option)
+    |> add_prompt_cache_breakpoint(part)
+  end
+
+  # Thinking content parts are output-only and should be omitted when sending to the API
+  def content_part_for_api(%ChatOpenAIResponses{} = _model, %ContentPart{type: :thinking}, _role),
+    do: nil
+
+  # Ignore unknown, unsupported content parts
+  def content_part_for_api(
+        %ChatOpenAIResponses{} = _model,
+        %ContentPart{type: :unsupported},
+        _role
+      ),
+      do: nil
+
+  # A provider item from OpenAI is its own input item and is replayed by
+  # `stand_alone_items_for_api/2`, never as message content. Items from any
+  # other provider are omitted.
+  def content_part_for_api(
+        %ChatOpenAIResponses{} = _model,
+        %ContentPart{type: :provider_item},
+        _role
+      ),
+      do: nil
+
+  # This model does not load tools by reference, so every deferred function is
+  # already declared as an ordinary tool. The reference reads as text.
+  def content_part_for_api(
+        %ChatOpenAIResponses{} = model,
+        %ContentPart{type: :tool_reference} = part,
+        role
+      ) do
+    content_part_for_api(model, ContentPart.text!(ContentPart.tool_reference_text(part)), role)
+  end
+
+  defp add_prompt_cache_breakpoint(output, %ContentPart{options: options}) do
+    Utils.conditionally_add_to_map(
+      output,
+      "prompt_cache_breakpoint",
+      Keyword.get(options || [], :prompt_cache_breakpoint)
+    )
+  end
+
+  @doc false
+  def get_parameters(%Function{parameters: [], parameters_schema: nil} = _fun) do
+    %{
+      "type" => "object",
+      "properties" => %{}
+    }
+  end
+
+  def get_parameters(%Function{parameters: [], parameters_schema: schema} = _fun)
+      when is_map(schema) do
+    schema
+  end
+
+  def get_parameters(%Function{parameters: params} = _fun) do
+    FunctionParam.to_parameters_schema(params)
+  end
+
+  @impl ChatModel
+  def call(openai, prompt, tools \\ [])
+
+  def call(%ChatOpenAIResponses{} = openai, prompt, tools) when is_binary(prompt) do
+    messages = [
+      Message.new_system!(),
+      Message.new_user!(prompt)
+    ]
+
+    call(openai, messages, tools)
+  end
+
+  def call(%ChatOpenAIResponses{} = openai, messages, tools) when is_list(messages) do
+    metadata = %{
+      model: openai.model,
+      provider: provider(),
+      message_count: length(messages),
+      tools_count: length(tools)
+    }
+
+    ChatModel.llm_telemetry_span(openai, metadata, fn ->
+      try do
+        # Track the prompt being sent
+        LangChain.Telemetry.llm_prompt(
+          %{system_time: System.system_time()},
+          %{model: openai.model, messages: messages}
+        )
+
+        # make base api request and perform high-level success/failure checks
+        case do_api_request(openai, messages, tools) do
+          {:error, reason} ->
+            {:error, reason}
+
+          parsed_data ->
+            # Track the response being received
+            LangChain.Telemetry.llm_response(
+              %{system_time: System.system_time()},
+              %{model: openai.model, response: parsed_data}
+            )
+
+            {:ok, parsed_data}
+        end
+      rescue
+        err in LangChainError ->
+          {:error, err}
+      end
+    end)
+  end
+
+  @spec do_api_request(t(), [Message.t()], ChatModel.tools(), integer() | nil) ::
+          list() | struct() | {:error, LangChainError.t()}
+  def do_api_request(openai, messages, tools, retry_count \\ nil)
+
+  def do_api_request(_openai, _messages, _tools, 0) do
+    raise LangChainError, "Retries exceeded. Connection failed."
+  end
+
+  if Code.ensure_loaded?(Mint.WebSocket) do
+    def do_api_request(
+          %ChatOpenAIResponses{websocket: ws_pid} = openai,
+          messages,
+          tools,
+          _retry_count
+        )
+        when is_pid(ws_pid) do
+      payload = for_api_websocket(openai, messages, tools)
+
+      done_fn = fn event ->
+        event["type"] in ["response.completed", "response.failed"]
+      end
+
+      case openai.stream do
+        false ->
+          case LangChain.WebSocket.send_and_collect(ws_pid, payload, done_fn,
+                 timeout: openai.receive_timeout
+               ) do
+            {:ok, events} ->
+              # Find the completed/failed event and process its response
+              events
+              |> Enum.find(&match?(%{"type" => "response.completed"}, &1))
+              |> case do
+                %{"response" => response} ->
+                  case do_process_response(openai, response) do
+                    {:error, %LangChainError{} = reason} ->
+                      {:error, reason}
+
+                    result ->
+                      Callbacks.fire(openai.callbacks, :on_llm_new_message, [result])
+                      result
+                  end
+
+                nil ->
+                  # Check for failed response
+                  events
+                  |> Enum.find(&match?(%{"type" => "response.failed"}, &1))
+                  |> case do
+                    %{"type" => "response.failed"} = failed_event ->
+                      do_process_response(openai, failed_event)
+
+                    nil ->
+                      {:error,
+                       LangChainError.exception(
+                         type: "unexpected_response",
+                         message: "No completed or failed event received via WebSocket"
+                       )}
+                  end
+              end
+
+            {:error, reason} ->
+              {:error,
+               LangChainError.exception(
+                 type: "websocket_error",
+                 message: "WebSocket request failed: #{inspect(reason)}"
+               )}
+          end
+
+        true ->
+          callback_fn = fn event ->
+            case do_process_response(openai, event) do
+              :skip ->
+                :skip
+
+              result ->
+                Utils.fire_streamed_callback(openai, List.wrap(result))
+                result
+            end
+          end
+
+          case LangChain.WebSocket.send_and_stream(ws_pid, payload, callback_fn, done_fn,
+                 timeout: openai.receive_timeout
+               ) do
+            {:ok, results} ->
+              results = results |> Enum.reject(&(&1 == :skip)) |> List.flatten()
+
+              # Check if any result is an error and return the first one found
+              case Enum.find(results, &match?({:error, %LangChainError{}}, &1)) do
+                {:error, _} = error -> error
+                nil -> results
+              end
+
+            {:error, reason} ->
+              {:error,
+               LangChainError.exception(
+                 type: "websocket_error",
+                 message: "WebSocket streaming request failed: #{inspect(reason)}"
+               )}
+          end
+      end
+    end
+  end
+
+  def do_api_request(
+        %ChatOpenAIResponses{stream: false} = openai,
+        messages,
+        tools,
+        retry_count
+      ) do
+    retry_count = retry_count || openai.retry_count + 1
+    raw_data = for_api(openai, messages, tools)
+
+    if openai.verbose_api do
+      IO.inspect(raw_data, label: "RAW DATA BEING SUBMITTED")
+    end
+
+    req =
+      Req.new(
+        url: openai.endpoint,
+        json: raw_data,
+        # required for OpenAI API
+        auth: {:bearer, get_api_key(openai)},
+        # required for Azure OpenAI version
+        headers: [
+          {"api-key", get_api_key(openai)}
+        ],
+        receive_timeout: openai.receive_timeout,
+        # Disable Req-level retry to prevent compounding with LangChain's own
+        # :closed retry. See https://github.com/brainlid/langchain/issues/503
+        retry: false
+      )
+
+    req
+    |> maybe_add_org_id_header()
+    |> maybe_add_proj_id_header()
+    |> Req.merge(openai.req_config |> Keyword.new())
+    |> Req.post()
+    # parse the body and return it as parsed structs
+    |> case do
+      {:ok, %Req.Response{body: data} = response} ->
+        if openai.verbose_api do
+          IO.inspect(response, label: "RAW REQ RESPONSE")
+        end
+
+        Callbacks.fire(openai.callbacks, :on_llm_ratelimit_info, [
+          get_ratelimit_info(response.headers)
+        ])
+
+        case do_process_response(openai, data) do
+          {:error, %LangChainError{} = reason} ->
+            {:error, reason}
+
+          result ->
+            Callbacks.fire(openai.callbacks, :on_llm_new_message, [result])
+
+            # Track non-streaming response completion
+            LangChain.Telemetry.emit_event(
+              [:langchain, :llm, :response, :non_streaming],
+              %{system_time: System.system_time()},
+              %{
+                model: openai.model,
+                response_size: byte_size(inspect(result))
+              }
+            )
+
+            result
+        end
+
+      {:error, %Req.TransportError{reason: :timeout} = err} ->
+        {:error,
+         LangChainError.exception(type: "timeout", message: "Request timed out", original: err)}
+
+      {:error, %Req.TransportError{reason: :closed}} ->
+        # Force a retry by making a recursive call decrementing the counter
+        Logger.debug(fn -> "Mint connection closed: retry count = #{inspect(retry_count)}" end)
+        do_api_request(openai, messages, tools, retry_count - 1)
+
+      other ->
+        Logger.warning(fn -> "Unexpected and unhandled API response! #{inspect(other)}" end)
+        other
+    end
+  end
+
+  def do_api_request(
+        %ChatOpenAIResponses{stream: true} = openai,
+        messages,
+        tools,
+        retry_count
+      ) do
+    retry_count = retry_count || openai.retry_count + 1
+
+    Req.new(
+      url: openai.endpoint,
+      json: for_api(openai, messages, tools),
+      # required for OpenAI API
+      auth: {:bearer, get_api_key(openai)},
+      # required for Azure OpenAI version
+      headers: [
+        {"api-key", get_api_key(openai)}
+      ],
+      receive_timeout: openai.receive_timeout
+    )
+    |> maybe_add_org_id_header()
+    |> maybe_add_proj_id_header()
+    |> Req.merge(openai.req_config |> Keyword.new())
+    |> Req.post(
+      into: Utils.handle_stream_fn(openai, &decode_stream/1, &do_process_response(openai, &1))
+    )
+    |> case do
+      {:ok, %Req.Response{body: {:error, %LangChainError{} = error}}} ->
+        {:error, error}
+
+      {:ok, %Req.Response{body: data} = response} ->
+        Callbacks.fire(openai.callbacks, :on_llm_ratelimit_info, [
+          get_ratelimit_info(response.headers)
+        ])
+
+        List.flatten(data)
+
+      {:error, %LangChainError{} = error} ->
+        {:error, error}
+
+      {:error, %Req.TransportError{reason: :timeout} = err} ->
+        {:error,
+         LangChainError.exception(type: "timeout", message: "Request timed out", original: err)}
+
+      {:error, %Req.TransportError{reason: :closed}} ->
+        # Force a retry by making a recursive call decrementing the counter
+        Logger.debug(fn -> "Connection closed: retry count = #{inspect(retry_count)}" end)
+        do_api_request(openai, messages, tools, retry_count - 1)
+
+      other ->
+        Logger.warning(fn ->
+          "Unhandled and unexpected response from streamed post call. #{inspect(other)}"
+        end)
+
+        {:error,
+         LangChainError.exception(
+           type: "unexpected_response",
+           message: "Unexpected response",
+           original: other
+         )}
+    end
+  end
+
+  # The Responses API streams events in the form:
+  # event: <event_type>\ndata: { ...json... }
+  # We want to extract each pair and parse the JSON from the `data:` line.
+
+  # A list of all events can be found here: https://platform.openai.com/docs/api-reference/responses-streaming
+
+  # Unlike the Chat Completions API, we do not get a [DONE] token at the end of the stream.
+
+  @spec decode_stream({String.t(), String.t()}) :: {[map()], String.t()}
+  def decode_stream({raw_data, buffer}) do
+    combined = buffer <> raw_data
+
+    segments = String.split(combined, "\n\n")
+
+    {complete_segments, [maybe_incomplete]} = Enum.split(segments, -1)
+
+    parsed =
+      complete_segments
+      |> Enum.flat_map(fn segment ->
+        segment
+        |> String.split("\n")
+        |> Enum.find_value(fn
+          "data: " <> json -> json
+          "data:" <> json -> String.trim_leading(json)
+          _ -> nil
+        end)
+        |> case do
+          nil ->
+            []
+
+          json ->
+            case Jason.decode(json) do
+              {:ok, parsed} -> [parsed]
+              {:error, _} -> []
+            end
+        end
+      end)
+
+    {parsed, maybe_incomplete}
+  end
+
+  # Parse a new message response
+  @doc false
+  @spec do_process_response(t(), data :: any()) ::
+          :skip
+          | TokenUsage.t()
+          | Message.t()
+          | [Message.t() | MessageDelta.t() | TokenUsage.t() | {:error, LangChainError.t()}]
+          | MessageDelta.t()
+          | [MessageDelta.t()]
+          | {:error, LangChainError.t()}
+
+  # A response with its output. An `"incomplete"` response was cut off, and its
+  # message carries the reason as its status (see `response_status/1`).
+  def do_process_response(
+        _model,
+        %{"status" => status, "output" => content_items} = response
+      )
+      when status in ["completed", "incomplete"] and is_list(content_items) do
+    {content_parts, tool_calls} = content_items_to_content_parts_and_tool_calls(content_items)
+
+    metadata =
+      case get_token_usage(response) do
+        nil -> %{}
+        %TokenUsage{} = usage -> %{usage: usage}
+      end
+      |> maybe_add_response_id(response)
+      |> maybe_add_end_turn(response)
+
+    Message.new!(%{
+      content: content_parts,
+      status: response_status(response),
+      role: :assistant,
+      tool_calls: tool_calls,
+      metadata: metadata
+    })
+  end
+
+  # Handle streaming events
+
+  # Streamed events are returned as a raw list of events
+  # Even if there is only one event, it is returned within a list.
+  # Open to feedback this should get moved up and down the pattern-matching
+  # priority here.
+
+  def do_process_response(model, list) when is_list(list) do
+    Enum.map(list, &do_process_response(model, &1))
+  end
+
+  # Deltas arrive in the following shape:
+  # %{
+  #   "content_index" => 0,
+  #   "delta" => "Hello",
+  #   "item_id" => "msg_1234567890",
+  #   "output_index" => 0,
+  #   "sequence_number" => 4,
+  #   "type" => "response.output_text.delta"
+  # }
+
+  # Reasoning/thinking deltas.
+  #
+  # - `response.reasoning.delta` is emitted by models that stream a reasoning
+  #   summary.
+  # - `response.reasoning_text.delta` is emitted by open-weight models that
+  #   expose their full chain-of-thought rather than a summary, notably OpenAI's
+  #   `gpt-oss` family, including when served through AWS Bedrock. The deltas are
+  #   wrapped in a `reasoning` output item and delimited by the structural
+  #   `response.reasoning_part.*` and `response.reasoning_text.done` markers,
+  #   which are skipped below.
+  #
+  # Both are emitted as `:thinking` content so consumers can display or filter
+  # reasoning consistently regardless of which model produced it.
+  @reasoning_delta_events [
+    "response.reasoning.delta",
+    "response.reasoning_text.delta"
+  ]
+
+  def do_process_response(_model, %{
+        "type" => type,
+        "output_index" => output_index,
+        "delta" => delta_text
+      })
+      when type in @reasoning_delta_events do
+    data = %{
+      content: ContentPart.new!(%{type: :thinking, content: delta_text}),
+      status: :incomplete,
+      role: :assistant,
+      index: output_index
+    }
+
+    case MessageDelta.new(data) do
+      {:ok, message} ->
+        message
+
+      {:error, %Ecto.Changeset{} = changeset} ->
+        {:error, LangChainError.exception(changeset)}
+    end
+  end
+
+  def do_process_response(
+        _model,
+        %{
+          "type" => "response.output_text.delta",
+          "output_index" => output_index,
+          "delta" => delta_text
+        }
+      ) do
+    data = %{
+      content: delta_text,
+      # Will need to be updated to :complete when the response is complete
+      status: :incomplete,
+      role: :assistant,
+      index: output_index
+    }
+
+    case MessageDelta.new(data) do
+      {:ok, message} ->
+        message
+
+      {:error, %Ecto.Changeset{} = changeset} ->
+        {:error, LangChainError.exception(changeset)}
+    end
+  end
+
+  def do_process_response(_model, %{"type" => "response.output_text.delta", "delta" => delta_text}) do
+    data = %{
+      content: delta_text,
+      # Will need to be updated to :complete when the response is complete
+      status: :incomplete,
+      role: :assistant
+    }
+
+    case MessageDelta.new(data) do
+      {:ok, message} ->
+        message
+
+      {:error, %Ecto.Changeset{} = changeset} ->
+        {:error, LangChainError.exception(changeset)}
+    end
+  end
+
+  # Annotation events arrive during streaming when the model cites sources
+  # (e.g., from web search). Each event carries one annotation that we convert
+  # to a Citation and attach to a ContentPart with nil content, which gets
+  # merged into the accumulated delta via ContentPart.merge_part/2.
+  def do_process_response(_model, %{
+        "type" => "response.output_text.annotation.added",
+        "annotation" => annotation_data,
+        "output_index" => output_index
+      }) do
+    citation = parse_openai_annotation(annotation_data)
+    content_part = %ContentPart{type: :text, content: nil, citations: [citation]}
+
+    data = %{
+      content: content_part,
+      status: :incomplete,
+      role: :assistant,
+      index: output_index
+    }
+
+    case MessageDelta.new(data) do
+      {:ok, message} ->
+        message
+
+      {:error, %Ecto.Changeset{} = changeset} ->
+        {:error, LangChainError.exception(changeset)}
+    end
+  end
+
+  # Open question: is it possible we get multiples of `response.output_text.done`?
+  # It precedes `response.content_part.done` and `response.output_item.done`
+  # and theoretically we could get multiple text content_parts and output_items.
+
+  # I believe, semantically, these deltas are "outside" the output item and content part
+  # and can be treated as a "global" stream of deltas -- meaning "done" is truly
+  # "done" -- but that remains unconfirmed.
+  def do_process_response(_model, %{"type" => "response.output_text.done"}) do
+    data = %{
+      content: "",
+      status: :complete,
+      role: :assistant
+    }
+
+    case MessageDelta.new(data) do
+      {:ok, message} ->
+        message
+
+      {:error, %Ecto.Changeset{} = changeset} ->
+        {:error, LangChainError.exception(changeset)}
+    end
+  end
+
+  # This is the first event we get for a reasoning/thinking block.
+  # It is followed by a series of `response.reasoning.delta` events.
+  # Finally, it is followed by a `response.output_item.done` event.
+  def do_process_response(_model, %{
+        "type" => "response.output_item.added",
+        "output_index" => output_index,
+        "item" => %{
+          "type" => "reasoning",
+          "id" => _reasoning_id
+        }
+      }) do
+    data = %{
+      content: ContentPart.new!(%{type: :thinking, content: ""}),
+      status: :incomplete,
+      role: :assistant,
+      index: output_index
+    }
+
+    case MessageDelta.new(data) do
+      {:ok, delta} ->
+        delta
+
+      {:error, %Ecto.Changeset{} = changeset} ->
+        {:error, LangChainError.exception(changeset)}
+    end
+  end
+
+  # A message item's `phase` arrives on `response.output_item.added`, before the
+  # first `response.output_text.delta` for that item, and again on
+  # `response.output_item.done`. Both emit the utterance marker at the item's
+  # `output_index`, where it merges onto the text accumulated there, so the
+  # part is labelled from its first token.
+  #
+  # The marker part is `:text` with `nil` content. It has to be `:text` because
+  # content parts only merge with a part of their own type, and `nil` rather
+  # than `""` because an empty text part is skipped by the merge. The marker
+  # survives the repeated merge because `:utterance` is not concatenated like
+  # other string options.
+  def do_process_response(model, %{
+        "type" => event,
+        "output_index" => output_index,
+        "item" => %{"type" => "message"} = item
+      })
+      when event in ["response.output_item.added", "response.output_item.done"] do
+    case %ContentPart{type: :text, content: nil} |> put_utterance_from_phase(item["phase"]) do
+      %ContentPart{options: []} ->
+        if model.verbose_api do
+          Logger.debug("[LANGCHAIN] Skipping streaming event: #{event}")
+        end
+
+        :skip
+
+      marker ->
+        data = %{
+          content: marker,
+          status: :incomplete,
+          role: :assistant,
+          index: output_index
+        }
+
+        case MessageDelta.new(data) do
+          {:ok, delta} ->
+            delta
+
+          {:error, %Ecto.Changeset{} = changeset} ->
+            {:error, LangChainError.exception(changeset)}
+        end
+    end
+  end
+
+  # This is the first event we get for a function call.
+  # It is followed by a series of `response.function_call_arguments.delta` events.
+  # It is followed by a `response.function_call_arguments.done` event. (which we skip)
+  # Finally, it is followed by a `response.output_item.done` event.
+  def do_process_response(_model, %{
+        "type" => "response.output_item.added",
+        "output_index" => output_index,
+        "item" =>
+          %{
+            "type" => "function_call",
+            "call_id" => call_id,
+            "name" => name,
+            "arguments" => args
+          } = item
+      }) do
+    data = %{
+      status: :incomplete,
+      type: :function,
+      call_id: call_id,
+      name: name,
+      arguments: args,
+      index: output_index,
+      metadata: namespace_metadata(item)
+    }
+
+    with {:ok, %ToolCall{} = call} <- ToolCall.new(data),
+         {:ok, delta} <-
+           MessageDelta.new(%{
+             content: "",
+             status: :incomplete,
+             role: :assistant,
+             tool_calls: [call]
+           }) do
+      delta
+    else
+      {:error, %Ecto.Changeset{} = changeset} ->
+        {:error, LangChainError.exception(changeset)}
+    end
+  end
+
+  def do_process_response(_model, %{
+        "type" => "response.function_call_arguments.delta",
+        "output_index" => output_index,
+        "delta" => delta_text
+      }) do
+    data = %{
+      arguments: delta_text,
+      index: output_index
+    }
+
+    with {:ok, call} <- ToolCall.new(data),
+         {:ok, message} <-
+           MessageDelta.new(%{
+             content: "",
+             status: :incomplete,
+             role: :assistant,
+             tool_calls: [call]
+           }) do
+      message
+    else
+      {:error, %Ecto.Changeset{} = changeset} ->
+        {:error, LangChainError.exception(changeset)}
+    end
+  end
+
+  # The completed reasoning item carries the `id` and, when the request included
+  # `reasoning.encrypted_content`, the encrypted payload. Both ride along in the
+  # thinking part's options so the item can be replayed on the next request.
+  # The part stays `:thinking` because that is the type the earlier
+  # `response.output_item.added` event opened at this index, and content parts
+  # only merge with a part of their own type.
+  def do_process_response(_model, %{
+        "type" => "response.output_item.done",
+        "output_index" => output_index,
+        "item" => %{"type" => "reasoning"} = item
+      }) do
+    options =
+      [id: item["id"], summary: item["summary"] || [], type: "reasoning"]
+      |> maybe_put_encrypted_content(item["encrypted_content"])
+
+    data = %{
+      content: ContentPart.new!(%{type: :thinking, content: "", options: options}),
+      status: :complete,
+      role: :assistant,
+      index: output_index
+    }
+
+    case MessageDelta.new(data) do
+      {:ok, delta} ->
+        delta
+
+      {:error, %Ecto.Changeset{} = changeset} ->
+        {:error, LangChainError.exception(changeset)}
+    end
+  end
+
+  def do_process_response(_model, %{
+        "type" => "response.output_item.done",
+        "output_index" => output_index,
+        "item" => %{"type" => "function_call"} = item
+      }) do
+    data = %{
+      status: :complete,
+      index: output_index,
+      call_id: item["call_id"],
+      arguments: item["arguments"],
+      name: item["name"],
+      metadata: namespace_metadata(item)
+    }
+
+    with {:ok, call} <- ToolCall.new(data),
+         {:ok, message} <-
+           MessageDelta.new(%{
+             status: :complete,
+             role: :assistant,
+             tool_calls: [call]
+           }) do
+      message
+    else
+      {:error, %Ecto.Changeset{} = changeset} ->
+        {:error, LangChainError.exception(changeset)}
+    end
+  end
+
+  # A tool search item streams as a whole item on `response.output_item.added`
+  # and again, completed, on `response.output_item.done`. Only the completed
+  # item is kept. It takes the item's `output_index`, so it stays in place
+  # among the text and reasoning around it.
+  def do_process_response(_model, %{
+        "type" => "response.output_item.done",
+        "output_index" => output_index,
+        "item" => %{"type" => type} = item
+      })
+      when type in @tool_search_item_types do
+    data = %{
+      content: ContentPart.provider_item!(@provider_item_name, item),
+      status: :incomplete,
+      role: :assistant,
+      index: output_index
+    }
+
+    case MessageDelta.new(data) do
+      {:ok, delta} ->
+        delta
+
+      {:error, %Ecto.Changeset{} = changeset} ->
+        {:error, LangChainError.exception(changeset)}
+    end
+  end
+
+  # The terminal event of a streamed response. `response.incomplete` means the
+  # response was cut off, so the message closes with the reason as its status
+  # even when an earlier item's text finished and marked it complete.
+  def do_process_response(_model, %{
+        "type" => event,
+        "response" => response
+      })
+      when event in ["response.completed", "response.incomplete"] do
+    usage = get_token_usage(response)
+
+    metadata =
+      %{usage: usage}
+      |> maybe_add_response_id(response)
+      |> maybe_add_end_turn(response)
+
+    status =
+      if event == "response.incomplete",
+        do: response_status(Map.put(response, "status", "incomplete")),
+        else: :complete
+
+    data = %{
+      content: "",
+      status: status,
+      role: :assistant,
+      metadata: metadata
+    }
+
+    case MessageDelta.new(data) do
+      {:ok, message} ->
+        message
+
+      {:error, %Ecto.Changeset{} = changeset} ->
+        {:error, LangChainError.exception(changeset)}
+    end
+  end
+
+  # Streaming events explicitly skipped
+
+  # Items we should come back and implement:
+  # - refusals
+  # - function_calls
+  # - error
+
+  @reasoning_summary_events [
+    "response.reasoning_summary_part.added",
+    "response.reasoning_summary_part.done",
+    "response.reasoning_summary_text.delta",
+    "response.reasoning_summary_text.done",
+    "response.reasoning_summary.delta",
+    "response.reasoning_summary.done"
+  ]
+
+  # Structural markers around raw reasoning-text streaming (gpt-oss and other
+  # open-weight models). The `response.reasoning_text.delta` content is handled
+  # above; these delimit the reasoning part and carry no incremental content we
+  # need, so they are skipped.
+  @reasoning_text_events [
+    "response.reasoning_part.added",
+    "response.reasoning_part.done",
+    "response.reasoning_text.done"
+  ]
+
+  @skippable_streaming_events [
+    "keepalive",
+    "response.created",
+    "response.in_progress",
+    "response.output_item.added",
+    "response.output_item.done",
+    "response.content_part.added",
+    "response.content_part.done",
+    "response.refusal.delta",
+    "response.refusal.done",
+    "response.function_call_arguments.done",
+    "response.file_search_call.in_progress",
+    "response.file_search_call.searching",
+    "response.file_search_call.completed",
+    "response.web_search_call.in_progress",
+    "response.web_search_call.searching",
+    "response.web_search_call.completed",
+    "response.image_generation_call.completed",
+    "response.image_generation_call.generating",
+    "response.image_generation_call.in_progress",
+    "response.image_generation_call.partial_image",
+    "response.mcp_call.arguments.delta",
+    "response.mcp_call.arguments.done",
+    "response.mcp_call.completed",
+    "response.mcp_call.failed",
+    "response.mcp_call.in_progress",
+    "response.queued",
+    "error"
+  ]
+
+  # Handle reasoning summary delta events - fire callback and return :skip
+  def do_process_response(model, %{
+        "type" => "response.reasoning_summary_text.delta",
+        "delta" => delta
+      }) do
+    if model.verbose_api do
+      Logger.debug("[LANGCHAIN] Reasoning text delta received")
+    end
+
+    Callbacks.fire(model.callbacks, :on_llm_reasoning_delta, [delta])
+    :skip
+  end
+
+  def do_process_response(model, %{
+        "type" => "response.reasoning_summary.delta",
+        "delta" => delta
+      }) do
+    if model.verbose_api do
+      Logger.debug("[LANGCHAIN] Reasoning summary delta received")
+    end
+
+    Callbacks.fire(model.callbacks, :on_llm_reasoning_delta, [delta])
+    :skip
+  end
+
+  def do_process_response(model, %{"type" => event} = _data)
+      when event in @reasoning_summary_events do
+    if model.verbose_api do
+      Logger.debug("[LANGCHAIN] Reasoning event: #{event}")
+    end
+
+    :skip
+  end
+
+  def do_process_response(model, %{"type" => event} = _data)
+      when event in @reasoning_text_events do
+    if model.verbose_api do
+      Logger.debug("[LANGCHAIN] Reasoning text event: #{event}")
+    end
+
+    :skip
+  end
+
+  def do_process_response(model, %{"type" => event})
+      when event in @skippable_streaming_events do
+    if model.verbose_api do
+      Logger.debug("[LANGCHAIN] Skipping streaming event: #{event}")
+    end
+
+    :skip
+  end
+
+  def do_process_response(_model, %{"error" => %{"message" => reason}}) do
+    {:error, LangChainError.exception(message: reason)}
+  end
+
+  # Handle failed response status (streaming event with type "response.failed")
+  def do_process_response(_model, %{
+        "type" => "response.failed",
+        "response" => %{"status" => "failed"} = response
+      }) do
+    build_failed_response_error(response)
+  end
+
+  # Handle failed response status (non-streaming / full response object)
+  def do_process_response(_model, %{"response" => %{"status" => "failed"} = response}) do
+    build_failed_response_error(response)
+  end
+
+  def do_process_response(_model, {:error, %Jason.DecodeError{} = response}) do
+    error_message = "Received invalid JSON: #{inspect(response)}"
+
+    {:error,
+     LangChainError.exception(type: "invalid_json", message: error_message, original: response)}
+  end
+
+  def do_process_response(_model, other) do
+    {:error,
+     LangChainError.exception(
+       type: "unexpected_response",
+       message: "Unexpected response",
+       original: other
+     )}
+  end
+
+  # Extracts error details from a failed OpenAI response and builds an error tuple.
+  # Handles various error formats defensively:
+  # - %{"error" => %{"code" => "...", "message" => "..."}}
+  # - %{"error" => "string message"}
+  # - %{} (no error details)
+  @spec build_failed_response_error(map()) :: {:error, LangChainError.t()}
+  defp build_failed_response_error(response) do
+    {error_type, error_message} = extract_error_details(response)
+
+    {:error,
+     LangChainError.exception(
+       type: error_type,
+       message: "OpenAI request failed: #{error_message}",
+       original: response
+     )}
+  end
+
+  @spec extract_error_details(map()) :: {String.t(), String.t()}
+  defp extract_error_details(response) do
+    case Map.get(response, "error") do
+      %{} = error_info ->
+        message = Map.get(error_info, "message", "Request failed")
+        code = Map.get(error_info, "code", "api_error")
+        {code, message}
+
+      message when is_binary(message) ->
+        {"api_error", message}
+
+      _ ->
+        {"api_error", "Request failed"}
+    end
+  end
+
+  defp get_token_usage(%{"usage" => usage} = response_body) when is_map(usage) do
+    # extract out the reported response token usage
+    #
+    # https://platform.openai.com/docs/api-reference/responses_streaming/response/completed#responses_streaming/response/completed-response-usage
+    #
+    # The tier that served the request is reported beside `usage`, not inside
+    # it. Keeping it in `raw` carries it to the final message along with the
+    # usage, which is also where ChatAnthropic reports its tier.
+    TokenUsage.new!(%{
+      input: Map.get(usage, "input_tokens"),
+      output: Map.get(usage, "output_tokens"),
+      raw: Utils.conditionally_add_to_map(usage, "service_tier", response_body["service_tier"])
+    })
+  end
+
+  defp get_token_usage(_response_body), do: nil
+
+  defp maybe_add_response_id(metadata, %{"id" => id}) when is_binary(id) do
+    Map.put(metadata, :response_id, id)
+  end
+
+  defp maybe_add_response_id(metadata, _response), do: metadata
+
+  # The message status for a response. An `"incomplete"` response stopped
+  # early: `incomplete_details.reason` is `"max_output_tokens"` when it ran out
+  # of output tokens or context, and `"content_filter"` when it was filtered.
+  defp response_status(%{"status" => "incomplete"} = response) do
+    case get_in(response, ["incomplete_details", "reason"]) do
+      "content_filter" -> :content_filtered
+      _max_output_tokens -> :length
+    end
+  end
+
+  defp response_status(_response), do: :complete
+
+  # A provider that reports whether the model ended its turn sends it as
+  # `end_turn` on the completed response. It is kept only when it is a boolean,
+  # so a missing or malformed value leaves the turn boundary to the content.
+  defp maybe_add_end_turn(metadata, %{"end_turn" => end_turn}) when is_boolean(end_turn) do
+    Map.put(metadata, :end_turn, end_turn)
+  end
+
+  defp maybe_add_end_turn(metadata, _response), do: metadata
+
+  # A call to a function that tool search loaded carries the `namespace` it
+  # was loaded under: the namespace's name, or the function's own name for a
+  # function outside any namespace. It is kept so the call replays with it.
+  defp namespace_metadata(%{"namespace" => namespace}) when is_binary(namespace),
+    do: %{"namespace" => namespace}
+
+  defp namespace_metadata(_item), do: nil
+
+  defp content_items_to_content_parts_and_tool_calls(content_items) do
+    Enum.reduce(content_items, {[], []}, fn content_item, {content_parts, tool_calls} ->
+      case content_item_to_content_part_or_tool_call(content_item) do
+        %ContentPart{} = cp ->
+          {content_parts ++ [cp], tool_calls}
+
+        %ToolCall{} = tc ->
+          {content_parts, tool_calls ++ [tc]}
+      end
+    end)
+  end
+
+  defp content_item_to_content_part_or_tool_call(
+         %{
+           "type" => "message",
+           "content" => message_contents
+         } = item
+       ) do
+    {text_parts, all_citations} =
+      Enum.reduce(message_contents, {[], []}, fn
+        %{"type" => "output_text", "text" => text} = item, {texts, citations} ->
+          new_citations = parse_openai_annotations(Map.get(item, "annotations", []))
+          {texts ++ [text], citations ++ new_citations}
+
+        %{"type" => "refusal", "refusal" => refusal}, {texts, citations} ->
+          {texts ++ [refusal], citations}
+      end)
+
+    text = Enum.join(text_parts, " ")
+    part = ContentPart.text!(text)
+
+    %{part | citations: all_citations}
+    |> put_utterance_from_phase(item["phase"])
+  end
+
+  # A function call cut off with its response carries `"status":
+  # "incomplete"` and arguments that stop partway, so it stays an incomplete
+  # call holding the raw text rather than being parsed and run.
+  defp content_item_to_content_part_or_tool_call(
+         %{
+           "type" => "function_call",
+           "call_id" => call_id,
+           "name" => name,
+           "arguments" => args
+         } = item
+       ) do
+    status = if item["status"] == "incomplete", do: :incomplete, else: :complete
+
+    case ToolCall.new(%{
+           type: :function,
+           status: status,
+           name: name,
+           arguments: args,
+           call_id: call_id,
+           metadata: namespace_metadata(item)
+         }) do
+      {:ok, %ToolCall{} = call} ->
+        call
+
+      {:error, %Ecto.Changeset{} = changeset} ->
+        {:error, LangChainError.exception(changeset)}
+    end
+  end
+
+  # Hosted tool search adds a `tool_search_call` and a `tool_search_output`
+  # item ahead of the call to the tool it loaded. Each is kept whole as a
+  # provider item and replayed unchanged by `stand_alone_items_for_api/2`.
+  defp content_item_to_content_part_or_tool_call(%{"type" => type} = item)
+       when type in @tool_search_item_types do
+    ContentPart.provider_item!(@provider_item_name, item)
+  end
+
+  # The Responses API returns web_search_call as a sibling of assistant messages, as
+  # in:
+  # %{
+  #   ...,
+  #   "output" => [
+  #     %{"type" => "web_search_call", ...},
+  #     %{"type" => "message", "content" => [...content_parts...]}
+  #   ]
+  # }
+  # however we embed it within the message as an unsupported content part to maintain the
+  # idiom of returning a single %Message{} per API call.
+  defp content_item_to_content_part_or_tool_call(%{
+         "type" => "web_search_call",
+         "id" => web_search_call_id,
+         "status" => "completed"
+       }) do
+    case ContentPart.new(%{
+           type: :unsupported,
+           options: [id: web_search_call_id, status: "completed", type: "web_search_call"]
+         }) do
+      {:ok, %ContentPart{} = call} ->
+        call
+
+      {:error, %Ecto.Changeset{} = changeset} ->
+        {:error, LangChainError.exception(changeset)}
+    end
+  end
+
+  # Reasoning output from gpt-5 and o-series models. The item has no display
+  # value, but it carries the `encrypted_content` the API needs handed back to
+  # keep reasoning continuous across a tool loop, so it is kept as an
+  # `:unsupported` part and replayed by `reasoning_item_for_api/1`.
+  #
+  # `encrypted_content` is only present when the request asked for it with
+  # `include: ["reasoning.encrypted_content"]`.
+  defp content_item_to_content_part_or_tool_call(
+         %{
+           "type" => "reasoning",
+           "id" => reasoning_id,
+           "summary" => summary
+         } = item
+       ) do
+    options =
+      [id: reasoning_id, summary: summary, type: "reasoning"]
+      |> maybe_put_encrypted_content(item["encrypted_content"])
+
+    case ContentPart.new(%{type: :unsupported, options: options}) do
+      {:ok, %ContentPart{} = part} ->
+        part
+
+      {:error, %Ecto.Changeset{} = changeset} ->
+        reason = Utils.changeset_error_to_string(changeset)
+        Logger.warning("Failed to process reasoning output. Reason: #{reason}")
+        # Return a minimal content part to avoid breaking the flow
+        ContentPart.text!("")
+    end
+  end
+
+  defp content_item_to_content_part_or_tool_call(
+         %{
+           "type" => "file_search_call"
+         } = part
+       ) do
+    # Store reasoning as an unsupported content part for now
+    # This preserves the information without breaking the flow
+    case ContentPart.new(%{
+           type: :unsupported,
+           options: [
+             id: part["id"],
+             type: "file_search_call",
+             queries: part["queries"],
+             results: part["results"]
+           ]
+         }) do
+      {:ok, %ContentPart{} = part} ->
+        part
+
+      {:error, %Ecto.Changeset{} = changeset} ->
+        reason = Utils.changeset_error_to_string(changeset)
+        Logger.warning("Failed to process file_search output. Reason: #{reason}")
+        # Return a minimal content part to avoid breaking the flow
+        ContentPart.text!("")
+    end
+  end
+
+  # Catch-all for unknown content item types
+  defp content_item_to_content_part_or_tool_call(%{"type" => type} = item) do
+    Logger.warning("Unknown content item type: #{type}. Item: #{inspect(item)}")
+    # Return empty text content to avoid breaking the flow
+    ContentPart.text!("")
+  end
+
+  # A message item's `phase` says whether the model is narrating work in
+  # progress (`"commentary"`) or answering (`"final_answer"`). This mapping and
+  # its inverse in `phase_for_utterance/1` are the only places the API's
+  # vocabulary appears; everything else reads the part's utterance marker.
+  defp put_utterance_from_phase(part, "commentary"),
+    do: ContentPart.put_utterance(part, "narration")
+
+  defp put_utterance_from_phase(part, "final_answer"),
+    do: ContentPart.put_utterance(part, "answer")
+
+  defp put_utterance_from_phase(part, _phase), do: part
+
+  defp phase_for_utterance("narration"), do: "commentary"
+  defp phase_for_utterance("answer"), do: "final_answer"
+  defp phase_for_utterance(_utterance), do: nil
+
+  # -- OpenAI annotation parsing helpers --
+
+  defp parse_openai_annotations(annotations) when is_list(annotations) do
+    Enum.map(annotations, &parse_openai_annotation/1)
+  end
+
+  defp parse_openai_annotations(_), do: []
+
+  defp parse_openai_annotation(%{"type" => "url_citation"} = ann) do
+    Citation.new!(%{
+      source: %{
+        type: :web,
+        title: Map.get(ann, "title"),
+        url: Map.get(ann, "url")
+      },
+      start_index: Map.get(ann, "start_index"),
+      end_index: Map.get(ann, "end_index"),
+      metadata: %{"provider_type" => "url_citation"}
+    })
+  end
+
+  defp parse_openai_annotation(%{"type" => "file_citation"} = ann) do
+    Citation.new!(%{
+      source: %{
+        type: :document,
+        document_id: Map.get(ann, "file_id"),
+        title: Map.get(ann, "filename"),
+        metadata: %{"filename" => Map.get(ann, "filename")}
+      },
+      start_index: Map.get(ann, "start_index"),
+      end_index: Map.get(ann, "end_index"),
+      metadata: %{"provider_type" => "file_citation"}
+    })
+  end
+
+  defp parse_openai_annotation(%{"type" => type} = ann) do
+    Logger.warning("Unknown OpenAI annotation type: #{type}")
+
+    Citation.new!(%{
+      metadata: %{"provider_type" => type, "raw" => ann}
+    })
+  end
+
+  defp maybe_add_org_id_header(%Req.Request{} = req) do
+    org_id = get_org_id()
+
+    if org_id do
+      Req.Request.put_header(req, "OpenAI-Organization", org_id)
+    else
+      req
+    end
+  end
+
+  defp maybe_add_proj_id_header(%Req.Request{} = req) do
+    proj_id = get_proj_id()
+
+    if proj_id do
+      Req.Request.put_header(req, "OpenAI-Project", proj_id)
+    else
+      req
+    end
+  end
+
+  defp get_ratelimit_info(response_headers) do
+    # extract out all the ratelimit response headers
+    #
+    #  https://platform.openai.com/docs/guides/rate-limits/rate-limits-in-headers
+    {return, _} =
+      Map.split(response_headers, [
+        "x-ratelimit-limit-requests",
+        "x-ratelimit-limit-tokens",
+        "x-ratelimit-remaining-requests",
+        "x-ratelimit-remaining-tokens",
+        "x-ratelimit-reset-requests",
+        "x-ratelimit-reset-tokens",
+        "x-request-id"
+      ])
+
+    return
+  end
+
+  @doc """
+  Generate a config map that can later restore the model's configuration.
+  """
+  @impl ChatModel
+  @spec serialize_config(t()) :: %{String.t() => any()}
+  def serialize_config(%ChatOpenAIResponses{} = model) do
+    Utils.to_serializable_map(
+      model,
+      [
+        :endpoint,
+        :model,
+        :context_management,
+        :prompt_cache_key,
+        :prompt_cache_options,
+        :temperature,
+        :frequency_penalty,
+        :reasoning,
+        :receive_timeout,
+        :seed,
+        :n,
+        :json_response,
+        :json_schema,
+        :stream,
+        :max_tokens,
+        :stream_options,
+        :verbosity,
+        :service_tier,
+        :extra_body
+      ],
+      @current_config_version
+    )
+  end
+
+  @doc """
+  Restores the model from the config.
+  """
+  @impl ChatModel
+  def restore_from_map(%{"version" => 1} = data) do
+    ChatOpenAIResponses.new(data)
+  end
+
+  @impl ChatModel
+  def provider, do: "openai_responses"
+
+  @doc """
+  Determine if an error should be retried with a fallback model.
+  Aligns with other providers.
+  """
+  @impl ChatModel
+  @spec retry_on_fallback?(LangChainError.t()) :: boolean()
+  def retry_on_fallback?(%LangChainError{type: "rate_limited"}), do: true
+  def retry_on_fallback?(%LangChainError{type: "rate_limit_exceeded"}), do: true
+  def retry_on_fallback?(%LangChainError{type: "timeout"}), do: true
+  def retry_on_fallback?(%LangChainError{type: "too_many_requests"}), do: true
+  def retry_on_fallback?(_), do: false
+end

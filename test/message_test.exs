@@ -5,6 +5,7 @@ defmodule LangChain.MessageTest do
   alias LangChain.Message.ToolCall
   alias LangChain.Message.ToolResult
   alias LangChain.Message.ContentPart
+  alias LangChain.Message.Citation
   alias LangChain.PromptTemplate
   alias LangChain.LangChainError
 
@@ -143,6 +144,37 @@ defmodule LangChain.MessageTest do
       content_part = ContentPart.text!("Hello world")
       assert {:ok, result} = Message.new(%{role: :user, content: content_part})
       assert result.content == [content_part]
+    end
+  end
+
+  describe "status" do
+    test "accepts each way a message can terminate" do
+      for status <- [:complete, :cancelled, :length, :content_filtered, :stream_error] do
+        assert {:ok, %Message{status: ^status}} =
+                 Message.new(%{role: :assistant, content: "Partial", status: status})
+      end
+    end
+
+    test "rejects an unknown status" do
+      assert {:error, changeset} =
+               Message.new(%{role: :assistant, content: "Partial", status: :made_up})
+
+      assert {"is invalid", _} = changeset.errors[:status]
+    end
+
+    test "defaults to :complete" do
+      assert {:ok, %Message{status: :complete}} = Message.new(%{role: :user, content: "Hi"})
+    end
+
+    test "only a :complete message has its tool call arguments parsed" do
+      # An unfinished message may hold a truncated arguments string, so parsing
+      # is skipped rather than failing the whole message.
+      truncated = ToolCall.new!(%{call_id: "1", name: "search", arguments: "{\"q\": \"eli"})
+
+      assert {:ok, %Message{} = message} =
+               Message.new(%{role: :assistant, tool_calls: [truncated], status: :length})
+
+      assert [%ToolCall{arguments: "{\"q\": \"eli", status: :incomplete}] = message.tool_calls
     end
   end
 
@@ -405,6 +437,174 @@ defmodule LangChain.MessageTest do
     end
   end
 
+  describe "narration?/1" do
+    test "true when every text part is narration" do
+      msg =
+        Message.new_assistant!(%{
+          content: [
+            ContentPart.narration!("Checking."),
+            ContentPart.narration!("Still checking.")
+          ]
+        })
+
+      assert Message.narration?(msg)
+    end
+
+    test "true when non-text parts sit beside narration" do
+      msg =
+        Message.new_assistant!(%{
+          content: [ContentPart.thinking!("hmm"), ContentPart.narration!("Checking.")]
+        })
+
+      assert Message.narration?(msg)
+    end
+
+    test "false when narration and an answer are mixed" do
+      msg =
+        Message.new_assistant!(%{
+          content: [ContentPart.narration!("Checking."), ContentPart.answer!("Found it.")]
+        })
+
+      refute Message.narration?(msg)
+    end
+
+    test "false when narration sits beside an unmarked part" do
+      msg =
+        Message.new_assistant!(%{
+          content: [ContentPart.narration!("Checking."), ContentPart.text!("Found it.")]
+        })
+
+      refute Message.narration?(msg)
+    end
+
+    test "false when unmarked" do
+      refute Message.narration?(Message.new_assistant!(%{content: "Howdy"}))
+    end
+
+    test "false when there is no text part" do
+      refute Message.narration?(
+               Message.new_assistant!(%{content: [ContentPart.thinking!("hmm")]})
+             )
+    end
+
+    test "false with tool calls" do
+      msg =
+        Message.new_assistant!(%{
+          content: [ContentPart.narration!("Checking.")],
+          tool_calls: [ToolCall.new!(%{call_id: "call_1", name: "my_fun", arguments: nil})]
+        })
+
+      refute Message.narration?(msg)
+      assert Message.is_tool_call?(msg)
+    end
+
+    test "false for a non-assistant role" do
+      refute Message.narration?(Message.new_user!([ContentPart.narration!("Checking.")]))
+
+      msg =
+        Message.new_tool_result!(%{
+          tool_results: [ToolResult.new!(%{tool_call_id: "call_1", content: "ok"})]
+        })
+
+      refute Message.narration?(msg)
+    end
+
+    test "false for string content" do
+      refute Message.narration?(%Message{role: :assistant, content: "Checking."})
+    end
+  end
+
+  describe "end_turn/1" do
+    test "reads the provider's report from metadata" do
+      assert Message.end_turn(
+               Message.new_assistant!(%{content: "Hi", metadata: %{end_turn: true}})
+             )
+
+      refute Message.end_turn(
+               Message.new_assistant!(%{content: "Hi", metadata: %{end_turn: false}})
+             )
+    end
+
+    test "nil when the provider did not report it" do
+      assert Message.end_turn(Message.new_assistant!("Hi")) == nil
+      assert Message.end_turn(Message.new_assistant!(%{content: "Hi", metadata: %{}})) == nil
+    end
+
+    test "nil for a value that is not a boolean" do
+      msg = Message.new_assistant!(%{content: "Hi", metadata: %{end_turn: "false"}})
+      assert Message.end_turn(msg) == nil
+    end
+  end
+
+  describe "continues_turn?/1" do
+    defp narration, do: Message.new_assistant!(%{content: [ContentPart.narration!("Checking.")]})
+
+    defp with_end_turn(%Message{} = msg, value), do: %Message{msg | metadata: %{end_turn: value}}
+
+    test "narration continues the turn when the provider did not report" do
+      assert Message.continues_turn?(narration())
+      refute Message.continues_turn?(Message.new_assistant!("Done."))
+    end
+
+    test "end_turn false continues the turn whatever the content" do
+      assert Message.continues_turn?(Message.new_assistant!("Done.") |> with_end_turn(false))
+
+      assert Message.continues_turn?(
+               Message.new_assistant!(%{content: []})
+               |> with_end_turn(false)
+             )
+    end
+
+    test "end_turn true ends the turn, narration included" do
+      refute Message.continues_turn?(narration() |> with_end_turn(true))
+    end
+
+    test "false for roles other than assistant" do
+      refute Message.continues_turn?(Message.new_user!("Continue."))
+    end
+  end
+
+  describe "answer_content/1" do
+    test "drops narration parts" do
+      msg =
+        Message.new_assistant!(%{
+          content: [ContentPart.narration!("Checking."), ContentPart.answer!(~s({"a": 1}))]
+        })
+
+      assert Message.answer_content(msg) == ~s({"a": 1})
+    end
+
+    test "joins the remaining text parts like content_to_string/1" do
+      msg =
+        Message.new_assistant!(%{
+          content: [
+            ContentPart.text!("One"),
+            ContentPart.narration!("x"),
+            ContentPart.text!("Two")
+          ]
+        })
+
+      assert Message.answer_content(msg) == "One\n\nTwo"
+    end
+
+    test "matches content_to_string/1 when there is no narration" do
+      msg = Message.new_assistant!(%{content: "Howdy"})
+      assert Message.answer_content(msg) == ContentPart.content_to_string(msg.content)
+    end
+
+    test "nil when the message is narration only or has no content" do
+      assert Message.answer_content(
+               Message.new_assistant!(%{content: [ContentPart.narration!("Checking.")]})
+             ) == nil
+
+      assert Message.answer_content(%Message{role: :assistant, content: nil}) == nil
+    end
+
+    test "returns string content as is" do
+      assert Message.answer_content(%Message{role: :assistant, content: "Hi"}) == "Hi"
+    end
+  end
+
   describe "is_tool_related?/1" do
     test "returns true when a tool call" do
       msg =
@@ -495,6 +695,91 @@ defmodule LangChain.MessageTest do
 
     test "returns false when not a tool response" do
       refute Message.tool_had_errors?(Message.new_assistant!(%{content: "Howdy"}))
+    end
+  end
+
+  describe "replace_tool_result/3" do
+    test "replaces the correct result in a multi-result tool message" do
+      result1 =
+        ToolResult.new!(%{tool_call_id: "call_1", name: "search", content: "found"})
+
+      result2 =
+        ToolResult.new!(%{
+          tool_call_id: "call_2",
+          name: "task",
+          content: "interrupted",
+          is_interrupt: true,
+          interrupt_data: %{type: :subagent_hitl}
+        })
+
+      tool_msg = Message.new_tool_result!(%{content: nil, tool_results: [result1, result2]})
+      messages = [Message.new_user!("hi"), tool_msg]
+
+      new_result =
+        ToolResult.new!(%{tool_call_id: "call_2", name: "task", content: "completed!"})
+
+      updated = Message.replace_tool_result(messages, "call_2", new_result)
+
+      assert [_user_msg, updated_tool_msg] = updated
+      assert length(updated_tool_msg.tool_results) == 2
+
+      # First result unchanged
+      assert Enum.at(updated_tool_msg.tool_results, 0).tool_call_id == "call_1"
+      assert Enum.at(updated_tool_msg.tool_results, 0).is_interrupt == false
+
+      # Second result replaced
+      replaced = Enum.at(updated_tool_msg.tool_results, 1)
+      assert replaced.tool_call_id == "call_2"
+      assert replaced.is_interrupt == false
+      assert replaced.content == [LangChain.Message.ContentPart.text!("completed!")]
+    end
+
+    test "no-op when tool_call_id doesn't match" do
+      result =
+        ToolResult.new!(%{tool_call_id: "call_1", name: "search", content: "found"})
+
+      tool_msg = Message.new_tool_result!(%{content: nil, tool_results: [result]})
+      messages = [tool_msg]
+
+      new_result =
+        ToolResult.new!(%{tool_call_id: "call_999", name: "task", content: "new"})
+
+      updated = Message.replace_tool_result(messages, "call_999", new_result)
+
+      assert updated == messages
+    end
+
+    test "non-tool messages are passed through unchanged" do
+      user_msg = Message.new_user!("hi")
+      assistant_msg = Message.new_assistant!("hello")
+      messages = [user_msg, assistant_msg]
+
+      new_result =
+        ToolResult.new!(%{tool_call_id: "call_1", name: "task", content: "done"})
+
+      updated = Message.replace_tool_result(messages, "call_1", new_result)
+      assert updated == messages
+    end
+
+    test "handles single-result tool messages" do
+      result =
+        ToolResult.new!(%{
+          tool_call_id: "call_1",
+          name: "task",
+          content: "placeholder",
+          is_interrupt: true
+        })
+
+      tool_msg = Message.new_tool_result!(%{content: nil, tool_results: [result]})
+
+      new_result =
+        ToolResult.new!(%{tool_call_id: "call_1", name: "task", content: "real result"})
+
+      [updated_msg] = Message.replace_tool_result([tool_msg], "call_1", new_result)
+      assert length(updated_msg.tool_results) == 1
+      replaced = hd(updated_msg.tool_results)
+      assert replaced.is_interrupt == false
+      assert replaced.content == [LangChain.Message.ContentPart.text!("real result")]
     end
   end
 
@@ -642,6 +927,95 @@ defmodule LangChain.MessageTest do
       }
 
       refute Message.is_empty?(message)
+    end
+  end
+
+  describe "all_citations/1" do
+    test "collects citations across content parts" do
+      citation1 =
+        Citation.new!(%{cited_text: "first", source: %{type: :web, url: "https://a.com"}})
+
+      citation2 =
+        Citation.new!(%{cited_text: "second", source: %{type: :document, document_id: "doc_1"}})
+
+      %ContentPart{} = base1 = ContentPart.text!("Hello")
+      part1 = %ContentPart{base1 | citations: [citation1]}
+      part2 = ContentPart.text!(" plain text")
+      %ContentPart{} = base3 = ContentPart.text!(" more")
+      part3 = %ContentPart{base3 | citations: [citation2]}
+
+      message = Message.new_assistant!([part1, part2, part3])
+
+      assert [%Citation{cited_text: "first"}, %Citation{cited_text: "second"}] =
+               Message.all_citations(message)
+    end
+
+    test "returns empty list for message with no citations" do
+      message = Message.new_assistant!("No citations here")
+      assert Message.all_citations(message) == []
+    end
+
+    test "returns empty list for string content" do
+      message = %Message{role: :assistant, content: "just a string", status: :complete}
+      assert Message.all_citations(message) == []
+    end
+
+    test "returns empty list for nil content" do
+      message = %Message{role: :assistant, content: nil, status: :complete}
+      assert Message.all_citations(message) == []
+    end
+  end
+
+  describe "strip_reasoning/1" do
+    test "leaves a message with no reasoning unchanged" do
+      message = Message.new_assistant!("Hello")
+      assert Message.strip_reasoning(message) == message
+      assert Message.strip_reasoning([message]) == [message]
+    end
+
+    test "leaves string content unchanged" do
+      %Message{} = message = Message.new_user!("Hi")
+      message = %Message{message | content: "Hi"}
+      assert Message.strip_reasoning(message) == message
+    end
+
+    test "removes reasoning parts and keeps the rest" do
+      message =
+        Message.new_assistant!([
+          ContentPart.thinking!("hmm", signature: "SIG"),
+          ContentPart.text!("Done")
+        ])
+
+      assert %Message{content: [%ContentPart{type: :text, content: "Done"}]} =
+               Message.strip_reasoning(message)
+    end
+
+    test "keeps a tool call message whose only other part is reasoning" do
+      message =
+        Message.new_assistant!(%{
+          content: [ContentPart.thinking!("hmm")],
+          tool_calls: [ToolCall.new!(%{call_id: "1", name: "hello", arguments: %{}})]
+        })
+
+      assert [%Message{content: [], tool_calls: [%ToolCall{call_id: "1"}]}] =
+               Message.strip_reasoning([message])
+    end
+
+    test "drops a message left empty without tool calls" do
+      reasoning_only = Message.new_assistant!([ContentPart.thinking!("hmm")])
+      user = Message.new_user!("Hi")
+
+      assert [^user] = Message.strip_reasoning([reasoning_only, user])
+    end
+
+    test "is idempotent" do
+      messages = [
+        Message.new_user!("Hi"),
+        Message.new_assistant!([ContentPart.thinking!("hmm"), ContentPart.text!("Hello")])
+      ]
+
+      once = Message.strip_reasoning(messages)
+      assert Message.strip_reasoning(once) == once
     end
   end
 end

@@ -5,6 +5,7 @@ defmodule LangChain.Utils do
   alias LangChain.LangChainError
   alias Ecto.Changeset
   alias LangChain.Callbacks
+  alias LangChain.Function
   alias LangChain.Message
   alias LangChain.Message.ContentPart
   alias LangChain.MessageDelta
@@ -29,6 +30,66 @@ defmodule LangChain.Utils do
     Map.put(map, key, value)
   end
 
+  @doc """
+  Merge user-supplied `extra_body` values into a request body built by a chat
+  model's `for_api/3`.
+
+  Values in `extra` win over values in `body`:
+
+  - Keys are matched by their string form, so a string key in `extra`
+    overwrites an existing atom key of the same name in place instead of
+    producing a duplicate key in the encoded JSON. Keys not already present are
+    added exactly as given; no atoms are created.
+  - A `nil` value removes the key from the body.
+  - When both sides hold a map, they are merged recursively by the same rules.
+    Any other value, lists included, replaces the existing value.
+
+  Returns `body` unchanged when `extra` is `nil` or empty.
+
+  Overriding keys the model depends on to parse the response, such as
+  `stream`, `messages`, `model` or `tools`, can break response handling.
+
+  ## Examples
+
+      iex> LangChain.Utils.merge_extra_body(%{max_tokens: 100, n: 1}, %{"max_tokens" => 10, "n" => nil})
+      %{max_tokens: 10}
+
+      iex> LangChain.Utils.merge_extra_body(%{model: "gpt-4o"}, %{"service_tier" => "priority"})
+      %{:model => "gpt-4o", "service_tier" => "priority"}
+  """
+  @spec merge_extra_body(map(), map() | nil) :: map()
+  def merge_extra_body(body, nil), do: body
+  def merge_extra_body(body, extra) when map_size(extra) == 0, do: body
+
+  def merge_extra_body(body, %{} = extra) when is_map(body) do
+    Enum.reduce(extra, body, fn {key, value}, acc ->
+      existing_key = find_key_by_string(acc, key)
+      target_key = existing_key || key
+
+      case {Map.get(acc, existing_key), value} do
+        {_current, nil} ->
+          Map.delete(acc, target_key)
+
+        {%{} = current, %{} = incoming} ->
+          Map.put(acc, target_key, merge_extra_body(current, incoming))
+
+        _other ->
+          Map.put(acc, target_key, value)
+      end
+    end)
+  end
+
+  # Find the key in `map` whose string form equals that of `key`, so `:n` and
+  # `"n"` are treated as the same JSON key. Returns `nil` when there is none.
+  defp find_key_by_string(map, key) do
+    if Map.has_key?(map, key) do
+      key
+    else
+      target = to_string(key)
+      Enum.find(Map.keys(map), fn existing -> to_string(existing) == target end)
+    end
+  end
+
   # Generate wrapped LLM callbacks on the model that include the chain as part
   # of the context.
   @doc false
@@ -43,8 +104,11 @@ defmodule LangChain.Utils do
       :on_llm_new_message,
       :on_llm_ratelimit_info,
       :on_llm_token_usage,
-      :on_llm_response_headers
+      :on_llm_response_headers,
+      :on_llm_reasoning_delta
     ]
+
+    tool_map = Map.get(context, :_tool_map) || %{}
 
     # get the LLM callbacks from the chain.
     new_callbacks =
@@ -52,16 +116,33 @@ defmodule LangChain.Utils do
       |> Enum.map(fn callback_map ->
         callback_map
         |> Map.take(to_wrap)
-        |> Enum.map(fn {key, fun} ->
-          # return a wrapped/curried function that embeds the chain context into
-          # the call
-          {key, fn arg -> fun.(context, arg) end}
+        |> Enum.map(fn
+          # For :on_llm_new_delta, augment tool calls with display_text before
+          # passing to the callback so consumers get enriched deltas during
+          # streaming (not only after post-streaming processing).
+          {:on_llm_new_delta, fun} when tool_map != %{} ->
+            {:on_llm_new_delta,
+             fn deltas ->
+               fun.(context, augment_delta_display_text(deltas, tool_map))
+             end}
+
+          {key, fun} ->
+            # return a wrapped/curried function that embeds the chain context into
+            # the call
+            {key, fn arg -> fun.(context, arg) end}
         end)
         |> Enum.into(%{})
       end)
 
-    # put those onto the model and return it
-    %{llm | callbacks: new_callbacks}
+    # Append rather than replace. Callbacks assigned directly to the model are
+    # the caller's own and must survive a chain run; overwriting them here made
+    # `ChatOpenAI.new(%{callbacks: [handler]})` silently do nothing whenever the
+    # model was run through an LLMChain.
+    #
+    # Note the two tiers take different arities. Model-tier handlers are fired
+    # by the chat model with just the event argument, while the chain-tier
+    # handlers wrapped above are curried with the chain as the first argument.
+    %{llm | callbacks: llm.callbacks ++ new_callbacks}
   end
 
   @doc """
@@ -131,11 +212,13 @@ defmodule LangChain.Utils do
   Fire a streaming callback if present.
   """
   @spec fire_streamed_callback(
-          %{optional(:stream) => boolean(), callbacks: [map()]},
+          map(),
           data :: callback_data() | [callback_data()]
         ) :: :ok | no_return()
 
   def fire_streamed_callback(model, deltas) when is_list(deltas) do
+    maybe_emit_first_token(model, deltas)
+
     #
     # Wrap in a another list for being sent as "args" in an MFA call
     Callbacks.fire(model.callbacks, :on_llm_new_delta, [deltas])
@@ -145,6 +228,32 @@ defmodule LangChain.Utils do
   def fire_streamed_callback(_model, other) do
     Logger.warning("Received unexpected data in the streamed callback: #{inspect(other)}")
     :ok
+  end
+
+  # Emits the time-to-first-token telemetry event once per streaming LLM call, on
+  # the first streamed chunk that carries a `%MessageDelta{}`. The call's start
+  # time is stashed in the process dictionary by
+  # `LangChain.ChatModels.ChatModel.llm_telemetry_span/3` (streaming decode runs in
+  # the same process). Degrades to a no-op when there is no start time (streaming
+  # outside a telemetry span) or when it has already fired for this call. The
+  # event is inert unless an OpenTelemetry (or other) handler is attached.
+  defp maybe_emit_first_token(model, deltas) do
+    with nil <- Process.get(:langchain_stream_first_token_seen),
+         true <- Enum.any?(deltas, &match?(%MessageDelta{}, &1)),
+         start when is_integer(start) <- Process.get(:langchain_llm_call_start) do
+      Process.put(:langchain_stream_first_token_seen, true)
+
+      LangChain.Telemetry.emit_event(
+        [:langchain, :llm, :stream, :first_token],
+        %{duration: System.monotonic_time() - start, system_time: System.system_time()},
+        %{
+          model: Map.get(model, :model),
+          provider: LangChain.ChatModels.ChatModel.provider(model)
+        }
+      )
+    else
+      _ -> :ok
+    end
   end
 
   @doc """
@@ -168,7 +277,7 @@ defmodule LangChain.Utils do
     `transform_data_fn`.
   """
   @spec handle_stream_fn(
-          %{optional(:stream) => boolean()},
+          map(),
           decode_stream_fn :: function(),
           transform_data_fn :: function()
         ) :: function()
@@ -211,10 +320,8 @@ defmodule LangChain.Utils do
         #         %LangChain.MessageDelta{
         #           content: nil,
         #           index: 0,
-        #           function_name: nil,
         #           role: :assistant,
-        #           arguments: nil,
-        #           complete: false
+        #           status: :incomplete
         #         },
         #         ...
         #       ]
@@ -229,25 +336,62 @@ defmodule LangChain.Utils do
         {:cont, {req, updated_response}}
 
       {:data, _raw_data}, {req, %Req.Response{status: 401} = _response} ->
-        Logger.error("Check API key settings. Request rejected for authentication failure.")
+        Logger.warning("Check API key settings. Request rejected for authentication failure.")
         {:halt, {req, LangChainError.exception("Authentication failure with request")}}
 
       {:data, raw_data}, {req, %Req.Response{status: status} = response}
       when status in 400..599 ->
-        case Jason.decode(raw_data) do
+        # Buffer error response data across chunks since the JSON may span
+        # multiple chunks. Try to decode the accumulated data on each chunk.
+        buffered = Req.Response.get_private(response, :error_buffer, "")
+        combined = buffered <> raw_data
+
+        case Jason.decode(combined) do
           {:ok, data} ->
             {:halt, {req, %{response | body: transform_data_fn.(data)}}}
 
-          {:error, reason} ->
-            Logger.error("Failed to JSON decode error response. ERROR: #{inspect(reason)}")
-
-            {:halt,
-             {req, LangChainError.exception("Failed to handle error response from server.")}}
+          {:error, _reason} ->
+            # JSON is incomplete, keep buffering
+            updated_response = Req.Response.put_private(response, :error_buffer, combined)
+            {:cont, {req, updated_response}}
         end
 
       {:data, _raw_data}, {req, response} ->
-        Logger.error("Unhandled API response!")
+        Logger.warning("Unhandled API response!")
         {:halt, {req, response}}
+    end
+  end
+
+  @doc """
+  Extract a structured error from a non-200 streaming response.
+
+  When `handle_stream_fn/3` processes error responses, it buffers the raw JSON
+  in the response's private `:error_buffer` key. This function attempts to
+  extract a parsed error map from either the response body (if already decoded)
+  or the buffered data.
+
+  Returns `{:ok, parsed_map}` with the decoded JSON map, or `:not_found`.
+
+  The caller is responsible for converting the parsed map into the appropriate
+  error struct (e.g. `LangChainError`), since the error structure varies by
+  provider.
+  """
+  @spec extract_stream_error(Req.Response.t()) :: {:ok, map()} | :not_found
+  def extract_stream_error(%Req.Response{} = response) do
+    buffer = Req.Response.get_private(response, :error_buffer, nil)
+
+    cond do
+      is_map(response.body) && response.body != %{} ->
+        {:ok, response.body}
+
+      is_binary(buffer) ->
+        case Jason.decode(buffer) do
+          {:ok, data} when is_map(data) -> {:ok, data}
+          _ -> :not_found
+        end
+
+      true ->
+        :not_found
     end
   end
 
@@ -287,6 +431,13 @@ defmodule LangChain.Utils do
   """
   def stringify_keys(nil), do: nil
 
+  # Handle structs by converting them to maps first
+  def stringify_keys(%{__struct__: _} = struct) do
+    struct
+    |> Map.from_struct()
+    |> stringify_keys()
+  end
+
   def stringify_keys(map = %{}) do
     map
     |> Enum.map(fn {k, v} -> {to_string(k), stringify_keys(v)} end)
@@ -316,15 +467,12 @@ defmodule LangChain.Utils do
       {:ok, String.to_existing_atom(module_name)}
     rescue
       _err ->
-        Logger.error("Failed to restore using module_name #{inspect(module_name)}. Not found.")
         {:error, "ChatModel module #{inspect(module_name)} not found"}
     end
   end
 
   def module_from_name(module_name) do
-    msg = "Not an Elixir module: #{inspect(module_name)}"
-    Logger.error(msg)
-    {:error, msg}
+    {:error, "Not an Elixir module: #{inspect(module_name)}"}
   end
 
   @doc """
@@ -398,5 +546,68 @@ defmodule LangChain.Utils do
       _ ->
         changeset
     end
+  end
+
+  # Set display_text on tool calls in streaming deltas using the chain's tool map.
+  # Called from rewrap_callbacks_for_model to enrich deltas before they reach
+  # consumer callbacks. Uses the same resolution logic as
+  # LLMChain.resolve_display_text: prefer Function.display_text, fall back to
+  # humanize_tool_name.
+  @doc false
+  @spec augment_delta_display_text([MessageDelta.t()], map()) :: [MessageDelta.t()]
+  def augment_delta_display_text(deltas, tool_map) when is_list(deltas) do
+    Enum.map(deltas, fn
+      %{tool_calls: [_ | _] = tcs} = delta ->
+        updated_tcs =
+          Enum.map(tcs, fn tc ->
+            if tc.name != nil and tc.display_text == nil do
+              display_text =
+                case tool_map[tc.name] do
+                  %Function{display_text: dt} when not is_nil(dt) -> dt
+                  _ -> humanize_tool_name(tc.name)
+                end
+
+              %{tc | display_text: display_text}
+            else
+              tc
+            end
+          end)
+
+        %{delta | tool_calls: updated_tcs}
+
+      delta ->
+        delta
+    end)
+  end
+
+  @doc """
+  Convert a tool name to a human-friendly display string.
+
+  ## Examples
+
+      iex> LangChain.Utils.humanize_tool_name("file_read")
+      "File read"
+
+      iex> LangChain.Utils.humanize_tool_name("search_web")
+      "Search web"
+  """
+  @spec humanize_tool_name(String.t()) :: String.t()
+  def humanize_tool_name(name) when is_binary(name) do
+    name
+    |> String.replace("_", " ")
+    |> String.capitalize()
+  end
+
+  @doc """
+  Generate an id for a tool call.
+
+  Some providers omit an id for a tool call, or identify it by name only, as
+  Gemini's function call parts do. An id is synthesized for those so each call
+  stays distinct from every other one, including across a conversation that is
+  stored and later reloaded.
+  """
+  @spec generate_tool_call_id() :: String.t()
+  def generate_tool_call_id do
+    Ecto.UUID.generate()
   end
 end

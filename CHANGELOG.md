@@ -1,12 +1,2022 @@
 # Changelog
 
-## [Unreleased]
+## v0.15.9
 
+A tool call can now be labelled from its arguments, so a UI can show
+"Searching for Chrome" instead of the same "Searching the web" for every call.
 
-- New callback `on_llm_response_headers` supports receiving the full Req HTTP response headers for a request.
+No breaking changes. Functions without the new option behave as before.
+
+### Added
+
+- `Function` option `display_text_from_args`, a 1-arity function that receives
+  a call's parsed arguments and returns its label, or `nil` to keep the static
+  `display_text`. `LLMChain` writes the result to the call's `display_text`
+  once the arguments are complete. A streamed call first gets the static label
+  and is relabelled when the message completes, so `:on_tool_call_identified`
+  fires a second time when the label changes. A blank or non-string result,
+  or a resolver that raises, keeps the static label.
+  https://github.com/brainlid/langchain/pull/705
+
+### Changed
+
+- `ToolResult` docs state that `content` is always a list of `ContentPart`
+  structs once built. `new/1` and `new!/1` convert a string, but a direct
+  struct update must supply the list itself, because some chat model encoders
+  accept only content parts. https://github.com/brainlid/langchain/pull/704
+
+## v0.15.8
+
+`ChatOpenAICompatible` now types temporary service failures, so a chain's
+`with_fallbacks` models are tried for them. Services that report these
+failures with their own error codes, such as Cloudflare Workers AI, opt in
+through a new `error_code_types` option.
+
+No breaking changes. A chain that uses `ChatOpenAICompatible` with fallbacks
+may now fall back in cases where it used to return the error, listed below.
+
+### Upgrading from v0.15.7 - v0.15.8
+
+- **More `ChatOpenAICompatible` errors fall back.** An untyped error with HTTP
+  503 or 529 is now typed `"overloaded"`, and `retry_on_fallback?/1` accepts
+  `"overloaded"` and `"server_error"`. An ordinary 500 still does not fall
+  back.
+- **Cloudflare Workers AI users** add
+  `error_code_types: ChatOpenAICompatible.error_code_types(:cloudflare)` to
+  have capacity (3040) and internal (4009) errors fall back.
+
+### Added
+
+- `ChatOpenAICompatible` option `error_code_types` maps a service's error
+  `code` to a `LangChainError` type. It is empty by default. The new
+  `ChatOpenAICompatible.error_code_types/1` returns presets for known
+  services, starting with `:cloudflare`, and can be merged with your own
+  codes. https://github.com/brainlid/langchain/pull/698
+
+### Fixed
+
+- `ChatOpenAICompatible` returns a streamed failure as
+  `{:error, %LangChainError{}}`. An error event that arrived mid-stream on a
+  200 connection used to come back inside an `{:ok, ...}` result, and a non-JSON
+  error body was lost. It also reads Cloudflare `"errors"` entries that carry
+  only a `code`. https://github.com/brainlid/langchain/pull/698
+
+## v0.15.7
+
+Tool results can now mark a refusal: a call turned down before it changed
+anything. `LLMChain` can give refusals their own retry budget, and it tells a
+model when it resends a call that just failed with the same arguments.
+
+No API breaking changes. The new refusal budget is opt-in. Two behaviors
+change for existing chains, listed below.
+
+### Upgrading from v0.15.6 - v0.15.7
+
+- **Error content of an identical retry starts with a notice.** A failing call
+  may be resent with the same tool name and arguments in the round right after
+  it failed. If it fails again, its error content now starts with "This is the
+  same call that just failed, with the same arguments. Change it before trying
+  again." This also applies to `:on_tool_execution_failed` and to the
+  messages sent to the model. Update any code or test that matches this
+  error text exactly.
+- **`:until_success` mode fires `:on_retries_exceeded`.** It now fires the
+  callback when it stops on a retry limit, the same as the other run modes.
+- **`Function.execute/3` mocks.** `LLMChain` now calls the internal
+  `Function.execute_call/3`. A Mimic or similar mock of `Function.execute/3`
+  will no longer intercept tool calls made by a chain.
+
+### Added
+
+- `ToolResult.is_refusal` marks a call turned down before it changed anything.
+  A refusal is always also `is_error: true`, so it can't be set together with
+  `is_exception`. LangChain sets it when:
+  - the required-key check or a `:parse_args` parser rejects the arguments;
+  - a call names a tool that doesn't exist;
+  - a human review rejects the call with `is_error: true`.
+
+  A tool can also set it on a `ToolResult` it returns. `Trajectory.to_map/1`
+  records it. https://github.com/brainlid/langchain/pull/696
+- `LLMChain` option `max_refusal_count`, opt-in (default `nil`). When it is
+  set, a tool round whose errors are all refusals counts against this limit
+  instead of `max_retry_count`, and the chain stops with "Exceeded max refusal
+  count". https://github.com/brainlid/langchain/pull/696
+- Error content of an identical failed retry starts with a notice telling the
+  model to change the call. This applies to `execute_tool_calls/2` and
+  `execute_tool_calls_with_decisions/3`.
+  https://github.com/brainlid/langchain/pull/696
+
+### Changed
+
+- `do_run/1` and `Modes.UntilSuccess` share one retry-limit check, so
+  `:until_success` fires `:on_retries_exceeded`.
+  https://github.com/brainlid/langchain/pull/696
+
+## v0.15.6
+
+Tools approved through Human-in-the-Loop now run the same way as tools the
+model calls directly. `async: true` tools run concurrently after approval
+instead of one after another.
+
+No API breaking changes. The order of tool callbacks on the decided path has
+changed.
+
+### Upgrading from v0.15.5 - v0.15.6
+
+- **Callback order in `LLMChain.execute_tool_calls_with_decisions/3`.** This
+  is the path a Human-in-the-Loop resume takes. Callbacks no longer interleave
+  per call (started, run, started, run). They now fire in the same order as
+  `execute_tool_calls/2`:
+  1. `:on_tool_execution_failed` for rejected calls and unknown tools.
+  2. `:on_tool_execution_started` for every call that will run, before any of
+     them runs.
+  3. Completion and failure callbacks, in call order, after the async batch
+     finishes.
+
+  If a callback handler expects each call to start and finish before the next
+  one starts, update it.
+
+### Changed
+
+- `LLMChain.execute_tool_calls/2` and `execute_tool_calls_with_decisions/3`
+  now share one execution pipeline, so approved and edited calls follow the
+  callback order described above.
+  https://github.com/brainlid/langchain/pull/694
+
+### Fixed
+
+- `LLMChain.execute_tool_calls_with_decisions/3` runs approved and edited
+  `async: true` tools concurrently. They share the `async_tool_timeout`
+  deadline and `:on_tool_pre_execution` fires inside each Task. Sync tools
+  still run afterward in call order, and results keep call order. The calls
+  used to run one after another: ten approved one-minute tools took ten
+  minutes. Cancelling the caller now also stops in-flight approved tools.
+  https://github.com/brainlid/langchain/pull/694
+
+## v0.15.5
+
+Tool search: functions can be marked deferred, so their definitions stay out
+of the model's context until the model searches for them. This keeps large
+tool sets from costing accuracy and tokens on every request, and the request
+prefix stays stable for prompt caching. It works on `ChatAnthropic`,
+`ChatOpenAIResponses` and `ChatReqLLM`. Every other chat model sends deferred
+functions as ordinary tools. `ChatAnthropic` also supports adaptive thinking
+on Claude Sonnet 5.5, and `ChatGrok` tool calls work end to end.
+
+No API breaking changes. The optional `req_llm` dependency now requires
+`>= 1.29.0`, and a few behavior changes are worth checking before upgrading.
+
+### Upgrading from v0.15.4 - v0.15.5
+
+- **`req_llm` >= 1.29.0.** If you use `ChatReqLLM`, run
+  `mix deps.update req_llm`. 1.29.0 keeps OpenAI's tool search items and each
+  call's namespace, and reports Anthropic's raw stop reason. Tool search
+  through `ChatReqLLM` relies on both. It also verifies TLS certificates for
+  WebSocket streaming URLs.
+- **Keep `:provider_item` parts when storing conversations.** Tool search adds
+  two `ContentPart` types: `:provider_item`, an opaque block a provider expects
+  back unchanged and in place, and `:tool_reference`. A stored conversation
+  that drops `:provider_item` parts replays calls to tools whose search is
+  gone, and the provider may reject it. Code that walks content parts should
+  allow for both types.
+- **Claude Sonnet 5.5 thinking.** Sonnet 5.5 rejects
+  `thinking: %{type: "enabled", budget_tokens: N}` with a 400. Use
+  `thinking: %{type: "adaptive"}` with `output_config: %{"effort" => ...}`,
+  which Sonnet 4.6 also accepts. `:thinking` is still passed through as given.
+- **`ChatAnthropic` `json_response` keeps `output_config`.** With
+  `json_response: true`, the JSON schema `"format"` is now merged into the
+  caller's `output_config`. Other keys such as `"effort"` used to be dropped
+  and are now sent.
+
+### Added
+
+- Tool search with deferred functions and namespaces. `Function` gains the
+  `:defer_loading`, `:namespace` and `:namespace_description` options, and
+  `NativeTool.tool_search/1` builds the search tool (`variant: :bm25 | :regex`).
+  A function can load tools itself by returning `ContentPart.tool_reference!/1`
+  parts in its result. Supported by `ChatAnthropic`, `ChatOpenAIResponses` and
+  `ChatReqLLM` (Anthropic, Bedrock and OpenAI models). Other chat models leave
+  the search tool out, send deferred functions as ordinary tools, drop provider
+  items and read tool references as text, so a chain keeps working when it
+  falls back to one of them. The `NativeTool` moduledoc has the support matrix.
+  https://github.com/brainlid/langchain/pull/689
+
+### Changed
+
+- `ChatAnthropic` and `ChatReqLLM` treat Anthropic's `stop_reason:
+  "pause_turn"` as `:complete` with `metadata[:end_turn]` set to `false`, so
+  `LLMChain` continues the turn.
+  https://github.com/brainlid/langchain/pull/689
+- `ChatAnthropic` documentation leads with adaptive thinking, with a table of
+  accepted `thinking` types by model family.
+  https://github.com/brainlid/langchain/pull/692
+
+### Fixed
+
+- `ChatAnthropic` `json_response: true` no longer drops the caller's
+  `output_config` keys, such as `"effort"`.
+  https://github.com/brainlid/langchain/pull/692
+- Streamed answer text from a reasoning model is kept when the provider leaves
+  `reasoning_content` out of answer chunks (as xAI does) and when one chunk
+  carries both thinking and answer text. It used to be dropped, leaving a reply
+  with only thinking. Affects `ChatOpenAICompatible` and any provider streaming
+  through `ChatCompletionsFormat`.
+  https://github.com/brainlid/langchain/pull/688
+- `ChatGrok` tool call round trips. Tool results are sent as flat messages
+  (fixing an HTTP 422), call arguments are sent as JSON strings, non-streamed
+  tool calls are parsed and complete, tools defined with a `FunctionParam` list
+  send their parameters, and streamed parallel tool calls keep their argument
+  fragments apart.
+  https://github.com/brainlid/langchain/pull/687
+
+## v0.15.4
+
+Reasoning can now be stripped from a message or a conversation in one call,
+for continuing a conversation under a new system prompt or tool set. Providers
+that sign or encrypt reasoning reject a replayed reasoning block once either
+changes. Non-streamed `ChatAnthropic` calls also now return the API's own
+error type and message for error responses.
+
+No breaking changes.
+
+### Upgrading from v0.15.3 - v0.15.4
+
+- **Non-streamed `ChatAnthropic` error types.** An error status other than
+  401, 429 or 529 whose body carries an API error object (for example a 400
+  `invalid_request_error` or a 500 `api_error`) used to return a
+  `LangChainError` with type `"unexpected_response"`. It now returns the API's
+  `type` and `message`, matching the streaming path. Code that matched on
+  `"unexpected_response"` for these responses should match on the API's error
+  type instead. Error statuses without an API error body still return
+  `"unexpected_response"`.
+
+### Added
+
+- `Message.strip_reasoning/1` removes reasoning content parts from a message
+  or a list of messages. In a list, a message left with no content is dropped
+  unless it carries tool calls. `ContentPart.reasoning?/1` recognizes every
+  reasoning shape the chat models produce (`:thinking` parts, Anthropic
+  `redacted_thinking`, OpenAI Responses `reasoning`, and `ChatReqLLM`
+  `:reasoning_details`).
+  https://github.com/brainlid/langchain/pull/690
+
+### Fixed
+
+- `ChatAnthropic` non-streamed calls return the API's error type and message
+  for error responses, instead of a generic "Unexpected response".
+  https://github.com/brainlid/langchain/pull/686
+
+## v0.15.3
+
+A tool's `parse_args` parser can now receive the tool context, so it can
+resolve what the arguments refer to (for example, look up a record for the
+current tenant) and not only check their shape. A call's arguments can also be
+parsed ahead of execution, letting a host learn that a call would fail before
+asking a human to approve it.
+
+No breaking changes. Existing 1-arity parsers and `:reject` decisions behave
+as before.
+
+### Added
+
+- `parse_args` accepts a 2-arity function, called with the raw arguments and
+  the same context the tool body receives (the chain's `custom_context` plus
+  `:tool_call_id`). A parser may run more than once for one call, so it should
+  read but never write.
+  https://github.com/brainlid/langchain/pull/684
+- `LangChain.Function.parse_arguments/3` and
+  `LLMChain.parse_tool_call_arguments/2` run a call's argument parsing without
+  executing the tool, returning `{:ok, parsed}` or the `{:error, message}` the
+  model would be given.
+  https://github.com/brainlid/langchain/pull/684
+- A `:reject` decision passed to `LLMChain.execute_tool_calls_with_decisions/3`
+  can carry `:message` to replace the default rejection text and `:is_error`
+  to mark the result as an error. An error result counts toward the chain's
+  failure count.
+  https://github.com/brainlid/langchain/pull/684
+
+## v0.15.2
+
+`ChatReqLLM` now passes prompt caching options on text content parts through
+to `req_llm`, so `cache_control` and `prompt_cache_breakpoint` take effect when
+a model is used through `ChatReqLLM`.
+
+No breaking changes.
+
+### Upgrading from v0.15.1 - v0.15.2
+
+- **Cache options are now sent.** A text `ContentPart` with `cache_control` or
+  `prompt_cache_breakpoint` set used to have those options dropped by
+  `ChatReqLLM`. They now reach the request. `req_llm`'s default Chat
+  Completions encoder (OpenAI chat, Groq, xAI and other OpenAI-compatible
+  providers) forwards both keys as given, so a part marked for Anthropic
+  caching also sends `cache_control` to those providers. Only text parts carry
+  the options; image and file parts do not.
+
+### Added
+
+- `ChatReqLLM` passes a text part's `cache_control` (Anthropic, OpenRouter,
+  Bedrock) and `prompt_cache_breakpoint` (OpenAI Responses) to `req_llm`.
+  `cache_control: true` expands to `%{"type" => "ephemeral"}`, as in
+  `ChatAnthropic`.
+  https://github.com/brainlid/langchain/pull/682
+
+## v0.15.1
+
+`ChatReqLLM` now sends a reasoning model's own reasoning back in tool loops.
+That covers OpenAI's encrypted reasoning items and Anthropic's signed thinking,
+streamed or not, and it is kept when a conversation is stored and reloaded.
+`ChatVertexAI` now reports when a response was cut off or filtered, and both
+Gemini models mark streamed tool calls complete.
+
+No API breaking changes. The optional `req_llm` dependency now requires
+`>= 1.25.0`, and three behavior changes are worth checking before upgrading.
+
+### Upgrading from v0.15.0 - v0.15.1
+
+- **`req_llm` >= 1.25.0.** If you use `ChatReqLLM`, run
+  `mix deps.update req_llm`. 1.25.0 is the first release that labels each
+  content part with its OpenAI Responses `phase`, which `ChatReqLLM` now relies
+  on.
+- **`ChatVertexAI` truncation and content filters end the run.** A response
+  stopped by `maxOutputTokens` or by a content filter now makes
+  `LLMChain.run/2` return `{:error, chain, %LangChainError{}}` with type
+  `"response_truncated"` or `"content_filtered"`. These runs used to look
+  successful. Other providers already behave this way.
+- **`ChatReqLLM` refusals.** A refusal with no content (Anthropic's
+  `stop_reason: "refusal"`) now returns a `"content_filtered"` error from
+  `LLMChain.run/2` and keeps the empty refused message. It used to be an
+  `"unexpected_response"` error.
+- **`ChatReqLLM` reasoning part.** An assistant message from a reasoning model
+  now ends with a `:unsupported` `ContentPart` holding the reasoning details in
+  its `:reasoning_details` option. Code that walks content parts should skip
+  `:unsupported` parts, as it already must for `ChatOpenAIResponses` reasoning.
+  `ChatAnthropic` logs a warning for this part if a `ChatReqLLM` conversation
+  is replayed through it.
+
+### Added
+
+- `ChatReqLLM` sends reasoning details back with an assistant message, so
+  OpenAI Responses tool loops include the model's encrypted reasoning items.
+  https://github.com/brainlid/langchain/pull/673
+- `ChatReqLLM` keeps reasoning details for streamed responses and stores them
+  in a JSON-safe content part, so they survive persistence.
+  https://github.com/brainlid/langchain/pull/674
+- `ChatReqLLM` puts the provider's `stop_details` on `metadata[:stop_details]`,
+  the same key `ChatAnthropic` uses.
+  https://github.com/brainlid/langchain/pull/678
+
+### Changed
+
+- The optional `req_llm` dependency now requires `>= 1.25.0` (was
+  `>= 1.11.0`). `ChatReqLLM` reads and sends the OpenAI Responses `phase` only
+  per content part. An assistant message that mixes narration with unlabelled
+  text now goes back with its narration labelled.
+  https://github.com/brainlid/langchain/pull/680
+
+### Fixed
+
+- `ChatReqLLM` gives each thinking block its own signature. Anthropic rejected
+  a multi-block response sent back with the first block's signature on every
+  block. https://github.com/brainlid/langchain/pull/675
+- `ChatReqLLM` sends signed Anthropic thinking back in the order the model
+  produced it, interleaved with text and tool calls.
+  https://github.com/brainlid/langchain/pull/676
+- `ChatReqLLM` keeps each streamed Anthropic thinking block as its own signed
+  part. Several blocks were merged into one part with concatenated signatures,
+  and the first block was dropped when sent back.
+  https://github.com/brainlid/langchain/pull/677
+- `ChatReqLLM` turns a refusal with no content into a `:content_filtered`
+  message instead of an `"unexpected_response"` error.
+  https://github.com/brainlid/langchain/pull/678
+- `ChatVertexAI` maps `finishReason` to the message status: `MAX_TOKENS` to
+  `:length`, and `SAFETY`, `RECITATION`, `BLOCKLIST`, `PROHIBITED_CONTENT`,
+  `SPII` and `MODEL_ARMOR` to `:content_filtered`. A blocked candidate with no
+  content or parts becomes an empty message with that status instead of an
+  error. https://github.com/brainlid/langchain/pull/679
+- `ChatGoogleAI` and `ChatVertexAI` mark function calls `:complete` in streamed
+  deltas. They were reported as `:incomplete` to callbacks.
+  https://github.com/brainlid/langchain/pull/671
+
+## v0.15.0
+
+Adds `ChatOpenAICompatible`, a chat model for services that expose an
+OpenAI-compatible Chat Completions endpoint: Cloudflare Workers AI, Groq,
+OpenRouter, Together, DeepInfra, Fireworks, vLLM, SGLang, Ollama and LM Studio.
+`ChatOpenAI` stays OpenAI's own client and keeps following OpenAI's API.
+
+No API breaking changes, and `ChatOpenAI`'s behavior is unchanged.
+
+### Upgrading from v0.14.4 - v0.15.0
+
+If you point `ChatOpenAI` at a non-OpenAI service, switch to
+`ChatOpenAICompatible`. With `ChatOpenAI`, these services can fail silently:
+
+- With `reasoning_mode: true`, system messages are sent as `role: "developer"`.
+  SGLang and vLLM (behind Cloudflare Workers AI, for example) accept the role,
+  but models whose chat template has no `developer` branch, such as GLM and
+  Qwen, never see the system prompt. There is no error.
+- `reasoning_effort` is only sent when `reasoning_mode: true` is set.
+- The token limit is sent as `max_completion_tokens`, which many compatible
+  servers ignore.
+- With no `api_key` set, the global OpenAI key is sent to the endpoint, along
+  with OpenAI organization and project headers.
+
+A Cloudflare Workers AI configuration:
+
+```elixir
+ChatOpenAICompatible.new!(%{
+  endpoint: "https://api.cloudflare.com/client/v4/accounts/#{account_id}/ai/v1/chat/completions",
+  api_key: api_token,
+  model: "@cf/zai-org/glm-5.3-flash",
+  reasoning_effort: "low",
+  req_config: %{
+    headers: [
+      {"cf-aig-gateway-id", gateway_id},
+      {"x-session-affinity", session_id}
+    ]
+  }
+})
+```
+
+When migrating:
+
+- `ChatOpenAICompatible` sends only the fields you set. `temperature` and `n`
+  are no longer sent by default.
+- `reasoning_mode`, `n`, `logprobs`, `top_logprobs`, `service_tier`,
+  `verbosity`, `user` and `org_id` are not fields. Pass any of these through
+  `extra_body` if your service supports them.
+- `api_key` must be set explicitly. With `api_key: nil`, no `Authorization`
+  header is sent.
+- `serialize_config/1` does not store `api_key` or `req_config`, so set both
+  again after `restore_from_map/1`. Configs saved as `ChatOpenAI` still restore
+  as `ChatOpenAI`.
+- `provider/0` returns `"openai_compatible"`, which appears in telemetry.
+
+Tests that mock `ChatOpenAI.decode_stream/1` or `ChatOpenAI.for_api/2` with
+Mimic no longer affect `ChatAwsMantle`, `ChatVertexAI`, `ChatGrok`,
+`ChatMistralAI`, `ChatOllamaAI` or `ChatGoogleAI`. Those models now call the
+shared encoder and decoder directly.
+
+### Added
+
+- `ChatOpenAICompatible`. It always sends system messages as `system`, sends
+  `reasoning_effort` whenever it is set, sends the token limit as `max_tokens`,
+  and requires explicit credentials. It parses `reasoning_content` into
+  `:thinking` content parts and reports Cloudflare's `{"errors": [...]}` error
+  shape. The moduledoc has recipes for Cloudflare Workers AI, Ollama, LM Studio,
+  vLLM, SGLang, OpenRouter and Groq.
+  https://github.com/brainlid/langchain/pull/667
+- A live conformance suite for OpenAI-compatible providers, tagged
+  `live_openai_compatible` with a tag per provider (`live_cloudflare`,
+  `live_ollama`, `live_openrouter`, `live_groq`). A provider whose environment
+  variables are missing is skipped. It replaces
+  `chat_open_ai_reasoning_live_test.exs`.
+  https://github.com/brainlid/langchain/pull/667
+
+### Changed
+
+- The Chat Completions wire format (encoding messages, tools and content parts;
+  decoding responses and streams) moved out of `ChatOpenAI` into an internal
+  shared module. `ChatOpenAI`'s public `for_api/2`, `content_part_for_api/2`,
+  `decode_stream/1`, `do_process_response/2` and `get_parameters/1` remain and
+  delegate to it. `ChatAwsMantle`, `ChatVertexAI`, `ChatGrok`,
+  `ChatMistralAI`, `ChatOllamaAI` and `ChatGoogleAI` use the shared module
+  directly. https://github.com/brainlid/langchain/pull/667
+- `ChatOpenAI` docs now send OpenAI-compatible services to
+  `ChatOpenAICompatible`. The Cloudflare example and the
+  `max_completion_tokens`/`max_tokens` workaround moved there, and the
+  `reasoning_effort` field docs list OpenAI's current values. The README's
+  "OpenAI compatible" section is rewritten around the new module.
+  https://github.com/brainlid/langchain/pull/667
+
+## v0.14.4
+
+Two `ChatReqLLM` timeout fixes.
+
+No API breaking changes. One behavior change is worth checking before
+upgrading: `ChatReqLLM`'s `receive_timeout` now takes effect.
+
+### Upgrading from v0.14.3 - v0.14.4
+
+`ChatReqLLM`'s `receive_timeout` field was documented with a 60s default but
+was never sent to req_llm, so every request used req_llm's own timeout.
+
+- If you do not set `receive_timeout`, nothing changes. The field now
+  defaults to `nil`, and req_llm keeps applying its per-provider default
+  (for example 120s for Anthropic, 300s for thinking and OpenAI Responses API
+  requests, and 30s for each streamed chunk).
+- If you do set `receive_timeout`, it is now honored. That includes streamed
+  requests, where it also limits how long to wait for each chunk. Check that
+  the value you set is long enough for your slowest requests.
+- `receive_timeout: 0` is now rejected. req_llm only accepts a positive
+  timeout.
+
+### Fixed
+
+- `ChatReqLLM` forwards `receive_timeout` to req_llm. To stop long streamed
+  responses stalling out after req_llm's 30s per-chunk default, set it
+  explicitly. https://github.com/brainlid/langchain/pull/665
+- `ChatReqLLM` classifies a streamed chunk that doesn't arrive in time as a
+  `LangChainError` with type `"timeout"`. It was logged as an unhandled error
+  before. Timeouts are eligible for model fallback.
+  https://github.com/brainlid/langchain/pull/665
+
+## v0.14.3
+
+Follow-up to the OpenAI `phase` work in v0.14.2. A provider can now say
+outright whether the model ended its turn, a response the provider cut off
+ends the run as an error instead of looking like a finished answer, and
+`ChatOpenAIResponses` replays reasoning items in the order the API produced
+them.
+
+No API breaking changes. One behavior change is worth checking before
+upgrading: an assistant response with status `:length` or `:content_filtered`
+now makes `LLMChain.run/2` return `{:error, chain, %LangChainError{}}` with
+type `"response_truncated"` or `"content_filtered"`. The partial message is
+still added to the chain, and its tool calls are not executed.
+
+### Added
+
+- `Message.end_turn/1` and `Message.continues_turn?/1`. A provider that
+  reports `end_turn` on its response has it stored as `metadata[:end_turn]`,
+  and it decides whether the turn continues. Without it, a narration-only
+  message keeps the turn open as before. `LLMChain`, `:while_needs_response`
+  and `:until_success` now use `continues_turn?/1`.
+  https://github.com/brainlid/langchain/pull/663
+- `ChatOpenAIResponses` and `ChatReqLLM` read `end_turn` from the response
+  (req_llm passes it through `provider_meta`).
+  https://github.com/brainlid/langchain/pull/663
+- `[:langchain, :chain, :turn, :no_answer]` telemetry event and a logged
+  warning when a run that narrated ends on an assistant message with no answer
+  text. The metadata describes the shape of the messages but includes none of
+  their text. https://github.com/brainlid/langchain/pull/663
+
+### Changed
+
+- `LLMChain` ends the run with an error when the received assistant message
+  has status `:length` or `:content_filtered`, and fires `:on_llm_error`.
+  https://github.com/brainlid/langchain/pull/663
+- `ChatOpenAIResponses` replays assistant content as items in their original
+  order, so a reasoning item between two commentary parts stays between them
+  instead of being moved to the front.
+  https://github.com/brainlid/langchain/pull/663
+
+### Fixed
+
+- `ChatOpenAIResponses` handles `"incomplete"` responses and the streamed
+  `response.incomplete` event. The message status is `:length` or
+  `:content_filtered` from `incomplete_details.reason`, and a cut-off
+  `function_call` stays an incomplete tool call with its raw arguments rather
+  than being run. https://github.com/brainlid/langchain/pull/663
+- `ChatReqLLM` keeps a tool call whose arguments do not parse in a truncated
+  response as incomplete, instead of turning it into a complete call with
+  empty arguments. https://github.com/brainlid/langchain/pull/663
+- `ChatReqLLM` streaming no longer drops the finish reason and usage when the
+  terminal meta chunk also carries reasoning details, so a turn whose only
+  output is a reasoning item still closes.
+  https://github.com/brainlid/langchain/pull/663
+- Merging `MessageDelta`s lets a truncating status (`:length`,
+  `:content_filtered`) replace `:complete`, since a provider can finish one
+  item and then report the whole response was cut off.
+  https://github.com/brainlid/langchain/pull/663
+
+## v0.14.2
+
+A model that says what it is about to do, without doing it yet, no longer ends
+the run. OpenAI's Responses API labels this text with a `phase` of
+`"commentary"`. `ChatOpenAIResponses` and `ChatReqLLM` now read that label and
+send it back, and `LLMChain` keeps the turn open when an assistant message is
+only narration.
+
+No breaking changes. Two behavior changes are worth checking before upgrading:
+`:while_needs_response` and `:until_success` now stop after 25 LLM calls per
+run by default, and the optional `req_llm` dependency now requires `>= 1.11.0`.
+
+### Added
+
+- **Narration and answer markers on text `ContentPart`s.** Chat models can
+  now mark a text part as `"narration"` (the model describing work in progress)
+  or `"answer"`. Unmarked parts count as answers, so providers that do not use
+  the marker behave as before. Build and read the marker with
+  `ContentPart.narration!/1`, `answer!/1`, `put_utterance/2`, `utterance/1` and
+  `narration?/1`. `Message.narration?/1` checks a whole message, and
+  `Message.answer_content/1` returns only the answer text, which is useful when
+  parsing structured output that might have narration in front of it.
+  https://github.com/brainlid/langchain/pull/661
+- **OpenAI `phase` support in `ChatOpenAIResponses`.** Each assistant
+  `message` item becomes its own text part, marked from its `phase`. When
+  streaming, the marker is set from the first token. On replay, consecutive
+  parts with the same marker go out as one `message` item with the matching
+  `phase`, which OpenAI needs under `store: false`.
+  https://github.com/brainlid/langchain/pull/661
+- **OpenAI `phase` support in `ChatReqLLM`.** Handles both the per-part and
+  per-message shapes req_llm uses to report `phase`, including splitting joined
+  non-streaming text back into one part per item, and sends the marker back on
+  replay. https://github.com/brainlid/langchain/pull/661
+- **Progress updates in `ChatAnthropic`.** With
+  `thinking: %{display: "updates"}`, thinking blocks that contain progress text
+  are marked `"narration"` so a UI can show them as status lines. This does not
+  change when the chain stops. https://github.com/brainlid/langchain/pull/661
+- `LLMChain.Mode.Steps.reset_run_count/1` for custom modes that limit each run
+  with `check_max_runs/2`. https://github.com/brainlid/langchain/pull/661
+
+### Changed
+
+- `LLMChain.add_message/2` sets `needs_response: true` for an assistant
+  message that has no tool calls and contains only narration, so
+  `:while_needs_response` and `:until_success` call the LLM again instead of
+  ending the run on a statement of intent.
+  https://github.com/brainlid/langchain/pull/661
+- `:while_needs_response` and `:until_success` are limited by `:max_runs`
+  (default 25 LLM calls per run). When the limit is hit they return
+  `%LangChainError{type: "exceeded_max_runs"}`. The count starts over on every
+  `LLMChain.run/2`. Pass `max_runs:` to `LLMChain.run/2` to change the limit.
+  https://github.com/brainlid/langchain/pull/661
+- The optional `req_llm` dependency now requires `>= 1.11.0` (was
+  `>= 1.6.0`), the first release that decodes and re-encodes `phase`.
+  https://github.com/brainlid/langchain/pull/661
+
+### Fixed
+
+- Runs using GPT-5.3 and later models through the Responses API could stop
+  early when the model replied with commentary and no tool calls. The chain
+  returned `{:ok, chain}` with no error, but the final message was only the
+  model saying what it would do next.
+  https://github.com/brainlid/langchain/pull/661
+
+## v0.14.1
+
+A tool can now expand its result into conversation messages, placing material
+into the conversation as established turns rather than as tool output.
+`ChatOpenAIResponses` gains OpenAI's prompt caching controls.
+
+No breaking changes.
+
+### Added
+
+- **Tool results can expand into conversation messages.** A tool returns a
+  `LangChain.MessageExpansion`, built with `MessageExpansion.expand/3`, that
+  asks for `:user` and `:assistant` messages to be inserted into the
+  conversation before the next LLM call, and for its own result to be trimmed
+  to a short summary once they are in. The tool supplies the plain result as
+  well, which the model reads under any mode that does not apply expansions.
+  The `:while_needs_response` mode applies them, and custom modes can compose
+  `LLMChain.Mode.Steps.expand_tool_results/2`. The expansion is virtual on
+  `ToolResult`, so a restored conversation does not insert the same messages
+  twice. The moduledoc covers how to shape the message list for Anthropic and a
+  limitation around unresolved server tools.
+  https://github.com/brainlid/langchain/pull/656
+  https://github.com/brainlid/langchain/pull/657
+- **Prompt caching on `ChatOpenAIResponses`.** New `prompt_cache_key` and
+  `prompt_cache_options` fields, plus a `prompt_cache_breakpoint` option on
+  text, image and file `ContentPart`s (including those in tool results) to mark
+  explicit cache breakpoints. https://github.com/brainlid/langchain/pull/653
+
+### Changed
+
+- `LLMChain.replace_tool_result/3` also updates `exchanged_messages` and
+  `last_message`, so all of the chain's views of the conversation agree on what
+  the tool returned. https://github.com/brainlid/langchain/pull/656
+- CI lint runs on Elixir 1.20 / OTP 29. Unreachable `for_api` clauses that
+  Elixir 1.20 warns about were removed from `ChatOpenAI`, `ChatDeepSeek`,
+  `ChatOrq` and `ChatMistralAI`. https://github.com/brainlid/langchain/pull/658
+
+### Fixed
+
+- `ChatOpenAIResponses` sends tool results with multiple content parts, or with
+  content part options, instead of raising a `MatchError`.
+  https://github.com/brainlid/langchain/pull/653
+- OpenTelemetry `gen_ai.input.messages` serializes each tool result as its own
+  tool message with its `tool_call_id` and LLM-visible content.
+  https://github.com/brainlid/langchain/pull/652
+- Prompt template security tests run portably across environments.
+  https://github.com/brainlid/langchain/pull/654
+
+## v0.14.0
+
+OpenAI-compatible servers are reachable with more of their own API. A
+`service_tier` field trades cost against latency, an `extra_body` map passes
+provider-specific parameters the library has no field for, and `ChatAwsMantle`
+gains the same escape hatch for the several vendors Mantle hosts.
+
+No breaking API changes. One behavior change to know about: `ChatOpenAI` and
+`ChatAwsMantle` now send `:max_tokens` under OpenAI's current name,
+`max_completion_tokens`. A server that accepts only the older `max_tokens` key
+ignores the new one, which leaves the request with no token limit at all. See
+the upgrade note below. `ChatGrok`, `ChatMistralAI` and `ChatOllamaAI` build
+their own request bodies and are unaffected.
+
+### Upgrading from v0.13.2 - v0.14.0
+
+If you point `ChatOpenAI` at OpenAI itself, no change is needed.
+`max_completion_tokens` is the name OpenAI documents, and its reasoning models
+require it.
+
+If you point `ChatOpenAI` at an OpenAI-compatible server that accepts only
+`max_tokens`, such as Ollama's `/v1` endpoint, swap the key back with
+`extra_body`:
+
+```elixir
+ChatOpenAI.new!(%{
+  endpoint: "http://localhost:11434/v1/chat/completions",
+  model: "llama3.2",
+  max_tokens: 4000,
+  extra_body: %{"max_completion_tokens" => nil, "max_tokens" => 4000}
+})
+```
+
+A `nil` value in `extra_body` removes that key from the request body. Keep the
+`max_tokens` field set as well, since telemetry reports the limit from it.
+
+The same swap applies to `ChatAwsMantle`. The Kimi and gpt-oss models on Bedrock
+accept either name, so most callers need no change.
+
+### Added
+
+- **`extra_body` passes provider-specific parameters straight through.** A map
+  of values merged into the request body last, so they override anything the
+  model computed. Available on `ChatOpenAI`, `ChatOpenAIResponses` and
+  `ChatAwsMantle`, and it covers parameters such as `top_k` or
+  `repetition_penalty` that these modules have no field for. Keys may be strings
+  or atoms and are matched by their string form, so a string key replaces an
+  existing atom key in place rather than producing a duplicate in the encoded
+  JSON. A `nil` value removes the key, and nested maps merge key by key.
+  `LangChain.Utils.merge_extra_body/2` is public and documents the full rules.
+  https://github.com/brainlid/langchain/pull/648
+- **`service_tier` selects a processing tier.** Asks the provider to serve the
+  request at a tier that trades cost against latency, such as `"flex"` or
+  `"priority"`. Supported on `ChatOpenAI` and `ChatOpenAIResponses`. The value is
+  passed through without validation, since compatible providers accept their own
+  subsets. https://github.com/brainlid/langchain/pull/648
+- **The tier that served a request is reported back.** Providers report it beside
+  `usage` rather than inside it, so it is kept in the token usage's `raw` map
+  under `"service_tier"`, reaching the final message along with the usage. It can
+  differ from the tier requested, and some providers omit it. When streaming, it
+  arrives only with `stream_options: %{include_usage: true}`.
+  https://github.com/brainlid/langchain/pull/648
+- **`ChatAwsMantle` accepts `reasoning_effort: "none"`.** Some OpenAI Chat
+  Completions models on Mantle require that value when the request carries
+  function tools. https://github.com/brainlid/langchain/pull/647
+
+### Changed
+
+- **`ChatOpenAI` and `ChatAwsMantle` send `:max_tokens` as
+  `max_completion_tokens`.** That is OpenAI's current name for the limit, it
+  counts reasoning tokens, and OpenAI's reasoning models accept no other name.
+  `:max_tokens` remains the single public field on both modules, with
+  `extra_body` as the escape hatch for a server that wants the older key.
+  https://github.com/brainlid/langchain/pull/648
+  https://github.com/brainlid/langchain/pull/647
+- **The `ChatOpenAIResponses` WebSocket transport matches dropped keys by string
+  form.** It always removes `stream`, `background`, `temperature` and `top_p`
+  from the payload, working around an OpenAI bug that silently closes the
+  connection. Matching on the string form means those keys are dropped when
+  supplied through `extra_body` as strings, not only when the model set them as
+  atoms. https://github.com/brainlid/langchain/pull/648
+
+## v0.13.2
+
+A patch release for reasoning models reached through OpenAI-compatible
+endpoints. Thinking those services return in a `reasoning_content` field is now
+captured as a `:thinking` content part instead of being dropped, and a message
+carrying thinking can be sent back to the provider without raising.
+
+No breaking API changes.
+
+### Added
+
+- **A reasoning model's thinking is captured on OpenAI-compatible endpoints.**
+  Services other than OpenAI itself return thinking in a `reasoning_content`
+  field beside `content`, on the message for a single response and on every
+  chunk when streaming. `ChatOpenAI` turns it into a
+  `LangChain.Message.ContentPart` of type `:thinking`, kept separate from the
+  answer text and ordered ahead of it, including when the same response also
+  calls a tool. Reaching such a service takes an `endpoint` for it and often an
+  extra header through `req_config`; the `ChatOpenAI` module docs show the
+  Cloudflare form. https://github.com/brainlid/langchain/pull/645
+
+### Changed
+
+- **`ChatOpenAI` omits `:thinking` and `:unsupported` content parts when
+  serializing a request.** Both are response-side artifacts with no
+  representation on this wire format, and both reach a request only by
+  round-tripping a message the provider produced. The omission is unconditional,
+  which is what keeps a prompt-cache prefix matching itself turn after turn.
+  `ChatAwsMantle` drops its own filtering and serializes straight through the
+  shared path. https://github.com/brainlid/langchain/pull/645
+
+### Fixed
+
+- **Sending a message that contains thinking back through `ChatOpenAI` no longer
+  raises.** `content_part_for_api/2` has no clause for a `:thinking` or
+  `:unsupported` part, so any module delegating to the shared serialization hit a
+  `FunctionClauseError` on the next turn of a conversation with a reasoning
+  model. Those parts are now rejected before serialization.
+  https://github.com/brainlid/langchain/pull/645
+
+## v0.13.1
+
+A patch release for streamed responses. A stream that never terminates is a
+failed call that gets retried instead of quietly merging into the next response,
+a stream the provider reports as failed surfaces that error instead of
+presenting a truncated answer as a finished one, and whitespace-only Ollama stop
+sequences survive Ecto 3.14's casting.
+
+No breaking API changes. Two things to know about: an unterminated stream now
+ends the run as a retried `"incomplete_stream"` error rather than returning
+`{:ok, chain}` with no message added, and a retry replays text that already
+reached consumers through `:on_llm_new_delta`, so a host rendering raw deltas
+should reset its buffer on `:on_llm_error`. Using `ChatReqLLM` against the
+OpenAI Responses API wants `req_llm` v1.21.1 or later, which is where failure
+frames are decoded into a terminal chunk this release can act on.
+
+### Changed
+
+- **An unterminated streamed response is treated as a failed call.** `LLMChain`
+  drops the hanging delta and routes the call through its existing failure path
+  as an `"incomplete_stream"` error: `:on_llm_error` per attempt, bounded by
+  `max_retry_count`, `:on_retries_exceeded` on exhaustion. A leftover delta is
+  also cleared before every attempt. The partial text is discarded rather than
+  salvaged, because a response cut off partway through is indistinguishable from
+  one that finished and lost only its terminator.
+  https://github.com/brainlid/langchain/pull/636
+- **Dependency upgrades**, notably `req_llm` to v1.21.1 for an upstream fix to
+  the OpenAI Responses API used through `ChatReqLLM`, and `sobelow` to v0.15.
+  The remaining updates are transitive. https://github.com/brainlid/langchain/pull/639
+
+### Fixed
+
+- **Separate streamed responses no longer concatenate into one message.** A
+  stream that produced no terminal delta left `chain.delta` live and
+  `needs_response` true, so a looping mode called the model again and the next
+  generation merged into the same accumulator. The result was a single assistant
+  message holding several complete answers end to end, unbounded because
+  `WhileNeedsResponse` has no run limit of its own.
+  https://github.com/brainlid/langchain/pull/636
+- **`ChatReqLLM` closes a turn whose terminal marker went missing.** When the
+  stream carried no terminal chunk but `req_llm`'s finish reason reports a
+  response the provider finished (`:stop`, `:tool_calls`, `:length`,
+  `:content_filter`), a closing delta is synthesized and delivered through the
+  streaming callback. Any other reason, including `:incomplete` or one that
+  could not be read, leaves the response unfinished for the chain to retry.
+  https://github.com/brainlid/langchain/pull/636
+- **A failed `ChatReqLLM` stream reports the provider's error instead of
+  completing.** A terminal chunk with `finish_reason: :error` emitted an
+  ordinary `:complete` message and discarded the error message. It now emits a
+  `"stream_error"` `LangChainError` into the delta stream, so the text streamed
+  so far is kept as a `:stream_error` message carrying the error under
+  `metadata.streaming_error`, matching how streamed provider errors are already
+  handled elsewhere. Usage metadata on the same chunk is still captured.
+  https://github.com/brainlid/langchain/pull/638
+- **A stream that fails before producing any content returns its error.** The
+  delta list is headed by an error tuple in that case, which no `do_run/1`
+  clause matched, so it fell through to a generic `unexpected_response`. It now
+  fires `:on_llm_error` and returns the error with its type intact.
+  https://github.com/brainlid/langchain/pull/638
+- **A failed OpenAI Responses stream no longer raises `BadMapError`.** The
+  turn-closing check read `.status` off every accumulated delta, and an error
+  tuple has none. An error tuple ends a turn the same way a terminal delta does.
+  https://github.com/brainlid/langchain/pull/638
+- **`ChatOllamaAI` keeps whitespace-only stop sequences.** Ecto 3.14 moved
+  trimming into a separate `:trim_values` option applied before the
+  `:empty_values` comparison, which disabled the module's deliberate opt-out.
+  `"\n"` and `"\t"` trimmed to `""`, matched `empty_values: [""]`, and were
+  dropped from the `stop` array with no error or warning. `new/1` now compares
+  untrimmed, so an empty string is still discarded and anything else is kept.
+  https://github.com/brainlid/langchain/pull/640
+
+## v0.13.0
+
+A new callback can decide each tool call before it runs, tool results come back in the
+order the model asked for them, and a Gemini function call carries its id in
+both directions.
+
+No breaking API changes. Two behavior changes to know about: tool results are
+ordered by the model's `tool_calls` rather than by how they were executed, and
+Gemini and Vertex AI requests now include the tool call id in the JSON body.
+
+### Added
+
+- **`:on_tool_call_review` callback on `LangChain.Chains.ChainCallbacks`.**
+  Consulted for each tool call, and unlike the observation-only tool callbacks
+  its return value is honored: `:ok` to abstain, `{:update_arguments, map}` to
+  rewrite the call, `{:deny, reason}` to stop it and answer the model with
+  `reason`, or `{:interrupt, message, data}` to put it in front of the user
+  first. Decides from the arguments the model chose, which withholding a tool
+  cannot do. https://github.com/brainlid/langchain/pull/633
+- **`LangChain.Callbacks.reduce/4`**, the decision-capable counterpart to
+  `fire/3`, which now delegates to it.
+  https://github.com/brainlid/langchain/pull/633
+
+### Changed
+
+- **Tool results are returned in the order the model requested the calls.** Each
+  call keeps its own slot through execution instead of being grouped by async,
+  sync, denied, and unknown-tool. Gemini pairs a function response with its call
+  by position, so a result out of place was answered against the wrong call.
+  https://github.com/brainlid/langchain/pull/633
+- **Review runs in the parent chain process before the
+  `:on_tool_execution_started` fan-out and before any `Task` is spawned**, so a
+  refused call is never announced as running. Reviews for async tools therefore
+  run serially. https://github.com/brainlid/langchain/pull/633
+- **A denied call reports `is_error: false`**, leaving the chain's failure
+  counter alone so a policy that turns down many calls cannot exhaust
+  `max_retry_count`. https://github.com/brainlid/langchain/pull/633
+- **`execute_tool_calls_with_decisions/3` reviews too**, since a human approving
+  a call says a person agreed, not that policy did.
+  https://github.com/brainlid/langchain/pull/633
+
+### Fixed
+
+- **Gemini and Vertex AI carry the tool call id through the exchange.** Newer
+  models issue an id with every call and expect it back, which is what pairs a
+  turn holding several calls to the same tool unambiguously rather than by
+  position. A call with no id sends none, and so does its answer.
+  https://github.com/brainlid/langchain/pull/634
+
+## v0.12.0
+
+Token usage is reported once per streamed turn, from every provider that sends
+it. `LangChain.Message.ContentPart` options hold one shape whichever way a part
+was built. OpenAI reasoning items survive a tool loop, and `ChatGrok` streaming
+delivers the assistant's reply.
+
+**This release contains breaking changes** for code that reads
+`%LangChain.TokenUsage{}`, combines token usage, reads `ContentPart.options`, or
+handles `:on_llm_token_usage` from `ChatGrok`.
+
+Reported token counts change for streamed `ChatAnthropic`, `ChatVertexAI` and
+`ChatReqLLM` calls, because the old numbers were wrong. Anthropic recorded input,
+cache-creation and cache-read at exactly 2x truth. Vertex AI multiplied usage by
+the chunk count. Streamed `ChatAwsMantle`, `ChatPerplexity` and `ChatGrok`
+calls recorded no tokens at all and now record them, and streamed `ChatOpenAI`
+calls now report tokens to the `[:langchain, :llm, :call, :stop]` telemetry event
+and its OTEL span, which previously saw `token_usage: nil`. Cost dashboards and
+alerts thresholded on any of these will move on the first deploy.
+
+### Upgrading from v0.11.0 - v0.12.0
+
+#### `:cumulative` is removed from `%TokenUsage{}`
+
+The field is gone from the struct and from `@create_fields`, and
+`TokenUsage.clear_cumulative/1` is deleted. Only `ChatGoogleAI` ever set the
+flag, while five other providers needed it and did not, so the distinction it
+carried moved to the call site, where the caller always knows which question it
+is asking.
+
+Anything touching the field through the struct is a compile error that
+`mix compile --warnings-as-errors` surfaces:
+
+```elixir
+%TokenUsage{input: 10, cumulative: true}      # ** (KeyError) key :cumulative not found
+%TokenUsage{usage | cumulative: false}        # ** (KeyError) key :cumulative not found
+def handle(%TokenUsage{cumulative: true}),    # ** (KeyError) key :cumulative not found
+TokenUsage.clear_cumulative(usage)            # warning: undefined function
+```
+
+Two cases do not fail loudly. `Ecto.Changeset.cast/3` drops params outside the
+permitted list, so `TokenUsage.new!(%{input: 10, cumulative: true})` still builds
+and ignores the flag. And `add/2` changed meaning with no compile-time signal.
+Grep for `cumulative` rather than relying on the compiler alone.
+
+#### `TokenUsage.add/2` combines readings of one message; `add_total/2` sums across messages
+
+`add/2` used to sum both operands. It now keeps the larger count per field,
+recursing into nested `raw` detail maps at every depth. That is the correct
+combination for a streamed response, where each reading is a snapshot of the
+message so far rather than one delta's share.
+
+```elixir
+TokenUsage.add(a, b)        # several readings of ONE message, keeps the larger count per field
+TokenUsage.add_total(a, b)  # final usage of DIFFERENT messages, sums them
+```
+
+| If you were... | Do this |
+| --- | --- |
+| Summing usage across messages or turns with `add/2` | Switch to `add_total/2`. **Compilation will not catch this one.** |
+| Combining several readings of one streamed message with `add/2` | No change. This is what `add/2` is now for. |
+| Setting `cumulative: true` in a custom chat model | Delete it. Every reading is treated as a snapshot, so no provider needs the marking. |
+| Branching on the flag to choose between replace and add | Delete the branch and call `add/2`. It handles both conventions. |
+| Calling `TokenUsage.clear_cumulative/1` | Delete the call. |
+| Passing `cumulative:` to `new/1` or `new!/1` | Remove it. It is ignored rather than rejected. |
+
+A `raw` key holding a value *derived* from other counts within a single reading,
+such as the `total_tokens` `req_llm` computes per snapshot, is only meaningful
+alongside the reading it came from and does not survive the merge intact. Read a
+combined total from `TokenUsage.total/1`.
+
+#### `ContentPart.options` is always a keyword list
+
+`ContentPart.new/1` normalizes a map of options into a keyword list, so a part
+holds the same shape whichever way it was built and keeps it across a
+serialization round trip.
+
+Callers passing a map keep working, since normalization happens in the
+constructor. Already-persisted conversations need no migration, because a JSON
+round trip already returned a keyword list. What breaks is code that *reads*
+`part.options` expecting a map:
+
+```elixir
+# Before
+part.options.id
+%ContentPart{options: %{type: "web_search_call"} = opts} -> ...
+
+# After
+Keyword.get(part.options, :id)
+%ContentPart{options: opts} -> if Keyword.get(opts, :type) == "web_search_call", do: ...
+```
+
+Option keys must be atoms. A map with any non-atom key is rejected with a
+changeset error rather than converted, because `String.to_atom/1` on
+caller-supplied input is an atom-table exhaustion vector.
+
+#### `ChatGrok` fires `:on_llm_token_usage` at the documented arity
+
+The callback fired as `[grok, response_data]`, two arguments ending in the raw
+API map. It now fires with one argument, a `%TokenUsage{}`, matching every other
+chat model. A handler written to the documented shape previously raised
+`BadArityError` inside `Callbacks.fire/3` and failed the entire `call/3`, so it
+starts working rather than needing a change. A handler written for the old
+two-argument shape needs updating.
+
+#### A streamed response can carry a bare `%TokenUsage{}`
+
+`ChatGrok` and `ChatAwsMantle` report the usage-only terminal chunk as a
+`%TokenUsage{}` where they previously returned an empty `%MessageDelta{}` and
+`:skip`. This is the shape `ChatOpenAI` has always returned, and `LLMChain`
+already folds it into the final delta. Code that assumes every item in a streamed
+response is a `%MessageDelta{}` needs to account for it.
+
+### Added
+
+- **`LangChain.TokenUsage.add_total/2`** for summing the final usage of different messages into a running total, at every depth of the `raw` map. `LLMChain` and `Trajectory` aggregation use it. https://github.com/brainlid/langchain/pull/625
+- **`LangChain.ChatModels.ChatModel.stream_item/0`** typespec, covering the three things a stream carries: deltas, a bare `%TokenUsage{}`, and in-list error tuples. `call_response/0` now also declares the list-of-lists nesting that `Utils.handle_stream_fn/3` produces. https://github.com/brainlid/langchain/pull/625
+- **OpenAI reasoning continuity across a tool loop.** `ChatOpenAIResponses` captures `reasoning.encrypted_content` on both the streamed and non-streamed paths and replays reasoning items as their own input entries, ordered ahead of the message or function call they produced. Set `include: ["reasoning.encrypted_content"]` to opt in; without it the code stays inert. New public `stand_alone_items_for_api/2` and `reasoning_item_for_api/1`. https://github.com/brainlid/langchain/pull/630
+- **`ContentPart.new/1` accepts a map of options** and converts it to a keyword list. https://github.com/brainlid/langchain/pull/631
+
+### Changed
+
+- **`TokenUsage.add/2` keeps the larger count per field** rather than summing, treating both operands as readings of the same message. This one semantic change fixes the double and multiplied counts in four providers at once. https://github.com/brainlid/langchain/pull/625
+- **`:cumulative` removed from `%TokenUsage{}`**, along with `TokenUsage.clear_cumulative/1`. https://github.com/brainlid/langchain/pull/625
+- **`ContentPart` options are normalized to a keyword list** in the constructor, and `ChatOpenAIResponses` reads them with `Keyword`. https://github.com/brainlid/langchain/pull/631
+- **`ChatGrok` derives message status from `finish_reason`**, on streamed deltas and non-streamed messages alike, so a truncated or filtered turn reports `:length` or `:content_filtered` instead of passing as complete. Streamed deltas also carry the choice `index`. https://github.com/brainlid/langchain/pull/627
+- **`ChatGrok` fires `:on_llm_token_usage` with a single `%TokenUsage{}`.** https://github.com/brainlid/langchain/pull/627
+- **`ChatAwsMantle` reports its usage-only terminal chunk** as a `%TokenUsage{}` instead of `:skip`. https://github.com/brainlid/langchain/pull/625
+- **`ChatGrok` reports its usage-only terminal chunk** as a `%TokenUsage{}` instead of an empty `%MessageDelta{}`. A chunk carrying neither choices nor usage is now `:skip`. https://github.com/brainlid/langchain/pull/626 https://github.com/brainlid/langchain/pull/627
+
+### Fixed
+
+- **Streamed `ChatAnthropic` usage was recorded at 2x.** `message_start` opens the message with the input classes and `message_delta` closes it with the message total, and the two readings were summed. Input, cache-creation and cache-read counts were each doubled. https://github.com/brainlid/langchain/pull/625
+- **Streamed `ChatVertexAI` usage was multiplied by the chunk count.** It decodes the same Gemini shape as `ChatGoogleAI`, where every chunk repeats the running totals, but never marked them as such. https://github.com/brainlid/langchain/pull/625
+- **`ChatReqLLM` reproduced the Anthropic double count** through the dependency. https://github.com/brainlid/langchain/pull/625
+- **`ChatPerplexity` never read `usage` on the streaming path.** No callback fired, nothing reached message metadata, and the telemetry span reported `token_usage: nil`. https://github.com/brainlid/langchain/pull/625
+- **Streamed `ChatOpenAI` and `ChatAwsMantle` calls reported no tokens to telemetry.** `ChatModel.token_usage_from_result/1` read usage only off delta metadata and ignored the bare `%TokenUsage{}` that OpenAI-shaped providers return in the same list. This also covers vLLM and OpenRouter, which put a running total on every content chunk under `continuous_usage_stats: true`. https://github.com/brainlid/langchain/pull/625
+- **`TokenUsage.total/1` raised `ArithmeticError` on an unreported count.** An unreported count now contributes nothing. Anthropic's closing event carries only `output_tokens`, so a `nil` input is a real shape. https://github.com/brainlid/langchain/pull/625
+- **A streamed `ChatGrok` turn never reached `chain.messages`.** Deltas stayed `:incomplete` because `finish_reason` was never read, so `MessageDelta.to_message/1` always failed and `LLMChain.run/1` returned `{:ok, chain}` with the reply stranded in `chain.delta`. https://github.com/brainlid/langchain/pull/627
+- **A streamed `ChatGrok` request did not stream.** The response was buffered whole and split afterwards, so `:on_llm_new_delta` and the `[:langchain, :llm, :stream, :first_token]` telemetry never fired. It now uses the shared `Utils.handle_stream_fn/3` collector. https://github.com/brainlid/langchain/pull/627
+- **OpenAI reasoning items were parsed and then dropped.** The non-streaming path produced an `:unsupported` part that no outbound clause could emit; the streaming path discarded the reasoning `id` and emitted an empty `:thinking` part. The model re-derived its reasoning on every round trip of a tool loop. https://github.com/brainlid/langchain/pull/630
+- **`ChatOpenAIResponses` dropped native tool calls from a replayed history after persistence.** `web_search_call` and `file_search_call` parts were built with map options and matched as maps, but a stored conversation returns keyword lists, so the clause fell through and the tool call vanished with no error. The same part crashed `ContentPart.set_option_on_last_part/3` with a `FunctionClauseError`. https://github.com/brainlid/langchain/pull/631
+
+## v0.11.0
+
+Gemini tool call ids, a `ChatReqLLM` streaming failure that escaped the error path, and visibility into exceptions raised inside a tool.
+
+**This release contains a breaking change** for code that calls
+`LangChain.Function.execute/3` directly. Chain usage is unaffected, since
+`LLMChain` handles the new shape internally.
+
+`Function.execute/3` returns `{:error, message, {exception, stacktrace}}` when it
+rescues an exception raised by a tool or by a `:parse_args` parser. That case
+previously returned `{:error, message}`. A caller matching exhaustively on the
+two-element tuple raises `CaseClauseError` when a tool raises, turning a handled
+failure into a crash.
+
+### Upgrading from v0.10.0 - v0.11.0
+
+Only direct callers of `Function.execute/3` need a change. Add a clause for the
+three-element shape ahead of the two-element one:
+
+```elixir
+case Function.execute(function, arguments, context) do
+  {:ok, llm_result} -> ...
+  {:ok, llm_result, processed_content} -> ...
+  {:interrupt, display_message, interrupt_data} -> ...
+  {:error, message, {exception, stacktrace}} -> ...
+  {:error, message} -> ...
+end
+```
+
+`{:error, message}` still covers every error a tool returns deliberately, along
+with argument checks that reject a call. The three-element shape appears only
+when an exception was actually rescued.
+
+Two behavior changes that need no code change:
+
+- Tool spans now close with an error status when a tool raises, so an
+  OpenTelemetry backend reports a tool error rate where it previously reported
+  none. Alerts thresholded on that rate may fire on the first deploy. A tool
+  returning `{:error, reason}` leaves the span unmarked, so only rescued
+  exceptions count.
+- The default model for `ChatGoogleAI` and `ChatVertexAI` is now
+  `gemini-pro-latest`. The models previously named as defaults answer every
+  request with a 404, and the `-latest` aliases track whatever Google currently
+  serves for the tier.
+
+### Added
+
+- **`:on_tool_execution_exception` callback on `LangChain.Chains.ChainCallbacks`.** Receives the chain, the `ToolCall`, the rescued exception, and its stacktrace. It fires in addition to `:on_tool_execution_failed`, which still receives the message the model sees. Error trackers group and fingerprint by stack frames, which a formatted message cannot support. It does not fire for `{:error, reason}` results, unknown tool names, human rejections, or interrupts, since none of those involve a rescued exception. https://github.com/brainlid/langchain/pull/621
+- **`is_exception` and a virtual `exception` field on `LangChain.Message.ToolResult`.** `is_exception` narrows `is_error` to results where an exception was rescued, and `exception` holds the `{exception, stacktrace}` pair. The exception is never sent to the LLM and never persisted, so a result restored from storage carries `is_exception: true` with `exception: nil`. https://github.com/brainlid/langchain/pull/621
+- **`{:error, message, {exception, stacktrace}}` return shape from `LangChain.Function.execute/3`.** It mirrors the success shape `{:ok, llm_result, processed_content}`: the second element is what the model sees, the third is the native Elixir detail kept for the application. Also returned when a `:parse_args` parser raises. https://github.com/brainlid/langchain/pull/621
+- **`LangChain.Utils.generate_tool_call_id/0`** for synthesizing a tool call id when a provider response omits one. It returns a UUID, which stays distinct from ids held by a conversation that was stored and later reloaded into a new VM. https://github.com/brainlid/langchain/pull/620
+
+### Changed
+
+- **A rescued tool exception marks the `execute_tool` OpenTelemetry span errored.** The stop handler sets an error status and an `error.type` attribute, and records the exception with its real stacktrace. `:stop` is the only point at which the span is still open. A tool returning `{:error, reason}` is a handled outcome the model reacts to and leaves the span unmarked, so error rates stay meaningful. https://github.com/brainlid/langchain/pull/621
+- **Default model for `ChatGoogleAI` and `ChatVertexAI` is `gemini-pro-latest`.** https://github.com/brainlid/langchain/pull/620
+
+### Fixed
+
+- **Gemini tool calls use the id Google reports.** Deriving the id from the tool name alone gave two calls to the same tool the same id, which pairs a `ToolResult` with the wrong call and is rejected when the conversation is replayed against a provider requiring unique ids. During `MessageDelta` accumulation, a tool call fragment continues the call at its index only when the ids agree, which keeps parallel calls separate, while a fragment carrying no id of its own still continues by index as OpenAI streams argument fragments. https://github.com/brainlid/langchain/pull/620
+- **`ChatReqLLM` returns `{:error, %LangChainError{}}` when a streamed request fails mid-stream.** req_llm builds its stream lazily and reports success before any bytes move, so a transport failure was raised from inside the stream during consumption rather than reaching the error clauses. Consumption now runs inside a rescue routing the failure through the same classifier the non-streaming path uses, reading the reason from Req, Finch, and Mint transport errors alike. A closed connection retries only when no deltas have reached the callback, since re-requesting after a consumer has rendered partial content would replay it. https://github.com/brainlid/langchain/pull/623
+
+## v0.10.0
+
+`LangChain.Message.status` now names every way a message can fail to finish,
+instead of folding two of them into values that describe something else.
+
+**This release contains breaking changes.** Three status values change for
+existing scenarios:
+
+- **A stream that dies mid-flight now produces `status: :stream_error`**, where
+  it previously produced `:cancelled`. This covers a provider reporting
+  `overloaded`, an invalid request, and transport-level filtering. The error
+  itself is still in `metadata[:streaming_error]`, so code reading the reason is
+  unaffected.
+
+  `:cancelled` remains, and now means only what it says: a caller stopped the
+  response through `LLMChain.cancel_delta/2`. Both preserve the partial content.
+
+- **A `"content_filter"` finish reason now produces `status: :content_filtered`**,
+  where it previously produced `:complete`. A response the provider's filter
+  stopped was being recorded as one the model finished. Applies to
+  `ChatOpenAI`, `ChatDeepSeek`, `ChatAWSMantle`, `ChatOrq`, and `ChatReqLLM`.
+
+- **`ChatAnthropic` maps a `"refusal"` stop reason to `status:
+  :content_filtered`**, where it previously produced `status: nil` and logged an
+  "Unsupported stop_reason" warning. Anthropic's safety classifiers return a
+  refusal as a normal HTTP 200 response, so it arrives on the success path
+  rather than as an error.
+
+### Upgrading from v0.9.7 - v0.10.0
+
+If you pattern match exhaustively on `Message.status`, add clauses for
+`:content_filtered` and `:stream_error`. Code matching on `:cancelled` to detect
+a dead stream must match `:stream_error` instead. If you persist the status and
+may need to roll back, note that older versions cannot read the two new values.
+
+### Added
+
+- **`:stream_error` and `:content_filtered` on `LangChain.Message.status`.**
+  The full set is now `:complete | :cancelled | :length | :content_filtered |
+  :stream_error`, documented on `LangChain.Message`. Every value other than
+  `:complete` means the model did not finish, and each names a distinct cause,
+  so a caller can tell them apart without inspecting metadata. https://github.com/brainlid/langchain/pull/616
+- **`:content_filtered` on `LangChain.MessageDelta.status`**, so a filtered
+  stream is assembled into a message rather than left hanging as an unfinished
+  delta. `:cancelled` and `:stream_error` are absent from the delta, since the
+  chain rather than the provider decides them. https://github.com/brainlid/langchain/pull/616
+- **Anthropic refusal details in `metadata[:stop_details]`.** A refused response
+  carries a `stop_details` object naming the policy category that stopped it.
+  `ChatAnthropic` places it in the message's `metadata` under `:stop_details`,
+  on both the single-response and streaming paths. Anthropic sends
+  `stop_details` only on a refusal, so the key is absent from `metadata` for
+  every other stop reason. https://github.com/brainlid/langchain/pull/616
+
+### Changed
+
+- **`LangChain.MessageDelta.merge_delta/2` carries provider metadata forward.**
+  Metadata on an incoming delta is shallow-merged into the accumulated delta, so
+  values a provider reports alongside the terminating event (a refusal's
+  `:stop_details`, OpenAI's `:logprobs`) survive into the assembled message
+  instead of being dropped. `:usage` is excluded from the merge and continues to
+  be summed across deltas by `accumulate_token_usage/2`. https://github.com/brainlid/langchain/pull/616
+- **OpenTelemetry `gen_ai.response.finish_reasons`** now reports
+  `"content_filter"` and `"error"` for the two new statuses. https://github.com/brainlid/langchain/pull/616
+
+## v0.9.7
+
+A small release focused on the OpenAI Responses API, adding server-side context compaction and correcting how assistant history is serialized.
+
+One behavior change to note before upgrading:
+
+- Assistant messages in conversation history are now sent to the Responses API as assistant "output" messages instead of being relabeled as user messages. Their text is serialized as `output_text`, and images, files, and other parts that an assistant message cannot carry are omitted. A message left with no representable content is dropped entirely rather than sent with an empty content list.
+
+### Added
+
+- **`context_management` option on `ChatOpenAIResponses`** for server-side context compaction on long-running conversations. When the rendered token count crosses the threshold, the server compacts the context before continuing inference.
+
+  ```elixir
+  ChatOpenAIResponses.new!(%{
+    context_management: [%{type: "compaction", compact_threshold: 200_000}]
+  })
+  ```
+
+  `compact_threshold` is optional; omit it to let the server pick one. Entries accept atom or string keys, are normalized to string keys, and are passed through as given, so new types and options work without a library change. The option is included in serialization and deserialization. https://github.com/brainlid/langchain/pull/608
+- **Structured output documentation for `ChatGoogleAI` and `ChatVertexAI`.** The `json_response` and `json_schema` support mapping to `generationConfig.response_mime_type` and `generationConfig.response_schema` shipped previously but was undocumented. Each moduledoc now has a `## Structured Output` section with a worked `json_schema` example. https://github.com/brainlid/langchain/pull/610
+
+### Changed
+
+- **`content_parts_for_api/3` and `content_part_for_api/3` on `ChatOpenAIResponses` take the message role.** Both default to `:user`, so existing arity-2 callers are unaffected. https://github.com/brainlid/langchain/pull/609
+
+### Fixed
+
+- **Assistant history no longer produces a payload the Responses API rejects.** Preserving the assistant role required role-aware content serialization; without it, the API returned `Invalid value: 'input_text'. Supported values are: 'output_text' and 'refusal'.` https://github.com/brainlid/langchain/pull/609
+
+## v0.9.6
+
+A small release improving what a tool reports back when the model calls it with the wrong argument names, so the next attempt is more likely to succeed.
+
+Two behavior changes to note before upgrading:
+
+- `parameters_schema:` tools now get the same top-level required-key check that `parameters:` lists have always had. A call missing a key from the schema's `required` array returns an error instead of invoking the tool.
+- A `:parse_args` parser now owns argument validation outright. The built-in required-key check is skipped when a parser is supplied, so the parser can report missing keys and type violations together in its own format.
+
+### Added
+
+- **Actionable errors for missing and misnamed tool arguments.** The error returned to the model names the required, missing, unrecognized, and accepted parameters, and suggests the accepted name a misnamed argument likely meant. A `KeyError` or `FunctionClauseError` from an argument the required-key check can't reach is reported the same way rather than as a stack trace.
+
+  A `read_document` tool declaring `path` and `offset` and called with `{"file_path": "/a.md"}` now returns:
+
+  ```text
+  Missing required parameters for this tool.
+
+  Required parameters: path
+  Missing parameters: path
+  Unrecognized parameters: file_path (did you mean "path"?)
+  Accepted parameters: path, offset
+
+  Ensure you're passing the correct parameter names as defined in the tool schema.
+  ```
+
+  Previously the model saw a raw exception with a stack frame from the tool's source, read it as a transient fault, and retried the identical call. https://github.com/brainlid/langchain/pull/606
+- **`LangChain.Function.required_param_names/1` and `accepted_param_names/1`.** Read top-level parameter names from either declaration style. https://github.com/brainlid/langchain/pull/606
+
+### Fixed
+
+- **`Function.execute/3` normalizes `nil` arguments to an empty map**, which an LLM can return in place of `%{}` for a no-argument call. https://github.com/brainlid/langchain/pull/606
+
+## v0.9.5
+
+Adds your application's context to OpenTelemetry spans. Attributes you set on a chain now land on every span it produces, not just the root. No breaking changes.
+
+### Added
+
+- **Span attributes from `custom_context[:otel_attributes]`.** A flat map that lands on the `invoke_agent` span, each `chat` span, and each `execute_tool` span, so you can filter and group traces by tenant, user, or feature.
+
+  ```elixir
+  chain
+  |> LLMChain.update_custom_context(%{
+    otel_attributes: %{"user.id" => user.id, "organization.id" => org.id}
+  })
+  ```
+
+  Only this reserved key is exported, never the rest of `custom_context`. `gen_ai.conversation.id` is inherited the same way. Attributes a span derives itself always win, so an inherited value can never mask the real `gen_ai.request.model`. Pass `inherit_attributes: false` to `setup/1` to keep attributes on the chain span only. https://github.com/brainlid/langchain/pull/603
+- **`LangChain.OpenTelemetry.Enrich`** for setting attributes imperatively. `set_current_span_attributes/1` enriches the innermost open span, useful from inside a tool function or callback. `put_inherited_attributes/1` seeds attributes before any chain exists, for a Plug, a LiveView `mount/3`, or an Oban worker. Both are safe to call without the OpenTelemetry dependencies installed. https://github.com/brainlid/langchain/pull/603
+- **`gen_ai.agent.name` and `gen_ai.agent.id`** from `custom_context[:agent_name]` and `[:agent_id]`. The name still falls back to the chain type when unset. https://github.com/brainlid/langchain/pull/603
+
+See the [Observability guide](https://hexdocs.pm/langchain/observability.html) for the full details.
+
+## v0.9.4
+
+A patch release fixing two provider-specific serialization and streaming bugs. The Google fix is the significant one: since v0.8.x, every tool declared the ordinary way with a `parameters:` list was rejected by Gemini, failing the whole request. No breaking changes.
+
+Note that one fix carries a deliberate semantic loss worth knowing about. Google's schema type has no `additionalProperties` field, so the keyword is now stripped rather than sent. Gemini therefore does not reject unexpected properties, and a tool call's arguments may contain fields the schema did not declare. Where that guarantee matters, validate the arguments inside the tool's own function. This is not a regression: the requests that carried the keyword previously failed outright, so nothing that worked before enforces less now.
+
+### Fixed
+
+- **`ChatGoogleAI` and `ChatVertexAI` strip the JSON Schema keywords Gemini's `Schema` type rejects.** Google's function declarations and response schemas accept a select subset of an OpenAPI 3.0 schema object, not full JSON Schema. The `Schema` type is a protobuf message, so an unknown keyword is rejected by the parser before any semantic validation. That fails the entire request rather than the single tool, with an error naming a field path rather than the tool. This was not limited to callers who set such a keyword deliberately: `FunctionParam.to_parameters_schema/1` adds `"additionalProperties" => false` to every schema it generates and recurses into nested objects and array items, so **any tool declared with the ordinary `parameters:` list form was rejected by Gemini**. That injection arrived in #490 to fix #440 for Anthropic, which requires the keyword; Google was not evaluated at the time. A new `LangChain.Utils.GoogleSchema` now sanitizes schemas at all four call sites that reach the API: `ChatGoogleAI`'s function declarations and `response_schema`, and `ChatVertexAI`'s. Recursion is key-aware, so a parameter *named* `const` or `examples` survives while the keywords themselves are removed, and supported keywords (`minimum`, `maximum`, `enum`, `nullable`, `title`, `pattern`, `default`, `format`) are kept. Also repairs the empty-parameters guard, which compared against a shape without `additionalProperties` and so had stopped matching for functions declared with `parameters: []`, and extends that guard to `ChatVertexAI`, which lacked it entirely. Fixes #598. Thanks to Edgar Gomes (@lostbean) for the contribution. https://github.com/brainlid/langchain/pull/599
+- **`ChatOpenAIResponses` no longer errors on raw reasoning-text streaming events.** Open-weight models that expose their full chain-of-thought rather than a summary — notably OpenAI's `gpt-oss` family, including when served through AWS Bedrock "Mantle" — stream their reasoning as a `reasoning` output item made of `response.reasoning_text.delta` events, delimited by `response.reasoning_part.added` / `.done` and `response.reasoning_text.done`. None of these were handled: they fell through to the catch-all and were returned as `{:error, %LangChainError{type: "unexpected_response"}}` for every reasoning chunk, which aborted the stream (and crashed any `on_llm_new_delta` handler that assumed a map). `response.reasoning_text.delta` is now processed exactly like `response.reasoning.delta` — as `:thinking` content on a `MessageDelta` — and the structural markers are skipped, mirroring the existing `response.reasoning_summary_*` handling. Thanks to Jeremy Searls (@jersearls) for the contribution. https://github.com/brainlid/langchain/pull/600
+
+## v0.9.3
+
+A release focused on two areas: closing credential-exposure and dependency-advisory issues, and making the callback system actually work the way it has always been documented. Callbacks assigned to a chat model were silently discarded, both by `new/1` and again by `LLMChain`, and the convenience chains offered no way to observe their internal run at all. No breaking changes.
+
+Note one behavior change that is a fix rather than a break: an `LLMChain` run now *appends* its event handlers to any already on the chat model instead of replacing them. If you previously registered the same handler in both places, relying on the model's copy being discarded, it will now fire twice.
+
+### Security
+
+- **Updated dependencies to clear outstanding advisories.** `mint` 1.7.1 to 1.9.3 resolves four advisories, including a high-severity unbounded `streams` map growth via `PUSH_PROMISE` frames without follow-up `HEADERS` ([GHSA-g586-ccqf-7x4r](https://github.com/advisories/GHSA-g586-ccqf-7x4r)), CRLF injection in the request line via unvalidated `method`/`target` ([GHSA-2pg6-44cx-c49v](https://github.com/advisories/GHSA-2pg6-44cx-c49v)), and a `Content-Length` parser accepting a non-RFC `+` prefix ([GHSA-mjqx-c6f6-7rc2](https://github.com/advisories/GHSA-mjqx-c6f6-7rc2)). `req` 0.5.17 to 0.6.3 additionally escapes multipart part headers per RFC 7578 ([GHSA-px9f-whj3-246m](https://github.com/wojtekmach/req/security/advisories/GHSA-px9f-whj3-246m)), which closes a header-injection vector in `FileOpenAI.upload/2` and `FileAnthropic.upload/2` where a caller-supplied `:filename` was interpolated into the part headers unescaped. `finch`, `hpax`, and `decimal` move with them. Lockfile only; no `mix.exs` constraint changed.
+
+  Two `req` 0.6 behavior changes are worth knowing about, neither of which affects this library: response decompression is now opt-in via `compressed: true`, and `decode_body` now decodes only JSON by default (archive and CSV formats moved behind `:decoders`). LangChain sets neither option and only decodes JSON. https://github.com/brainlid/langchain/pull/591
+
+- **`ChatVertexAI` no longer puts the API key in the request URL.** `build_url/1` appended the key as a `?key=...` query parameter, copied from `ChatGoogleAI`, whose generativelanguage.googleapis.com endpoint really does authenticate that way. Vertex AI targets aiplatform.googleapis.com, which uses OAuth bearer tokens, and the request already sent `auth: {:bearer, ...}`. The query-string copy was therefore redundant and a potential credential-leak vector, since full request URLs routinely land in server and proxy access logs, error trackers, and browser history. Authentication is unchanged: the bearer token in the `Authorization` header still carries the credential. The SSE parameter, which previously relied on the `?` introduced by `?key=`, now opens the query string itself (`?alt=sse` rather than `&alt=sse`). Thanks to Tom Clarke (@pinetops) for the contribution. https://github.com/brainlid/langchain/pull/575
+
+### Fixed
+
+- **Chat models now accept `callbacks` through `new/1` instead of silently dropping them.** `:callbacks` was declared as a schema field on every chat model but was missing from `@create_fields` on 12 of the 14, so `Ecto.Changeset.cast/3` discarded it. `ChatOpenAI.new(%{callbacks: [handlers]})` returned `{:ok, model}` with `callbacks: []` and no error, and any handler registered that way never fired. `ChatOpenAI` and `ChatOpenAIResponses` documented exactly that call in their "Rate Limit API Response Headers" examples, so the documented way to read rate-limit headers could not work. The remaining ten were quietly inconsistent with `ChatGrok` and `ChatOrq`, which already permitted the field. Affects `ChatAnthropic`, `ChatAwsMantle`, `ChatBumblebee`, `ChatDeepSeek`, `ChatGoogleAI`, `ChatMistralAI`, `ChatOllamaAI`, `ChatOpenAI`, `ChatOpenAIResponses`, `ChatPerplexity`, `ChatReqLLM`, and `ChatVertexAI`. Setting callbacks by struct update (`%ChatOpenAI{chat | callbacks: [handler]}`) was unaffected and keeps working. https://github.com/brainlid/langchain/pull/592
+- **Callbacks assigned to a chat model are no longer discarded when it runs inside an `LLMChain`.** `Utils.rewrap_callbacks_for_model/3` forwards the chain's LLM-level handlers down onto the model for the duration of a run, but it *replaced* the model's `:callbacks` rather than adding to them. Any handler the caller had assigned to the model was silently dropped for the whole run, which made the fix above only half-effective: callbacks were accepted by `new/1` but still never fired on the path most callers use. The chain's handlers are now appended to the model's, so both sets run. https://github.com/brainlid/langchain/pull/592
+- **Corrected the callback arity in the `ChatOpenAI`, `ChatOpenAIResponses`, and `ChatGrok` rate-limit examples.** The two tiers take different arguments: a chat model fires its own handlers with just the event's argument, while `LLMChain` curries itself in as a first argument. All three moduledocs showed a two-argument handler assigned to the *model* via `new(%{callbacks: [handlers]})`. Following that example produced a `BadArityError`, which `Callbacks.fire/3` re-raises as a `LangChainError`, failing the entire LLM call rather than skipping the callback. This was already reachable on `ChatGrok`, which has always permitted the field. The `ChatAnthropic` example was already correct, as it registers on the chain. `LLMChain`'s moduledoc now documents both tiers. https://github.com/brainlid/langchain/pull/592
+- **`ChatReqLLM` now round-trips Anthropic extended-thinking signatures.** With thinking enabled, Anthropic requires assistant thinking blocks to be replayed with their original signature on tool-result continuations. The adapter lost the signature on the way in and on the way out: streaming never picked it up from the terminal `reasoning_details` meta chunk, non-streaming responses carry it on `message.reasoning_details` rather than the content part, and `content_part_to_req_llm/1` dropped `options[:signature]` on serialization. The result was a 400 (`thinking.signature: Field required`) on every thinking + tool-use turn. Signatures now survive both response paths and are passed back as part metadata; unsigned thinking blocks are omitted with a warning, same as `ChatAnthropic`. https://github.com/brainlid/langchain/pull/587
+
+### Added
+
+- **The convenience chains accept `callbacks`, making their internally run `LLMChain` observable.** `DataExtractionChain`, `RoutingChain`, `TextToTitleChain`, and `SummarizeConversationChain` each build an `LLMChain` internally and never expose it, so there was no way to observe a run as it happened. Handlers set on the `llm` were not a workaround: `LLMChain.run/2` calls `Utils.rewrap_callbacks_for_model/3`, which replaces the model's callbacks with the chain-derived set, silently discarding whatever the caller had attached. `RoutingChain`, `TextToTitleChain`, and `SummarizeConversationChain` now take a `callbacks` field on `new/1`; `DataExtractionChain.run/4` and `run_chain/4` take a `:callbacks` option. Handlers are registered on the internally run `LLMChain`, so the full `LangChain.Chains.ChainCallbacks` event set is available, including streamed deltas which no post-run return value can provide. Defaults to `[]`. https://github.com/brainlid/langchain/pull/590
+- **`DataExtractionChain` exposes the executed `LLMChain` through `run_chain/4` and `extract_result/1`.** `run/4` returns only the extracted data, so there was no way to reach the underlying chain to log or report the token usage of an extraction. `run_chain/4` returns `{:ok, %LLMChain{}}` — matching how `RoutingChain`, `TextToTitleChain`, and `SummarizeConversationChain` already work — and `extract_result/1` pulls the extracted data out of it. Because the chain is returned regardless of whether the model produced the expected tool call, usage is reportable even when the extraction itself fails. `run/4` is unchanged and is now implemented in terms of the two. https://github.com/brainlid/langchain/pull/589
+- **`ChatAnthropic` accepts `suppress_api_key: true` to omit the `x-api-key` header.** When the Anthropic Messages endpoint is fronted by its own authentication — a corporate proxy, or an AWS SigV4-signed gateway such as Bedrock "Mantle" — sending `x-api-key` is rejected or ignored. Setting `suppress_api_key: true` suppresses the header entirely so the caller's own auth (e.g. `req_opts` SigV4 signing) can take over. Defaults to `false`, preserving existing behavior. Thanks to Jeremy Searls (@jersearls) for the contribution. https://github.com/brainlid/langchain/pull/585
+- **`ChatVertexAI` supports configurable `safety_settings`.** `ChatGoogleAI` has long exposed a `safety_settings` field passed through to the API as `safetySettings`, but `ChatVertexAI` had no equivalent, so callers could not tune Vertex AI harm-category thresholds and the provider defaults always applied. The field is now available on `ChatVertexAI` as well, is included in `serialize_config/1` so it survives a serialize/restore round-trip, and defaults to `[]` — an empty list is omitted from the request, leaving existing behavior unchanged. Thanks to Tom Clarke (@pinetops) for the contribution. https://github.com/brainlid/langchain/pull/593
+
+### Changed
+
+- **CI**: Bumped `erlef/setup-beam` from 1.24.0 to 1.24.1. https://github.com/brainlid/langchain/pull/586
+
+## v0.9.2
+
+A patch release that brings the `ChatReqLLM` backend to parity with `ChatOpenAI` for tool definitions. No breaking changes.
+
+### Added
+
+- **`ChatReqLLM` now maps a `Function`'s `:strict` flag and `FunctionParam` syntax onto the ReqLLM tool.** Tools defined with a `:parameters` list of `LangChain.FunctionParam` structs previously produced an empty schema, and `fun.strict` was dropped entirely. Both parameter forms (`:parameters` and raw `:parameters_schema`) are now supported, and `strict:` is passed through so providers like OpenAI can enforce structured-output schemas. https://github.com/brainlid/langchain/pull/583
+
+## v0.9.1
+
+A patch release that fixes tool-call serialization when a `ToolCall`'s arguments are still an unparsed string. No breaking changes.
+
+### Fixed
+
+- **`ToolCall` arguments are normalized to a map when serializing tool calls.** A `ToolCall` whose `arguments` never reached `status: :complete` (a persisted/replayed `:incomplete` call, a truncated stream, or an empty-string zero-argument call) still held a raw JSON string. `ChatAnthropic`, `ChatGoogleAI`, and `ChatVertexAI` passed that string straight through, so Anthropic rejected the request with `tool_use.input: Input should be an object` (Google/Vertex sent `args: nil`). A shared `ToolCall.arguments_as_map/1` helper now normalizes any shape (map, JSON string, nil, empty/invalid string) to a map at the serialization boundary. Fixes #580. https://github.com/brainlid/langchain/pull/581
+
+## v0.9.0
+
+Adds an opt-in **OpenTelemetry** integration that turns LangChain's existing `:telemetry` events into [GenAI-semantic-convention](https://opentelemetry.io/docs/specs/semconv/gen-ai/) spans and metrics — ready to export to Langfuse, Honeycomb, Grafana Tempo, Jaeger, or any OTLP collector. The work also hardens the underlying telemetry surface and fixes several token-usage bugs it uncovered along the way. See the [Observability guide](guides/observability.md) and [PR #472](https://github.com/brainlid/langchain/pull/472) for full details.
+
+**This release contains breaking changes** for code that attaches to LangChain's `:telemetry` events or implements a custom `ChatModel`. Normal chain/LLM usage is unaffected — no public function signatures changed.
+
+### Upgrading from v0.8.14 - v0.9.0
+
+These only matter if you attach telemetry handlers or implement a custom chat model:
+
+- **Chain telemetry metadata key `tool_count` → `tools_count`.** The `[:langchain, :chain, :execute, *]` events now emit `:tools_count`, aligning with the key the `[:langchain, :llm, :call, *]` events already used across every chat model. If you read `metadata.tool_count` in a chain-event handler, rename it to `tools_count`.
+- **`ChatGrok` `message.metadata.usage` is now a `%LangChain.TokenUsage{}`** (`input`/`output`/`raw`) instead of the raw provider map, matching every other provider. Code reading `msg.metadata.usage["prompt_tokens"]` off a Grok message must switch to `.input`/`.output` (or `TokenUsage.get/1`).
+- **Per-model response events renamed** from the malformed keyword form `[:langchain, :llm, :response, streaming: true | false]` to `[:langchain, :llm, :response, :streaming]` and `[:langchain, :llm, :response, :non_streaming]` (affects `ChatAnthropic`, `ChatBumblebee`, `ChatGoogleAI`). Re-attach handlers to the new names.
+- **New optional `ChatModel.provider/0` callback.** Declared with `@optional_callbacks`, so existing custom chat models continue to compile and run unchanged (their provider is derived from the module name). Implement `provider/0` to return a canonical provider string.
+
+See the PR description for the full list of additive/behavior-change notes (new `:call_id`, `custom_context`, `request_options`, `endpoint`, and time-to-first-token metadata). https://github.com/brainlid/langchain/pull/472
+
+### Added
+
+- **OpenTelemetry GenAI integration** (`LangChain.OpenTelemetry`): an opt-in, zero-overhead-when-absent layer that emits GenAI-semconv spans and metrics from LangChain's telemetry events, with privacy-safe defaults (message/tool content capture is off by default). Ships with an [Observability guide](guides/observability.md), a runnable Livebook, and expanded `LangChain.Telemetry` docs. `:opentelemetry_api` is an optional dependency; the integration compiles only when it's present. https://github.com/brainlid/langchain/pull/472
+
+### Changed
+
+- **Telemetry surface hardened**: LLM-call telemetry is funneled through a single `ChatModel.llm_telemetry_span/3` chokepoint so no provider can silently drop token usage; every event now carries a `:call_id`, and `[:langchain, *, :exception]` events fire on `throw`/`exit` (not just `raise`) and carry a `duration`. https://github.com/brainlid/langchain/pull/472
+- **CI**: Bumped `actions/cache` (and its `restore`/`save` sub-actions) from 5.0.5 to 6.1.0. https://github.com/brainlid/langchain/pull/572 https://github.com/brainlid/langchain/pull/573 https://github.com/brainlid/langchain/pull/574
+
+### Fixed
+
+- **`ChatMistralAI` and `ChatPerplexity` now persist token usage onto the returned message.** Both fired the `:on_llm_token_usage` callback but never set `msg.metadata.usage`, so `TokenUsage.get/1` returned `nil` for every non-streaming response — any caller reading usage/cost off those messages got nothing. Usage is now attached via `TokenUsage.set/2`. https://github.com/brainlid/langchain/pull/472
+- **Streaming token usage now reaches the `:stop` telemetry and OTel spans.** Usage extraction only matched `%Message{}` results and missed the `%MessageDelta{}` (and Mistral's list-of-lists batched) shapes that streaming returns, reporting `nil` usage at the call boundary. https://github.com/brainlid/langchain/pull/472
+
+## v0.8.14
+
+A streaming-compatibility fix for OpenAI-compatible providers that emit SSE comment lines (notably OpenRouter's `: OPENROUTER PROCESSING` keep-alives). No breaking changes.
+
+### Fixed
+
+- **`ChatOpenAI.decode_stream/2` now ignores SSE comment lines**: A line beginning with `:` is an ignorable SSE comment per spec, but it previously failed JSON decoding and got stuck in the incomplete-buffer, poisoning every subsequent chunk and collapsing the whole stream to an empty response. Comment lines are now skipped. Fixes #259. https://github.com/brainlid/langchain/pull/569
+
+### Changed
+
+- **CI**: Bumped `actions/checkout` from 6.0.2 to 7.0.0. https://github.com/brainlid/langchain/pull/570
+
+## v0.8.13
+
+A trajectory eval helper plus a Google AI streaming fix. `Trajectory` gains a `called_before?/4` predicate (and `assert_called_before`/`refute_called_before` macros) for asserting the relative order of two tool calls, and a `ChatGoogleAI` crash on empty streaming responses is fixed. No breaking changes.
+
+### Added
+
+- **`Trajectory.called_before?/4`**: Assert that tool A was called before tool B, independent of intervening calls — the middle ground between `:superset` (containment) and `:strict` (exact sequence). Uses "any A before any B" (`min(index A) < max(index B)`) semantics, accepts a `Trajectory`/`LLMChain`/tool-call list, and supports `require_both: true` to raise on a missing tool. Adds companion `assert_called_before/4` and `refute_called_before/4` macros. https://github.com/brainlid/langchain/pull/565
+
+### Fixed
+
+- **`ChatGoogleAI` crash on an empty streaming response**: A streaming request that returns `200 OK` with zero delta chunks left the response body as `""`, crashing with a `FunctionClauseError` in `:lists.flatten/1`. It now returns a structured `%LangChainError{type: "empty_stream"}` that the chain surfaces cleanly. https://github.com/brainlid/langchain/pull/563
+
+## v0.8.12
+
+A reliability and reach release. A Google AI streaming crash on malformed/empty candidates is fixed, latent bugs surfaced by Elixir 1.20-rc.6's new warnings are corrected (including a `MessageDelta` clause that silently dropped already-merged content), `Trajectory` gains a constructor for bare message lists, Google file uploads can target a specific `:origin`, and Cloudflare Workers AI (e.g. Moonshot Kimi K2.6) is verified and documented via `ChatOpenAI`. No breaking changes.
+
+### Added
+
+- **`Trajectory.from_messages/2`**: Build a trajectory from a bare `[Message.t()]` (with optional `llm`) instead of requiring a live `%LLMChain{}`; `from_chain/1` now delegates to it. https://github.com/brainlid/langchain/pull/560
+- **`FileGoogle.request_upload_url/*` `:origin` option**: Set the request origin when generating a Google file upload URL. https://github.com/brainlid/langchain/pull/556
+- **Cloudflare Workers AI support**: Verified and documented using Workers AI models (e.g. `@cf/moonshotai/kimi-k2.6`) through `ChatOpenAI`, including streaming and tool calling. https://github.com/brainlid/langchain/pull/558
+
+### Changed
+
+- **Elixir 1.20-rc.6 compiler-warning cleanup**: Removed dead code and unreachable clauses to compile cleanly under Elixir 1.20-rc.6's stricter warnings. https://github.com/brainlid/langchain/pull/561
+
+### Fixed
+
+- **`ChatGoogleAI` streaming crash on malformed/empty candidates**: An error candidate (e.g. `MALFORMED_FUNCTION_CALL`) in the stream is now surfaced before delta-reindexing instead of crashing with a `KeyError`. https://github.com/brainlid/langchain/pull/548
+- **Latent bugs exposed by Elixir 1.20-rc.6 warnings**: Reordered a `MessageDelta` clause that was silently dropping already-merged content, plus smaller `ContentPart` and `FunctionParam` fixes. https://github.com/brainlid/langchain/pull/561
+
+## v0.8.11
+
+A small correctness and supply-chain release. `LLMChain.run_until_tool_used/3` no longer discards a successful tool call when the success happens on the same LLM call that hits the `max_runs` ceiling, and `mix_audit` is wired into `mix precommit` so dependency advisories are caught before merge. The `:jsv` and `:decimal` deps are also refreshed.
+
+### Changed
+
+- **Dependency refresh and `mix_audit` in `precommit`**: Bumped `:jsv` and `:decimal` via `mix.lock`, added `:mix_audit` (`~> 2.1`, dev/test only) as a dep, and inserted `deps.audit` into the `precommit` alias so known vulnerable dependencies fail the pre-commit gate. https://github.com/brainlid/langchain/pull/554
+
+### Fixed
+
+- **`LLMChain.run_until_tool_used/3` no longer discards a successful tool call that lands on the `max_runs` boundary**: A first-call success with `max_runs: 1` previously surfaced as `"Exceeded maximum number of runs (1/1)"` because the ceiling check ran before the tool-used check. The pipeline now evaluates success first. https://github.com/brainlid/langchain/pull/553
+
+## v0.8.10
+
+A focused fix for `ChatReqLLM` streaming tool calls against the default OpenAI decoder shape (direct OpenAI, LiteLLM proxy, and any other ReqLLM provider that emits the OpenAI tool-call pattern).
+
+### Fixed
+
+- **`ChatReqLLM` correctly assembles OpenAI-style streamed tool calls**: handles ReqLLM's default OpenAI tool-call chunk shape (direct OpenAI, LiteLLM proxy, etc.), which previously produced an orphan `ToolCall` and a `"delta_conversion_failed"` error. https://github.com/brainlid/langchain/pull/551
+
+## v0.8.9
+
+A streaming-helpers release. `LangChain.MessageDelta` gains four small, well-documented functions that codify the merge rules every streaming consumer (Phoenix LiveView, Sagents, etc.) was reimplementing locally: append-vs-merge of tool calls by `call_id`, one-way status promotion, no-regression `display_text` updates, and a terminal-status gate for UI cleanup. All additions are pure data transforms; no existing `MessageDelta` behavior changes.
+
+### Added
+
+- **`LangChain.MessageDelta` streaming tool-call status helpers**: Four new functions codify the merge logic that streaming consumers previously reimplemented by hand.
+  - `upsert_tool_call/2` appends a new `ToolCall` or merges non-nil fields onto an existing one with the same `call_id`. `status` is promoted one-way (`:incomplete` to `:complete`, never back), and `metadata` is shallow-merged with incoming keys winning per-key.
+  - `set_tool_execution_status/3` drives the `metadata["execution_status"]` lifecycle for a specific `call_id`, delegating to `ToolCall.set_execution_status/2`.
+  - `set_tool_display_text/3` refines `display_text` as more is learned (e.g. `"Reading file"` to `"Reading \"outline.md\" (lines 60-100)"`). A `nil` incoming value is an explicit no-op so the UI never regresses from showing something to showing nothing.
+  - `all_tools_terminal?/1` gates UI cleanup on every tool call reaching a terminal status. Returns `false` for `nil` or empty `tool_calls`, so empty deltas don't trigger premature clears.
+
+  All helpers tolerate `nil`/empty `tool_calls`, so callers don't need to guard. https://github.com/brainlid/langchain/pull/549
+
+## v0.8.8
+
+A dependency-hygiene release that unblocks downstream apps from upgrading `:langchain` when they already use `:zoi`.
+
+### Changed
+
+- **Removed `:zoi` from `mix.exs`**: v0.8.7 declared `:zoi` as an optional dep so the `:parse_args` integration test could exercise a real schema library. That declaration propagated a version constraint to downstream apps and conflicted with projects pinning a different `:zoi` version. The dep is now gone from `mix.exs` entirely; the test suite picks up `:zoi` transitively through the optional `:req_llm` -> `:llm_db` chain. Downstream apps that want to use Zoi with `:parse_args` continue to list `:zoi` in their own deps (the recommended pattern from the start) and are no longer constrained by `:langchain`.
+
+## v0.8.7
+
+A streaming-resilience and tooling release. Three production crashes in the streaming path are fixed (OpenAI Responses SSE chunking, post-complete tool-call fragments, and unexpected `do_run/1` shapes), Gemini gets unstuck when a `ToolResult` is built from an error case, and `LangChain.Function` gains an opt-in `:parse_args` callback that lets tools "parse, don't validate" the LLM's arguments at the centralized execution point. `ChatAnthropic` also picks up `:output_config` so callers can drive Anthropic's adaptive thinking-effort knob.
+
+### Added
+
+- **`LangChain.Function` `:parse_args` callback**: New 1-arity hook that runs after the required-key check and before the tool body, receiving the raw string-keyed arguments map and returning `:ok`, `{:ok, parsed_map}`, or `{:error, reason_string}`. On rejection the body is skipped and `reason` flows through as the tool result so the model can self-correct on the next turn; the call still produces a `ToolResult{is_error: true}`, fires `:on_tool_response_created`, and emits the `[:langchain, :tool, :call]` telemetry span, so trajectory and token-usage consumers see the attempted call rather than a silent drop. Designed to plug in Zoi, NimbleOptions, Ecto changesets, JSV, or plain Elixir without LangChain taking a new hard dependency; `zoi` is added as an optional dep purely so the integration test can exercise an end-to-end adapter. https://github.com/brainlid/langchain/pull/544
+- **`ChatAnthropic` `:output_config` field**: New top-level `:map` field on the chat-model schema that is forwarded to Anthropic as the `output_config` request parameter, enabling adaptive thinking-effort control alongside the existing `:thinking` settings. https://github.com/brainlid/langchain/pull/541
+
+### Fixed
+
+- **`ChatOpenAIResponses` streaming parser handled split SSE event boundaries**: `decode_stream/2` previously split the buffer on `"event: "`, which silently assumed each event and its `data:` line arrived in the same TCP chunk. After a change in OpenAI's chunking behavior that assumption broke: typically only the first delta arrived, the buffer poisoned itself with an "invalid JSON" fragment, no further callbacks fired, and the chain hung. The parser now splits on the actual SSE event boundary (`\n\n`) and extracts the `data:` line from each complete event block, correctly handling split events, multiple events per chunk, and incomplete JSON across chunks. https://github.com/brainlid/langchain/pull/540
+- **`ToolCall.merge/2` no longer crashes on trailing binary fragments after a complete tool call**: During streaming, some providers emit overlapping or trailing argument deltas after a tool call has already been marked `:complete` with a decoded map. The previous code path tried to concatenate a binary JSON fragment onto a map via `<>` and raised `ArgumentError`. A new guard detects the map-plus-binary case and returns the primary unchanged, safely discarding the unmergeable fragment. https://github.com/brainlid/langchain/pull/543
+- **`LLMChain.do_run/1` handles unexpected response shapes instead of crashing**: Added catch-all clauses for two shapes seen in production: `{:ok, [[error: %LangChainError{}] | _]}` (for example, an Anthropic `overloaded_error` surfacing through the streaming path inside an `:ok` tuple) and `{:error, reason}` where `reason` is neither a string nor a `LangChainError`. Both are now converted into structured `{:error, chain, reason}` tuples with appropriate type and message. https://github.com/brainlid/langchain/pull/542
+- **`ToolResult` always carries the tool name, including on error paths**: Several internal construction sites built a `ToolResult` without populating `:name`, which Gemini rejected with `GenerateContentRequest.contents[*].parts[0].function_response.name: Name cannot be empty`. The name is now propagated through the error branches as well, so Gemini-routed conversations no longer fail with `INVALID_ARGUMENT` after a tool error. https://github.com/brainlid/langchain/pull/539
+
+## v0.8.6
+
+A reliability and tooling release: `ChatOllamaAI` gains native thinking/reasoning support, Dialyzer is wired into the project and CI, and two crash-resistance fixes harden `DataExtractionChain` and the step-mode interrupt path.
+
+### Added
+
+- **`ChatOllamaAI` thinking support via `:think`**: New boolean field enables Ollama's native reasoning output for models like `gpt-oss`, `deepseek-r1`, `qwen3`, and `gemma3`. Surfaced as a `:thinking` `ContentPart` matching the Anthropic / Google convention. https://github.com/brainlid/langchain/pull/532
+- **Dialyzer added to the project and CI**: `dialyxir` dependency, PLT caching, GitHub PR annotations, and a sweep of pre-existing type-spec issues across the codebase. https://github.com/brainlid/langchain/pull/535
+- **`LLMChain.run/2` typespec includes `{:interrupt, t(), term()}`**: The interrupt return variant is now declared, fixing a Dialyzer false positive for callers pattern-matching on `:interrupt`. https://github.com/brainlid/langchain/pull/536
+
+### Fixed
+
+- **`DataExtractionChain` normalises single-object `info` tool payloads**: A lone map returned for a single-row extraction is now wrapped in a list instead of failing the `run/4` pattern match. https://github.com/brainlid/langchain/pull/533
+- **`Steps.extract_interrupt_data/1` tolerates `nil` interrupt data**: A tool result with `interrupt_data: nil` no longer crashes step-mode with `BadMapError`. https://github.com/brainlid/langchain/pull/534
+
+## v0.8.5
+
+A small reliability and observability release. Streaming runs now recover from delta-conversion errors instead of failing the chain outright, and a new tool callback fires inside the per-tool process so per-process context (tenancy, OTel, Sentry) can be re-applied across the async Task boundary.
+
+### Added
+
+- **`:on_tool_pre_execution` chain callback**: New callback that fires inside the process that will actually run the tool, immediately before the tool function is invoked. For `async: true` tools it fires inside the spawned `Task.async/1`; for `async: false` tools and tools run through `execute_tool_calls_with_decisions/3` it fires in the chain's own process. Use this hook (instead of `:on_tool_execution_started`, which always fires in the parent chain process) when you need to re-apply per-process state — tenant context, OpenTelemetry spans, Sentry scope, etc. — that does not propagate across the async boundary on its own. https://github.com/brainlid/langchain/pull/530
+
+### Fixed
+
+- **Streaming delta-conversion errors are now retried like transport errors**: When `delta_to_message_when_complete/1` returned `{:error, chain, reason}` (for example, `"delta_conversion_failed"` from invalid streamed JSON), `LLMChain` previously surfaced the error immediately and abandoned the run. The chain now routes that failure through the same path as other LLM errors: it fires `:on_llm_error`, increments `current_failure_count`, and recurses into `do_run/1` if retries remain. On final exhaustion the original reason is preserved (rather than being rewritten to `"exceeded_failure_count"`), so downstream apps that pattern-match on the reason to render user-facing copy continue to work. https://github.com/brainlid/langchain/pull/528
+
+## v0.8.4
+
+A security-focused release. Fixes an API-key leak in `ChatGrok` verbose logging, hardens an atom-table exposure in `ChatReqLLM`, documents `PromptTemplate`'s EEx trust boundary, and wires `mix sobelow` into `mix precommit`.
+
+### Added
+
+- **`PromptTemplate` EEx security documentation**: Added a security admonition to `PromptTemplate` and the raw-text constructors warning that `text` is evaluated as EEx. Developer-controlled templates are safe; user- or LLM-controlled strings are not. https://github.com/brainlid/langchain/pull/526
+- **`mix sobelow` in `mix precommit`**: Sobelow runs between `format` and `test` with a committed `.sobelow-conf`. Reviewed call sites carry inline `# sobelow_skip` annotations. https://github.com/brainlid/langchain/pull/526
+
+### Changed
+
+- **`ChatReqLLM.merge_provider_opts/2` uses `String.to_existing_atom/1`**: Unknown provider-opt keys now raise `ArgumentError` instead of growing the atom table. https://github.com/brainlid/langchain/pull/526
+
+### Fixed
+
+- **`ChatGrok` verbose logging leaked the API key**: An unconditional `IO.inspect/1` ran before the redaction branch, so `verbose_api: true` printed the raw `Bearer` token to stdout. Rotate any Grok keys that may have been captured in logs. https://github.com/brainlid/langchain/pull/526
+
+## v0.8.3
+
+### Added
+
+- **`ChatOllamaAI`: native `:format` (structured outputs) and image support**: Two gaps in the Ollama chat model are now closed.
+  - `:format` accepts either `"json"` (plain JSON mode) or a JSON Schema map, and is forwarded as the request's top-level `format` field. Schema-enforced generation is handled server-side by Ollama, mirroring what `/api/generate` has always supported.
+  - User messages containing `:image` `ContentPart`s now have their base64 payloads split out of the message content and re-attached as Ollama's native top-level `images` array on the message. Multiple image parts are preserved in order. `:image_url` parts raise a clear error because Ollama has no server-side URL fetcher — callers must fetch bytes themselves and pass them as `:image` parts.
+  - Prior behavior dropped image parts silently via `ContentPart.parts_to_string/1` and had no way to request structured output, forcing users to route through `ChatOpenAI` against Ollama's `/v1/chat/completions` endpoint — which doesn't reliably enforce schemas. https://github.com/brainlid/langchain/pull/520
+
+### Fixed
+
+- **Cross-model message serialization for `:thinking` and `:unsupported` content parts**: When conversation history crosses model providers (e.g. a Claude response with extended thinking is replayed to an OpenAI-compatible endpoint, or vice versa), the receiving model's serializer could encounter `ContentPart` types it doesn't recognize.
+  - `ChatAnthropic.content_parts_for_api/1` now filters out `nil` entries after mapping, preventing Anthropic from rejecting requests with unsigned or unrecognised `:thinking` parts.
+  - `ChatAwsMantle.strip_thinking_parts/1` now also strips `:unsupported` parts (in addition to `:thinking`), so Anthropic `redacted_thinking` blocks don't crash the Mantle serializer when forwarded as conversation history. https://github.com/brainlid/langchain/pull/523
+
+## v0.8.2
+
+This release introduces **experimental** support for AWS Bedrock's Mantle endpoint via a new `ChatAwsMantle` chat model. Mantle is AWS's OpenAI-compatible gateway for third-party Bedrock models, so one new module unlocks a whole family of providers at once: Moonshot's Kimi K2 line, OpenAI's gpt-oss series, and any models AWS adds in the future.
+
+### Added
+
+- **`ChatAwsMantle` chat model (experimental)**: New module for AWS Bedrock's Mantle endpoint. Supports both Bearer auth (Bedrock API key) and AWS SigV4 (IAM credentials via a zero-arity `:credentials` function). Region-aware URL building derives `https://bedrock-mantle.{region}.api.aws/v1/chat/completions` from `:region`. Reasoning extraction surfaces Mantle's `message.reasoning` / `delta.reasoning` field as `:thinking` `ContentPart`s on the assistant message (including streaming), so reasoning-model output renders the same way as Anthropic extended thinking. Streaming (with separate reasoning and content deltas), tool calling, K2.5 multimodal input, and the OpenAI-standard `:reasoning_effort` field all work. Defaults to `receive_timeout: 120_000` and `max_tokens: 4096` to bound Mantle's intermittent slow-starts and Kimi's occasional token-repetition loops. Verified against `moonshotai.kimi-k2-thinking`, `moonshotai.kimi-k2.5`, and `openai.gpt-oss-120b` https://github.com/brainlid/langchain/pull/521
+
+### Changed
+
+- **`MessageDelta` merges batched tool-call fragments**: The tool-call merge path now folds over every fragment in a chunk's `tool_calls` array rather than assuming one fragment per chunk. Most providers emit one fragment per chunk (no behavior change); gpt-oss-120b on AWS Mantle batches multiple argument fragments per SSE event, and this generalization handles either batching style correctly https://github.com/brainlid/langchain/pull/521
+- **`LLMChain` `max_runs` error includes the configured value**: When the chain halts because the `max_runs` ceiling was reached, the returned error now reports the configured limit so callers can log or surface the exact threshold that was hit. Additional test coverage was also added around this mode's termination paths https://github.com/brainlid/langchain/pull/519
+
+### Fixed
+
+- **`ContentPart.parts_to_string/2` tolerates `nil` entries**: When `MessageDelta.merge_content_part_at_index/3` pads `merged_content` with `nil` (common mid-stream when reasoning lands at index 0 and visible content at index 1), the string-serializer now filters those nils instead of raising `BadMapError` on the first mid-stream read https://github.com/brainlid/langchain/pull/521
+
+## v0.8.1
+
+A small follow-up to v0.8.0. The headline change is improved sub-agent cancellation: tools that spawn sub-agents (or any other long-running side-effect) now receive the originating `tool_call_id` in their execution context, making it possible to correlate the spawned work back to the tool call and update its status when the user cancels.
+
+### Added
+
+- **`tool_call_id` available in tool execution context**: When `LLMChain` executes a tool, the call's `tool_call_id` is now injected into the tool's `context` map under the `:tool_call_id` key. Tools that spawn sub-agents or other asynchronous side-effects can use this to correlate the spawned work back to the originating tool call, enabling a cleaner cancellation UX where a cancelled sub-agent can mark its tool call as cancelled instead of leaving it dangling https://github.com/brainlid/langchain/pull/514
+
+### Changed
+
+- **Relaxed `req_llm` dependency constraint**: The optional `req_llm` dependency now uses `>= 1.6.0` instead of `~> 1.6`, allowing host applications to pull in newer major versions of `req_llm` (such as 2.x) without waiting on a LangChain release. Because `req_llm` is `optional: true`, applications that use `ChatReqLLM` should pin the version they want in their own `mix.exs` https://github.com/brainlid/langchain/pull/513
+- **Hardened GitHub Actions CI configuration**: Applied [zizmor](https://github.com/woodruffw/zizmor) security recommendations to the Elixir workflow and added a `dependabot.yml` for automated workflow updates. No effect on library users; relevant for contributors running CI https://github.com/brainlid/langchain/pull/515
+
+## v0.8.0
+
+**Breaking changes** in this release. Delta-related functions in `LLMChain` now return `{:ok, chain}` / `{:error, chain, reason}` tuples instead of bare chain structs. See upgrade guide below.
+
+This release greatly improves the stability of the library. There were long-standing issues where errors were difficult to detect or handle, and this release is focused on improving error detection, insight, and the general stability of longer running multi-turn agents.
+
+In particular, a validation was introduced some time back when trying to deal with older Mistral models that was causing problems for modern LLMs. It is valid for an LLM to return an empty `MessageDelta` (no content and no tool calls) when closing out an exchange where it has nothing else to say. This commonly happened when the final action was a tool call and result with nothing left to add. The overly strict validation was rejecting these as errors, causing difficult to diagnose, intermittent failures.
+
+That long-standing issue has finally been resolved! If you've had stability issues with the library in the past when building agents or working with multi-turn LLM conversations, this release is worth evaluating. With the empty delta issue resolved, improved error detection and handling within the streaming pipeline, and the new error-focused callbacks (`on_error` and `on_llm_error`), it's a great time to try it out.
+
+### Upgrading from v0.7.0 - v0.8.0
+
+#### Breaking: Delta functions return `:ok`/`:error` tuples
+
+The following `LLMChain` functions now return `{:ok, chain}` or `{:error, chain, reason}` instead of a bare `%LLMChain{}` struct:
+
+- `apply_deltas/2`
+- `merge_deltas/2` (returns `%LLMChain{}` on success, `{:error, chain, reason}` on failure)
+- `delta_to_message_when_complete/1`
+
+If you call these functions directly, update your pattern matches:
+
+```elixir
+# Before (v0.7.0)
+chain = LLMChain.apply_deltas(chain, deltas)
+chain = LLMChain.delta_to_message_when_complete(chain)
+
+# After (v0.8.0)
+{:ok, chain} = LLMChain.apply_deltas(chain, deltas)
+{:ok, chain} = LLMChain.delta_to_message_when_complete(chain)
+```
+
+These changes allow errors during streaming delta processing (e.g., failed delta-to-message conversion) to propagate as structured errors rather than being silently swallowed.
+
+### Added
+
+- **`on_error` and `on_llm_error` callbacks**: Two new chain callbacks for error observability. `on_llm_error` fires on every individual LLM call failure (including transient ones that may be retried or recovered via fallbacks). `on_error` fires exactly once when the chain has exhausted all recovery options and is returning a terminal error to the caller https://github.com/brainlid/langchain/pull/511
+- **Top-level `cache_control` for `ChatAnthropic`**: New `cache_control` field on the `ChatAnthropic` struct enables Anthropic's automatic caching feature, which applies cache breakpoints to the last cacheable block in each request. This is the simplest way to enable prompt caching for multi-turn conversations without manual breakpoint management. Existing `cache_messages` option is clarified as legacy client-side behavior https://github.com/brainlid/langchain/pull/509
+
+### Changed
+
+- **Delta functions return `:ok`/`:error` tuples** (breaking): `apply_deltas/2`, `delta_to_message_when_complete/1`, and `merge_deltas/2` now return structured result tuples, enabling proper error propagation through the streaming pipeline. Failed delta-to-message conversions now return `{:error, chain, %LangChainError{type: "delta_conversion_failed"}}` instead of silently resetting streaming state https://github.com/brainlid/langchain/pull/511
+- **Removed `validate_not_empty` from `MessageDelta.to_message/1`**: Empty assistant deltas (no content, no tool calls) are no longer rejected during delta-to-message conversion. This validation was overly strict and could mask legitimate responses https://github.com/brainlid/langchain/pull/511
+
+### Fixed
+
+- **Compiler warnings with optional `mint_web_socket` dependency**: Fixed warnings in `ChatOpenAIResponses` and `WebSocket` modules when the optional `mint_web_socket` library is not included as a dependency https://github.com/brainlid/langchain/pull/510
+
+## v0.7.0
+
+### Changed
+
+- **Req-level HTTP retry disabled by default**: All chat model and image generator modules now set `retry: false` on Req HTTP requests. Previously, Req's `retry: :transient` (up to 3 retries) compounded with LangChain's own connection retry, potentially causing up to 12 HTTP requests per call. Server errors (503/429) now bubble up immediately to the caller, which is the correct behavior for applications using job queues like Oban with proper backoff strategies. The `req_config` option can still be used to re-enable Req retry if needed https://github.com/brainlid/langchain/pull/504
+
+### Added
+
+- **Configurable `retry_count` on chat models**: All chat model and image generator structs now expose a `retry_count` field (default: `2`) controlling how many times LangChain retries on connection errors. Set `retry_count: 0` to disable retries entirely and let your application's job queue handle retry strategy. Default behavior is unchanged (1 initial attempt + 2 retries = 3 total requests) https://github.com/brainlid/langchain/pull/505
+- **WebSocket transport for `ChatOpenAIResponses`**: New optional WebSocket transport allows requests over a persistent connection instead of HTTP. Includes a generic `LangChain.WebSocket` client GenServer built on `mint_web_socket`. Use `connect_websocket!/1` and `disconnect_websocket!/1` to manage the lifecycle. Best suited for short-lived, synchronous sessions -- not for long-lived agents or HITL workflows https://github.com/brainlid/langchain/pull/497
+- **Streaming tool calls for `ChatOllamaAI`**: Tool calls in streaming responses are now correctly handled instead of being silently dropped. Supports both complete and incomplete tool call responses https://github.com/brainlid/langchain/pull/498
+- **Regression tests for DeepSeek streaming token usage**: Added test coverage for the DeepSeek streaming format where usage data arrives bundled in the final chunk alongside non-empty choices, verifying existing code handles both DeepSeek and OpenAI formats correctly https://github.com/brainlid/langchain/pull/499
+
+### Fixed
+
+- **`{:interrupt, ...}` and `{:pause, ...}` with fallback LLMs**: These valid execution results from HITL middleware now pass through `try_chain_with_llm/4` correctly instead of causing a `CaseClauseError` or being incorrectly retried on fallback models. Fallback models and HITL interrupts are no longer mutually exclusive https://github.com/brainlid/langchain/pull/502
+- **Streaming `overloaded_error` from Anthropic API**: When Anthropic sends an `overloaded_error` as an SSE event during streaming on a 200 connection, it is now extracted and returned as a proper `{:error, %LangChainError{}}` instead of causing a crash. The `"overloaded_error"` type is also now recognized by `retry_on_fallback?/1` for fallback model retry https://github.com/brainlid/langchain/pull/500
+
+## v0.6.3
+
+### Added
+
+- **ChatOpenAI Logprobs**: Added `logprobs` and `top_logprobs` parameters to `ChatOpenAI`, allowing users to request log probability information from the OpenAI API. When present, logprobs data is surfaced in message/delta metadata under the `"logprobs"` key. Supports both streaming and non-streaming modes https://github.com/brainlid/langchain/pull/494
+- **LangChain.Trajectory**: New `LangChain.Trajectory` module for easier evaluation of agents, providing a structured way to assess agent execution paths https://github.com/brainlid/langchain/pull/481
+- **ChatVertexAI Multimodal Tool Results**: Tool results in `ChatVertexAI` now support multimodal content including images, files (base64-encoded PDFs, etc.), JSON responses, and display names https://github.com/brainlid/langchain/pull/491
+
+### Changed
+
+- **Reduced Logger.error usage**: Replaced excessive `Logger.error` calls across the library with a more nuanced approach — errors already captured in return values no longer log redundantly, and catch-all/rescue clauses now use `Logger.warning` with lazy evaluation. This gives library consumers control over their logging levels https://github.com/brainlid/langchain/pull/492
+
+### Fixed
+
+- **Mistral responses without tool_calls**: Fixed crash when Mistral (or Azure-hosted Mistral) returns a complete message without a `"tool_calls"` key. The response previously fell through to the catch-all error handler https://github.com/brainlid/langchain/pull/495
+- **Tool schema compatibility**: Added `additionalProperties: false` to tool parameter schemas for Anthropic API compatibility, which strictly requires this field on all object-type schemas https://github.com/brainlid/langchain/pull/490
+- **Azure streaming keepalive**: Fixed crash caused by Azure OpenAI keepalive SSE events during long-running streaming responses, which were not matched by any `do_process_response/2` clause https://github.com/brainlid/langchain/pull/485
+- **Empty/unexpected LLM streaming responses**: Added catch-all clauses in `do_run/1` for `{:ok, []}` and other unrecognized response formats (e.g., from thinking/reasoning models like Qwen3 and DeepSeek-R1 that emit `<think>` tokens), returning typed `LangChainError` instead of crashing with `CaseClauseError` https://github.com/brainlid/langchain/pull/484
+- **Malformed tool call JSON loop**: Added regression tests verifying that truncated/malformed JSON in `tool_call.arguments` during streaming is properly cleared, preventing infinite loops https://github.com/brainlid/langchain/pull/493
+
+## v0.6.2
+
+### Upgrading from v0.6.1 - v0.6.2
+
+#### Developer Environment: `.envrc` → `.env`
+
+The library now uses [dotenvy](https://hex.pm/packages/dotenvy) to automatically load API keys from a `.env` file when running `mix test` or starting `iex -S mix`. This replaces the previous `direnv`/`.envrc` workflow.
+
+**Who is affected**: Developers running live tests locally.
+
+**How to migrate**:
+
+```bash
+# From the my_langchain/ directory:
+cp .envrc .env
+```
+
+That's it. The `.env` file is gitignored and will be loaded automatically — no shell tool or `source .envrc` step required. AI coding assistants running `mix test` will also pick up the keys without any additional configuration.
+
+The untracked `.envrc` file remains for anyone who prefers to continue using `direnv`. The new `.env.example` is the canonical starting point:
+
+```bash
+cp .env.example .env
+# Populate .env with your API keys
+```
+
+### Added
+
+- **ChatReqLLM**: New experimental `LangChain.ChatModels.ChatReqLLM` adapter that delegates HTTP, authentication, and provider encoding to the [`req_llm`](https://hex.pm/packages/req_llm) library. A single `"provider:model_id"` string (e.g. `"anthropic:claude-haiku-4-5"`, `"openai:gpt-4o"`, `"ollama:llama3"`) unlocks 20+ providers without requiring per-provider adapter code. Supports streaming, tool use, multi-modal content, token usage, `serialize_config/1`, and `restore_from_map/1` https://github.com/brainlid/langchain/pull/486
+- **dotenvy dependency**: Added `dotenvy ~> 1.1` for automatic `.env` file loading in dev/test. The test suite now calls `Dotenvy.source!/1` before reading API keys, so no shell setup is needed to run live tests
+- **`.env.example`**: New template file (dotenv format, no `export` prefix) for setting up local API keys
+
+## v0.6.1
+
+### Added
+
+- **ModelsLabImage Provider**: New `LangChain.Images.ModelsLabImage` module for text-to-image generation via the ModelsLab REST API, supporting Flux, SDXL, and community models https://github.com/brainlid/langchain/pull/468
+- **ChatAnthropic Structured Output**: Native structured output support via `json_response` and `json_schema` fields, using Anthropic's `output_config.format` API https://github.com/brainlid/langchain/pull/474
+- **ChatAnthropic file_id Support**: `ContentPart` `:file` and `:image` types can now reference files uploaded via Anthropic's Files API using `type: :file_id` option https://github.com/brainlid/langchain/pull/475
+- **Gemini Inline Data for PDF/CSV**: Added `inline_data` support for PDF and CSV content parts in `ChatGoogleAI` and `ChatVertexAI` https://github.com/brainlid/langchain/pull/478
+- **ChatOpenAIResponses Verbosity**: Added `verbosity` parameter to control response length via the OpenAI Responses API `text` configuration https://github.com/brainlid/langchain/pull/470
+- **Tool Result Interrupt/Resume**: `ToolResult` gains `is_interrupt` and `interrupt_data` fields, allowing tools to return `{:interrupt, message, data}` to pause execution for external input (e.g., Human-in-the-Loop approval). Includes `Message.replace_tool_result/3` and `LLMChain.replace_tool_result/3` for resuming with completed results, and a new `on_tool_interrupted` callback https://github.com/brainlid/langchain/pull/479
+
+### Changed
+
+- **Streaming Error Handling**: `LLMChain.merge_delta/2` now gracefully handles any `LangChainError` received during streaming (content moderation, etc.) instead of only `"overloaded"` errors. Cancelled messages store the error in `metadata[:streaming_error]` for higher layers to detect. `MessageDelta.merge_delta/2` absorbs `{:error, _}` tuples mid-stream without crashing https://github.com/brainlid/langchain/pull/480
+
+### Fixed
+
+- **ChatOpenAIResponses**: Fixed verbosity parameter to be passed inside the `text` parameter as required by the API, and improved error handling for malformed API responses https://github.com/brainlid/langchain/pull/476
+- **Message Processors**: Fixed `FunctionClauseError` in `run_message_processors` when assistant messages have nil content (e.g., Groq tool-call-only responses) by using `content_to_string` which handles nil, string, and list content types https://github.com/brainlid/langchain/pull/473
+
+## v0.6.0
 
 ### Breaking Changes
-- **ChatOllamaAI**: Fixed `stop` field type from `:string` to `{:array, :string}` to match Ollama API requirements. Previously, stop sequences were non-functional due to API type mismatch. Now accepts arrays like `["\\n", "Human:", "<|eot_id|>"]`. Empty arrays are excluded from API requests to preserve modelfile defaults.
+
+- **DeepResearch `ResearchResult.Source` removed**: The inline `Source` embedded schema in `ResearchResult` has been replaced with the unified `Citation`/`CitationSource` structs. See migration steps below.
+- **Perplexity response format**: Response content is now returned as a list of `ContentPart` structs (consistent with other providers) rather than a plain string.
+- **Google AI `groundingMetadata` restructured**: Raw grounding metadata has moved from top-level keys in `message.metadata` to `message.metadata["grounding_metadata"]`.
+
+### Upgrading from v0.5.2 - v0.6.0
+
+**ContentPart `citations` field (all providers)**: `ContentPart` structs returned from any provider may now have a non-empty `citations` field (list of `Citation` structs). Code that pattern-matches on the exact `ContentPart` struct shape should be unaffected since `citations` defaults to `[]`.
+
+**Anthropic round-trip**: Code that sends assistant messages back to the Anthropic API will automatically include citations in the round-trip. No action required.
+
+**Google AI `groundingMetadata`**: Code reading `message.metadata["groundingChunks"]` should update to `message.metadata["grounding_metadata"]["groundingChunks"]`. The structured citations on `ContentPart` are now the canonical representation.
+
+**OpenAI Responses API**: `ContentPart` structs may now include citation data from annotations that were previously discarded. This is purely additive.
+
+**Perplexity**: Code that expects `message.content` to be a string should update to handle `[%ContentPart{}]`.
+
+**DeepResearch `ResearchResult.Source`**: Code referencing `ResearchResult.Source` must update to use `Citation` and `CitationSource`:
+  - `%ResearchResult.Source{title: t, url: u}` → `%Citation{source: %CitationSource{title: t, url: u}}`
+  - `source.title` → `citation.source.title`
+  - `source.url` → `citation.source.url`
+  - `source.snippet` → `citation.cited_text`
+  - `source.start_index` → `citation.start_index`
+  - `ResearchResult.source_urls/1` now filters out `nil` URLs (previously returned all, including nil)
+
+### Added
+
+- **Citation Support**: Unified citation abstraction shared across all providers https://github.com/brainlid/langchain/pull/461
+  - New `LangChain.Message.Citation` struct with `cited_text`, `source`, `start_index`, `end_index`, `confidence`, and `metadata` fields
+  - New `LangChain.Message.CitationSource` struct with `type` (`:web`, `:document`, `:place`), `title`, `url`, `document_id`, and `metadata` fields
+  - `ContentPart` gains a `citations` field (virtual, defaults to `[]`) with merging support during streaming delta accumulation
+  - Helper functions: `ContentPart.citations/1`, `ContentPart.has_citations?/1`, `Message.all_citations/1`
+  - **Anthropic**: Non-streaming and streaming citation parsing, API round-trip serialization, all three citation types (`char_location`, `page_location`, `content_block_location`)
+  - **OpenAI Responses API**: Annotation parsing for `url_citation` and `file_citation` types (not yet verified against live API)
+  - **Google AI (Gemini)**: Grounding metadata decomposed into `Citation` structs by `partIndex` with confidence scores
+  - **Perplexity**: `citations` URLs and `search_results` parsed into `Citation` structs with `[N]` inline reference matching
+  - **DeepResearch**: Migrated `ResearchResult` to use `Citation`/`CitationSource`; added `Citation.changeset/2` for Ecto `cast_embed/3`
+- **Customizable Run Modes**: Extracted LLMChain execution modes into discrete, composable modules with a `Mode` behaviour https://github.com/brainlid/langchain/pull/469
+  - Built-in modes: `WhileNeedsResponse`, `UntilSuccess`, `Step`, `UntilToolUsed`
+  - Pipe-friendly API for composing custom modes
+  - Backward compatible with existing `LLMChain.run/2` usage
+- **Streaming Reasoning Callbacks**: Added `on_llm_reasoning_delta` callback for reasoning summary streaming from Azure OpenAI Responses API https://github.com/brainlid/langchain/pull/456
+- **ChatVertexAI**: Added `req_config` option for custom Req configuration https://github.com/brainlid/langchain/pull/457
+
+### Changed
+
+- **Error Handling**: Consistently include `original` error info in "Unexpected response" errors across all providers https://github.com/brainlid/langchain/pull/392
+
+### Fixed
+
+- **ChatAnthropic**: Auth error (HTTP 401) for invalid API keys is now handled gracefully https://github.com/brainlid/langchain/pull/464
+- **ChatAnthropic**: Fixed error handling regression introduced by PR #392, added additional catch for `{:error, thing}` shape and tracking of `original` error info on `LangChainError` https://github.com/brainlid/langchain/pull/462
+- **LLMChain**: Fixed exception handling in `run_message_processors` — exceptions now correctly return 3-tuple expected by `process_message` https://github.com/brainlid/langchain/pull/460
+
+## v0.5.2
+
+### Changed
+
+- **Tool Detection Improvements**: Simplified tool execution flow and enhanced UI feedback https://github.com/brainlid/langchain/pull/458
+  - Removed special detection of malformed tool calls (partial rollback of https://github.com/brainlid/langchain/pull/449). The previous approach created a more complicated multi-path flow and could add internally defined user messages that appeared unexpectedly to users
+  - Added `display_text` as a first-class attribute on `ToolCall` for better UI feedback and display control
+  - Fixed early tool use detection and notification timing
+
+### Fixed
+
+- **ChatVertexAI**: Fixed tool calls for ChatVertexAI and added support for Gemini 3 models https://github.com/brainlid/langchain/pull/452
+  - Added `thought_signature` support for Gemini 3 function calls
+  - Removed unsupported "strict" field from function declarations for Vertex AI compatibility
+  - Added Jason encoder derivation for `ContentPart` to ensure proper JSON serialization
+  - Implemented `thoughtSignature` handling for Vertex AI tool calls
+
+---
+
+## v0.5.1
+
+### Enhancements
+
+**Enhanced Tool Execution Callbacks**: Added four new callbacks that provide granular visibility into the complete tool execution lifecycle:
+
+1. **`:on_tool_call_identified`** - Fires as soon as a tool name is detected during streaming (before arguments are fully received). May not have `call_id` yet. Enables early UI feedback like "Searching web..." while the LLM is still streaming.
+
+2. **`:on_tool_execution_started`** - Fires immediately before tool execution begins. Always has `call_id`. Allows tracking when actual execution starts.
+
+3. **`:on_tool_execution_completed`** - Fires after successful tool execution with the result. Useful for logging, metrics, and updating UI state.
+
+4. **`:on_tool_execution_failed`** - Fires when a tool call fails, is invalid, or is rejected during human-in-the-loop approval. Includes error details.
+
+**Key distinction**: The early `:on_tool_call_identified` callback fires during streaming as soon as the tool name appears, while `:on_tool_execution_started` fires later when execution actually begins. This two-phase notification enables responsive UIs that can show immediate feedback.
+
+**Example usage**:
+
+```elixir
+callbacks = %{
+  on_tool_call_identified: fn _chain, tool_call, func ->
+    # Show early UI feedback during streaming (tool args may be incomplete)
+    IO.puts("Tool identified: #{func.display_text || tool_call.name}")
+  end,
+  on_tool_execution_started: fn _chain, tool_call, func ->
+    # Update UI when execution actually begins (tool args complete)
+    IO.puts("Executing: #{func.display_text || tool_call.name}")
+  end,
+  on_tool_execution_completed: fn _chain, tool_call, func, result ->
+    # Handle successful execution
+    IO.puts("Completed: #{tool_call.name}")
+  end,
+  on_tool_execution_failed: fn _chain, tool_call, func, error ->
+    # Handle failures
+    IO.puts("Failed: #{tool_call.name} - #{error}")
+  end
+}
+
+chain = LLMChain.new!(%{
+  llm: model,
+  tools: [my_tool],
+  callbacks: [callbacks]
+})
+```
+
+**Additional improvements**:
+- `MessageDelta` now tracks tool display information in metadata for better UI rendering
+- Callbacks fire correctly across all execution paths (normal, async, HITL workflows)
+- Internal tracking prevents duplicate identification notifications for the same tool call
+
+**Non-breaking change**: Existing applications continue to work without modifications. All new callbacks are optional.
+
+---
+
+## v0.5.0
+
+### Breaking Changes
+
+**Elixir 1.17+ Required**: This release requires Elixir 1.17 or higher. The library uses the `get_in` macro which is only available in Elixir 1.17 onwards. Using Elixir 1.16 will throw a compile error. https://github.com/brainlid/langchain/pull/427
+
+**Async Tool Timeout Default Changed**: The default timeout for async tools (tools with `async: true`) has changed from 2 minutes (`120_000` ms) to `:infinity` (no timeout).
+
+### Upgrading from v0.4.1 - v0.5.0
+
+#### Elixir Version Requirement
+
+**What changed**: Minimum Elixir version is now 1.17.
+
+**Who is affected**: Users running Elixir 1.16 or earlier.
+
+**How to migrate**: Upgrade to Elixir 1.17 or later.
+
+#### Async Tool Timeout Default Change
+
+**What changed**: The default timeout for async tools (tools with `async: true`) has changed from 2 minutes (`120_000` ms) to `:infinity` (no timeout).
+
+**Why**: The previous 2-minute default was problematic for human-interactive agents because:
+- Web research tools often take 3-5+ minutes
+- Sub-agent workflows can run indefinitely
+- Deep analysis tools may need extended processing time
+- Users observing the agent can manually stop it if needed
+
+**Who is affected**: If your application relied on the implicit 2-minute timeout to catch runaway tools, you will need to explicitly set a timeout.
+
+**How to migrate**:
+
+1. **If you were happy with the 2-minute timeout**, add this to your `config/runtime.exs`:
+
+       config :langchain, async_tool_timeout: 2 * 60 * 1000  # 2 minutes (previous default)
+
+2. **If you set an explicit `async_tool_timeout`**, no changes needed - your explicit value is still respected.
+
+3. **If the new `:infinity` default works for you** (human-interactive agents), no changes needed.
+
+**Configuration precedence** (highest to lowest):
+1. `LLMChain.async_tool_timeout` - explicit value on chain
+2. `Agent.async_tool_timeout` - passed through to chain when building
+3. `Application.get_env(:langchain, :async_tool_timeout)` - runtime config
+4. Library default - `:infinity`
+
+**Example configurations**:
+
+    # Application-level (config/runtime.exs)
+    config :langchain, async_tool_timeout: 5 * 60 * 1000  # 5 minutes
+
+    # Agent-level
+    {:ok, agent} = Agent.new(%{
+      model: model,
+      async_tool_timeout: 10 * 60 * 1000  # 10 minutes
+    })
+
+    # Chain-level
+    {:ok, chain} = LLMChain.new(%{
+      llm: model,
+      async_tool_timeout: 35 * 60 * 1000  # 35 minutes for Deep Research
+    })
+
+### Added
+- **Agent Framework Foundation**: Base work for new agent library with middleware-based architecture, including agent orchestration, state management, virtual filesystem, human-in-the-loop (HITL) workflows, sub-agents, summarization, and presence tracking https://github.com/brainlid/langchain/pull/442
+- **ChatOpenAIResponses**: Added `req_config` option for custom Req configuration https://github.com/brainlid/langchain/pull/415
+- **ChatOpenAIResponses**: Added reasoning/thinking events support https://github.com/brainlid/langchain/pull/421
+- **ChatOpenAIResponses**: Added new reasoning effort values https://github.com/brainlid/langchain/pull/419
+- **ChatOpenAIResponses**: Added stateful context support for Response API https://github.com/brainlid/langchain/pull/425
+- **ChatVertexAI**: Added JSON schema support https://github.com/brainlid/langchain/pull/424
+- **ChatVertexAI**: Added thinking configuration support https://github.com/brainlid/langchain/pull/423
+- **ChatGoogleAI**: Added `thought_signature` support for Gemini 3 function calls https://github.com/brainlid/langchain/pull/431
+- **ChatMistralAI**: Added support for parallel tool calls https://github.com/brainlid/langchain/pull/433
+- **ChatMistralAI**: Added thinking content parts support https://github.com/brainlid/langchain/pull/418
+- **ChatPerplexity and ChatMistralAI**: Added `verbose_api` field https://github.com/brainlid/langchain/pull/416
+- **LLMChain**: Changed default `async_tool_timeout` from 2 minutes to `:infinity` https://github.com/brainlid/langchain/pull/442
+
+### Changed
+- **Dependencies**: Updated Elixir requirement to `~> 1.17` https://github.com/brainlid/langchain/pull/427
+- **ChatOpenAIResponses**: Don't include `top_p` parameter for gpt-5.2+ models https://github.com/brainlid/langchain/pull/428
+
+### Fixed
+- **ChatDeepSeek**: Fixed UI bug in deepseek-chat model introduced by reasoning_content support https://github.com/brainlid/langchain/pull/429
+- **Core**: Fixed missing error handling and fallback mechanism on server outages https://github.com/brainlid/langchain/pull/435
+- **ChatOpenAIResponses**: Fixed image `file_id` content type handling https://github.com/brainlid/langchain/pull/438
+
+---
+
+## v0.4.1
+
+### Added
+- **ChatDeepSeek**: Added DeepSeek chat model integration with reasoning_content support (#394, #407)
+- **ChatOpenAI**: Added strict tool use support (#301)
+- **ChatOpenAI**: Added support for file_url with link to file (#395)
+- **ChatAnthropic**: Added strict tool use support (#409)
+- **ChatAnthropic**: Added support for file_url (#404)
+- **ChatAnthropic**: Added PDF reading support via Anthropic API (#403)
+- **ChatAnthropic**: Added `cache_messages` option to improve cache utilization (#398)
+- **ChatAnthropic**: Added `req_opts` option for custom Req configuration (#408)
+- **MessageDelta**: Added `MessageDelta.merge_deltas/2` function for merging multiple deltas (#401)
+- **ChatAnthropic**: Added `disable_parallel_tool_use` tool_choice pass-through (#390)
+- **Core**: Added multi-part tool responses support (#410)
+
+### Changed
+- **ChatOpenAI**: Enhanced OpenAI responses API (#391)
+- **Dependencies**: Updated gettext requirement to `~> 1.0` (#393, #399)
+- **Documentation**: Updated README install instructions
+
+### Fixed
+- **Core**: Fixed compiler typing warnings
+
+---
+
+## v0.4.0
+
+### Added
+- **ChatOpenAI**: Added support for json-schema in OpenAI responses API (#387)
+- **Documentation**: Added AGENTS.md and CLAUDE.md file support (#385)
+- **CI**: Added support for OTP 28 (#382)
+
+### Changed
+- **ChatOpenAI**: Enhanced OpenAI responses handling (#381)
+- **Documentation**: Use moduledoc instead of doc for LLMChain documentation (#384)
+- **Utils.ChainResult**: Added clarity to message stopped for length handling
+
+### Fixed
+- **ChatBumblebee**: Suppressed compiler warning messages when used as a dependency (#386)
+- **Core**: Fixed Ecto field formatting
+
+---
+
+## v0.4.0-rc.3
+
+### Added
+- **ChatOrqAI**: Added Orq AI chat model support (#377)
+- **ChatOpenAI**: Added OpenAI Deep Research integration (#336)
+- **ChatOpenAI**: Added `parallel_tool_calls` option (#371)
+- **ChatOpenAI**: Added `req_config` option for custom Req configuration (#376)
+- **ChatOpenAI**: Added verbosity parameter support (#379)
+- **ChatVertexAI**: Added support for native tool calls (#359)
+- **ChatGoogleAI**: Added full thinking configuration support (#375)
+- **Bedrock**: Added optional AWS session token handling in BedrockHelpers (#372)
+- **LLMChain**: Added `should_continue?` function for automatic looping on mode `:step` (#361)
+- **Core**: Added `retry_on_fallback?` to chat model definition and all models (#350)
+
+### Fixed
+- **Images**: Fixed handling of LiteLLM responses with null `b64_json` in OpenAI image generation (#368)
+- **Core**: Fixed handling of missing `finish_reason` in streaming responses for LiteLLM compatibility (#367)
+- **ChatGoogleAI**: Fixed error prevention from thinking content parts (#374)
+- **ChatGoogleAI**: Fixed handling of Gemini's cumulative token usage (#373)
+
+---
+
+## v0.4.0-rc.2
+
+### Added
+- **ChatGrok**: Added xAI Grok chat model support (#338)
+- **ChatGoogleAI**: Added thinking support (#354)
+- **ChatGoogleAI**: Added `req_config` option for custom Req configuration (#357)
+- **ChatOllamaAI**: Added missing `verbose_api` field for streaming compatibility (#341)
+- **ChatVertexAI**: Added usage data to Message response metadata (#335)
+- **Images**: Added support for `gpt-image-1` model in OpenAI image generation (#360)
+- **LLMChain**: Added new run mode `:step` for step-by-step execution (#343)
+- **LLMChain**: Added support for multiple tools in `run_until_tool_used` (#345)
+- **OpenAI**: Added organization ID as a parameter for API requests (#337)
+- New callback `on_llm_response_headers` supports receiving the full Req HTTP response headers for a request (#358)
+
+### Changed
+- **Bedrock**: Added OpenAI-compatible API compatibility (#356)
+- **ChatAnthropic**: Expanded logging for API errors (#349)
+- **ChatAnthropic**: Added transient Req retry support in stream mode (#329)
+- **ChatGoogleAI**: Cleaned up MessageDelta handling (#353)
+- **ChatOpenAI**: Only include "user" field with requests when a value is provided (#364)
+- **Dependencies**: Updated gettext requirement to `~> 0.26` (#332)
+
+### Fixed
+- **ChatGoogleAI**: Handle responses with no content parts (#365)
+- **ChatGoogleAI**: Prevent crash when ToolResult contains string content (#352)
+- **Core**: Fixed issue with poorly matching list in case statements (#334)
+- **Core**: Filter out empty lists in message responses (#333)
+
+### Breaking Changes
+- **ChatOllamaAI**: Fixed `stop` field type from `:string` to `{:array, :string}` to match Ollama API requirements. Previously, stop sequences were non-functional due to API type mismatch. Now accepts arrays like `["\\n", "Human:", "<|eot_id|>"]`. Empty arrays are excluded from API requests to preserve modelfile defaults (#342)
 
 ---
 

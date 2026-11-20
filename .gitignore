@@ -29,7 +29,18 @@ langchain-*.tar
 /tmp/
 
 .envrc
+.env
 
 DEV_NOTES.md
 PERSONAL.md
-/logo/
+my_docs/
+
+# macOS system files
+.DS_Store
+
+# Dialyzer PLT files
+/priv/plts/
+
+# Scratch output from the live Responses phase capture test. The curated
+# fixtures beside it are committed; these are whatever the last run produced.
+/test/fixtures/openai_phase/captures/

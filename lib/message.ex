@@ -16,6 +16,34 @@ defmodule LangChain.Message do
 
   - `:tool` - A message for returning the result of executing a `tool` request.
 
+  ## Status
+
+  `status` records how the message terminated. Every value other than
+  `:complete` means the model did not finish, and each names a distinct cause so
+  a caller can tell them apart without inspecting metadata:
+
+  - `:complete` - the model finished on its own.
+
+  - `:length` - the output token cap was reached. The message holds whatever was
+    produced up to the cap.
+
+  - `:content_filtered` - the provider's content filter stopped the response.
+    Reported by providers that return a `"content_filter"` finish reason.
+
+  - `:stream_error` - the stream died mid-flight (a provider `overloaded`, an
+    invalid request, a filter applied at the transport level). The partial
+    content is preserved. `LangChain.Chains.LLMChain` sets this and puts the
+    `LangChain.LangChainError` in `metadata[:streaming_error]`, so the reason is
+    available as well as the fact.
+
+  - `:cancelled` - a caller stopped the response. Set by
+    `LangChain.Chains.LLMChain.cancel_delta/2`, which preserves the partial
+    content rather than discarding it.
+
+  Only a `:complete` message has its tool call arguments parsed into maps.
+  Anything else may hold a truncated or unparsed `arguments` string, since the
+  model may have been cut off mid-call.
+
   ## Tools
 
   A `tool_call` comes from the `:assistant` role. The `tool_id` identifies which
@@ -90,7 +118,6 @@ defmodule LangChain.Message do
   """
   use Ecto.Schema
   import Ecto.Changeset
-  require Logger
   alias __MODULE__
   alias LangChain.Message.ContentPart
   alias LangChain.Message.ToolCall
@@ -105,7 +132,10 @@ defmodule LangChain.Message do
     field :content, :any, virtual: true
     field :processed_content, :any, virtual: true
     field :index, :integer
-    field :status, Ecto.Enum, values: [:complete, :cancelled, :length], default: :complete
+
+    field :status, Ecto.Enum,
+      values: [:complete, :cancelled, :length, :content_filtered, :stream_error],
+      default: :complete
 
     field :role, Ecto.Enum,
       values: [:system, :user, :assistant, :tool],
@@ -127,7 +157,7 @@ defmodule LangChain.Message do
   end
 
   @type t :: %Message{}
-  @type status :: :complete | :cancelled | :length
+  @type status :: :complete | :cancelled | :length | :content_filtered | :stream_error
 
   @update_fields [
     :role,
@@ -222,15 +252,8 @@ defmodule LangChain.Message do
           end
         else
           # only a user message can have ContentParts (except for ChatAnthropic system messages)
-          Logger.error(
-            "Invalid message content #{inspect(get_field(changeset, :content))} for role #{role}"
-          )
-
           add_error(changeset, :content, "is invalid for role #{role}")
         end
-
-      {:ok, []} ->
-        put_change(changeset, :content, nil)
 
       # any other value is not valid
       {:ok, _value} ->
@@ -511,6 +534,129 @@ defmodule LangChain.Message do
   def is_tool_call?(%Message{}), do: false
 
   @doc """
+  Remove the model's reasoning from a message, or from a list of messages.
+
+  Reasoning parts are the ones `LangChain.Message.ContentPart.reasoning?/1`
+  recognizes. A message with no reasoning comes back unchanged.
+
+  Given a list, a message left with no content once its reasoning is removed is
+  dropped, unless it carries tool calls: the tool results that follow it need
+  the call they answer.
+
+  A provider that signs or encrypts reasoning rejects a replayed block once the
+  system prompt or tool list it was produced under has changed. Stripping it is
+  how a conversation continues under a new prompt or tool list.
+  """
+  @spec strip_reasoning(t()) :: t()
+  @spec strip_reasoning([t()]) :: [t()]
+  def strip_reasoning(messages) when is_list(messages) do
+    Enum.flat_map(messages, fn message ->
+      if has_reasoning?(message) do
+        case strip_reasoning(message) do
+          %Message{content: [], tool_calls: calls} when calls in [nil, []] -> []
+          stripped -> [stripped]
+        end
+      else
+        [message]
+      end
+    end)
+  end
+
+  def strip_reasoning(%Message{content: parts} = message) when is_list(parts) do
+    if has_reasoning?(message),
+      do: %Message{message | content: Enum.reject(parts, &ContentPart.reasoning?/1)},
+      else: message
+  end
+
+  def strip_reasoning(%Message{} = message), do: message
+
+  defp has_reasoning?(%Message{content: parts}) when is_list(parts),
+    do: Enum.any?(parts, &ContentPart.reasoning?/1)
+
+  defp has_reasoning?(%Message{}), do: false
+
+  @doc """
+  Return `true` when an assistant message is narration only: the model spoke
+  without answering, and its turn is not over.
+
+  That is the case when every text part is marked as narration (see
+  `LangChain.Message.ContentPart.narration?/1`) and the message has no tool
+  calls. A message with tool calls is already a turn in progress and answers
+  `false` here, so `is_tool_call?/1` stays the question that decides it. A
+  message holding both narration and an answer part has answered. An unmarked
+  message is an answer.
+  """
+  @spec narration?(t()) :: boolean()
+  def narration?(%Message{role: :assistant, tool_calls: calls})
+      when is_list(calls) and calls != [],
+      do: false
+
+  def narration?(%Message{role: :assistant, content: parts}) when is_list(parts) do
+    text_parts = Enum.filter(parts, &match?(%ContentPart{type: :text}, &1))
+    text_parts != [] and Enum.all?(text_parts, &ContentPart.narration?/1)
+  end
+
+  def narration?(%Message{}), do: false
+
+  @doc """
+  Return whether the provider reported that the model ended its turn with this
+  assistant message: `true`, `false`, or `nil` when the provider did not say.
+
+  A provider that reports it (as `end_turn` on the completed response) is
+  stating the turn boundary outright, which no reading of the message's
+  content can do. Most providers do not report it, and `nil` is the common
+  case. Chat models store the value under `metadata[:end_turn]`, and the chain
+  reads it when the message arrives.
+  """
+  @spec end_turn(t()) :: boolean() | nil
+  def end_turn(%Message{role: :assistant, metadata: %{end_turn: value}}) when is_boolean(value),
+    do: value
+
+  def end_turn(%Message{}), do: nil
+
+  @doc """
+  Return `true` when an assistant message leaves the model's turn open, so the
+  model is called again even though the message has no tool calls.
+
+  The provider's `end_turn/1` report decides when present: `false` keeps the
+  turn open and `true` closes it, whatever the content. Without a report, a
+  message that is narration only (`narration?/1`) keeps the turn open.
+
+  A message with tool calls continues the turn through `is_tool_call?/1`, which
+  callers ask first. This question is about the messages that have none.
+  """
+  @spec continues_turn?(t()) :: boolean()
+  def continues_turn?(%Message{role: :assistant} = message) do
+    case end_turn(message) do
+      nil -> narration?(message)
+      ended? -> not ended?
+    end
+  end
+
+  def continues_turn?(%Message{}), do: false
+
+  @doc """
+  Return the message's answer text: the text parts that are not narration,
+  joined as `LangChain.Message.ContentPart.parts_to_string/2` joins them.
+  Returns `nil` when there is no answer text.
+
+  This is the text to parse when a caller expects structured output, because a
+  narration part in front of the answer would otherwise be decoded with it.
+  For a message with no narration it is the same as
+  `LangChain.Message.ContentPart.content_to_string/1`.
+  """
+  @spec answer_content(t()) :: String.t() | nil
+  def answer_content(%Message{content: content}) when is_binary(content), do: content
+
+  def answer_content(%Message{content: parts}) when is_list(parts) do
+    parts
+    |> Enum.reject(&(is_nil(&1) or ContentPart.narration?(&1)))
+    |> ContentPart.parts_to_string()
+  end
+
+  def answer_content(%Message{}), do: nil
+
+  @doc """
   Return if a Message is tool related. It may be a tool call or a tool result.
   """
   def is_tool_related?(%Message{role: :tool}), do: true
@@ -527,6 +673,44 @@ defmodule LangChain.Message do
   end
 
   def tool_had_errors?(%Message{} = _message), do: false
+
+  @doc """
+  Replace a tool result in a list of messages by `tool_call_id`.
+
+  Finds the `:tool` message containing a `ToolResult` with the given
+  `tool_call_id` and replaces it with `new_result`. Updates `tool_results`
+  on the message.
+
+  Returns the message list unchanged if no matching `tool_call_id` is found.
+
+  ## Examples
+
+      messages = [assistant_msg, tool_msg]
+      new_result = ToolResult.new!(%{tool_call_id: "call-1", content: "done"})
+      updated = Message.replace_tool_result(messages, "call-1", new_result)
+  """
+  @spec replace_tool_result([t()], String.t(), ToolResult.t()) :: [t()]
+  def replace_tool_result(messages, tool_call_id, %ToolResult{} = new_result)
+      when is_list(messages) and is_binary(tool_call_id) do
+    Enum.map(messages, fn message ->
+      case message do
+        %Message{role: :tool, tool_results: results} when is_list(results) ->
+          if Enum.any?(results, &(&1.tool_call_id == tool_call_id)) do
+            updated_results =
+              Enum.map(results, fn tr ->
+                if tr.tool_call_id == tool_call_id, do: new_result, else: tr
+              end)
+
+            %{message | tool_results: updated_results}
+          else
+            message
+          end
+
+        _ ->
+          message
+      end
+    end)
+  end
 
   @doc """
   Determines if a message is considered "empty" and likely indicates a failure.
@@ -562,4 +746,14 @@ defmodule LangChain.Message do
   end
 
   def is_empty?(_message), do: false
+
+  @doc """
+  Returns all citations across all content parts of a message.
+  """
+  @spec all_citations(t()) :: [LangChain.Message.Citation.t()]
+  def all_citations(%Message{content: content}) when is_list(content) do
+    Enum.flat_map(content, &ContentPart.citations/1)
+  end
+
+  def all_citations(%Message{}), do: []
 end

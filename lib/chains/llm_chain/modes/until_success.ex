@@ -1,0 +1,88 @@
+defmodule LangChain.Chains.LLMChain.Modes.UntilSuccess do
+  @moduledoc """
+  Execution mode that loops until a successful result.
+
+  Calls the LLM, executes tool calls, and repeats until:
+  - The last message is an assistant response (success)
+  - The last message is a tool result with no errors (success)
+  - Max retry count is exceeded (error)
+  - Max runs is exceeded (error)
+
+  An assistant message that leaves the model's turn open (see
+  `LangChain.Message.continues_turn?/1`) is not a response, so the LLM is
+  called again. That is a message the provider reported as not ending the
+  turn, or one that is narration only: the model has said what it is about to
+  do without doing it.
+
+  ## Options
+
+  - `:max_runs` - Maximum LLM calls in one run before returning
+    `%LangChainError{type: "exceeded_max_runs"}`. Default: 25. The count starts
+    at 0 on every `LLMChain.run/2`.
+  - `:force_recurse` — When `true`, forces recursion even after a successful
+    result. Default: `false`.
+
+  ## Usage
+
+      LLMChain.run(chain, mode: :until_success)
+  """
+
+  @behaviour LangChain.Chains.LLMChain.Mode
+
+  import LangChain.Chains.LLMChain.Mode.Steps
+
+  alias LangChain.Chains.LLMChain
+  alias LangChain.Message
+
+  @impl true
+  def run(%LLMChain{} = chain, opts) do
+    chain
+    |> reset_run_count()
+    |> do_run(Keyword.put_new(opts, :max_runs, 25))
+  end
+
+  defp do_run(%LLMChain{last_message: %Message{} = last_message} = chain, opts) do
+    force_recurse = Keyword.get(opts, :force_recurse, false)
+
+    stop_or_recurse =
+      cond do
+        force_recurse ->
+          :recurse
+
+        stop = LLMChain.exceeded_retry_limit(chain) ->
+          stop
+
+        last_message.role == :tool && !Message.tool_had_errors?(last_message) ->
+          {:ok, chain}
+
+        last_message.role == :assistant and not Message.continues_turn?(last_message) ->
+          {:ok, chain}
+
+        true ->
+          :recurse
+      end
+
+    case stop_or_recurse do
+      :recurse -> step(chain, opts)
+      other -> other
+    end
+  end
+
+  # Initial call when no messages have been processed yet
+  defp do_run(%LLMChain{} = chain, opts), do: step(chain, opts)
+
+  defp step(chain, opts) do
+    {:continue, chain}
+    |> check_max_runs(opts)
+    |> call_llm()
+    |> case do
+      {:continue, updated_chain} ->
+        updated_chain
+        |> LLMChain.execute_tool_calls()
+        |> do_run(opts)
+
+      terminal ->
+        terminal
+    end
+  end
+end

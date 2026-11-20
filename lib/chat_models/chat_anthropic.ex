@@ -104,36 +104,138 @@ defmodule LangChain.ChatModels.ChatAnthropic do
       alias LangChain.ChatModels.ChatAnthropic
 
       ChatAnthropic.new!(%{
-        model: "anthropic.claude-3-5-sonnet-20241022-v2:0",
+        model: "anthropic.claude-sonnet-4-6",
         bedrock: BedrockConfig.from_application_env!()
       })
 
   ## Thinking
 
-  Models like Claude 3.7 Sonnet introduced a hybrid approach which allows for "thinking" and reasoning.
-  See the [Anthropic thinking documentation](https://docs.anthropic.com/en/docs/build-with-claude/extended-thinking)
-  for up-to-date instructions on the usage.
+  The `:thinking` attribute is a map matching the
+  [Anthropic `thinking` request field](https://docs.anthropic.com/en/api/messages#body-thinking).
+  It is forwarded to the API as given, so the values it accepts depend on the
+  model. See the [Anthropic thinking documentation](https://docs.anthropic.com/en/docs/build-with-claude/extended-thinking)
+  for details.
 
-  For instance, enabling thinking may require the `temperature` to be set to `1` and other settings like `topP` may not be allowed.
+  Adaptive thinking, with depth set through `output_config` effort, works on
+  current models (Sonnet 4.6, Opus 4.6 and later) without per-model changes:
 
-  The model supports a `:thinking` attribute where the data is a map that matches the structure in the
-  [Anthropic documentation](https://docs.anthropic.com/en/api/messages#body-thinking). It is passed along as-is.
-
-  **Example:**
-
-      # Enable thinking and budget 2,000 tokens for the thinking space.
       model = ChatAnthropic.new!(%{
-        model: "claude-3-7-sonnet-latest",
+        model: "claude-sonnet-5-5",
+        thinking: %{type: "adaptive", display: "summarized"},
+        output_config: %{"effort" => "medium"},
+        max_tokens: 16_000
+      })
+
+  Effort levels `low`, `medium`, `high` and `max` are accepted by all models
+  that support effort. `xhigh` is accepted by Sonnet 5 and later only.
+
+  When `:thinking` is unset, Sonnet 5 and later think adaptively anyway.
+  Sonnet 4.6 and earlier and Haiku 4.5 do not think.
+
+  On Sonnet 5.5 the lowest thinking setting is `between_tools`. It takes no
+  other keys, accepts effort `low`, `medium` or `high`, and the effort cannot
+  change partway through a conversation:
+
+      model = ChatAnthropic.new!(%{
+        model: "claude-sonnet-5-5",
+        thinking: %{type: "between_tools"},
+        output_config: %{"effort" => "low"}
+      })
+
+  Accepted `type` values by model family:
+
+  | `type` | Models |
+  |---|---|
+  | `"adaptive"` | Sonnet 4.6, Opus 4.6 and later |
+  | `"between_tools"` | Sonnet 5.5 only. Takes no other keys; effort must be `high` or below |
+  | `"disabled"` | Rejected by Sonnet 5.5 and Opus 5.5 |
+  | `"enabled"` with `budget_tokens` | Haiku 4.5, Sonnet 4.5 and earlier. Deprecated on 4.6; rejected by Sonnet 5 and later |
+
+  Models that still need a token budget take the `"enabled"` form. The
+  minimum budget is 1024 tokens:
+
+      model = ChatAnthropic.new!(%{
+        model: "claude-haiku-4-5",
         thinking: %{type: "enabled", budget_tokens: 2000}
       })
 
-      # Disable thinking
+  Things to know when thinking is on:
+
+  - Adaptive thinking decides per request whether to think. Simple prompts
+    often get no thinking block at all.
+  - `display` defaults to `"omitted"` on Sonnet 5 and later, so thinking blocks
+    arrive with empty text. Set `display: "summarized"` to receive readable
+    thinking text.
+  - `max_tokens` covers both thinking and the reply. A `status: :length`
+    result from a thinking model usually means `max_tokens` is too low for the
+    effort level.
+  - A non-streaming response arrives only after all thinking is done, which
+    can take longer than the default `receive_timeout` of 60 seconds. Stream,
+    or raise `receive_timeout`, for higher effort levels.
+  - Thinking parts with empty text still carry a signature and are sent back to
+    the API automatically. Do not strip them from the message history.
+  - Sonnet 5 and later reject a non-default `temperature`, `top_p` or `top_k`.
+    Thinking on earlier models requires `temperature` to be `1`.
+
+  ### Progress Updates
+
+  Between tool calls the model can write a progress update: a sentence or two
+  on what it just found and what it is about to do, written for the person
+  watching rather than as reasoning. It arrives as its own `thinking` block,
+  immediately before the `tool_use` block it introduces.
+
+  `display` decides what comes back in a thinking block. Under
+  `display: "updates"`, reasoning blocks have empty text and only progress
+  updates carry any, so a thinking block with text is a progress update. Those
+  parts are marked as `"narration"`
+  (see `LangChain.Message.ContentPart.utterance/1`) and a consumer can render
+  them as a status line while keeping reasoning hidden.
+
+  It needs a beta header, which is set by the caller:
+
       model = ChatAnthropic.new!(%{
-        model: "claude-3-7-sonnet-latest",
-        thinking: %{type: "disabled"}
+        model: "claude-sonnet-5-5",
+        thinking: %{type: "adaptive", display: "updates"},
+        beta_headers: ["structured-outputs-2025-11-13", "thinking-display-updates-2026-08-18"]
       })
 
-  As of the documentation for Claude 3.7 Sonnet, the minimum budget for thinking is 1024 tokens.
+  Under any other `display`, a thinking block with text is reasoning and is
+  left unmarked.
+
+  The marker says what kind of utterance a part is, not whether the turn is
+  over. Turn completion is decided by `stop_reason` alone. A progress update is
+  followed by the tool call it introduces, and that is what keeps the turn
+  going.
+
+  ## Structured Outputs (JSON Response)
+
+  Anthropic supports [structured outputs](https://docs.anthropic.com/en/docs/build-with-claude/structured-outputs)
+  to constrain Claude's response to follow a specific JSON schema. This is supported on
+  Claude Opus 4.6, Sonnet 4.6, Sonnet 4.5, Opus 4.5, and Haiku 4.5.
+
+  Set `json_response: true` and provide a `json_schema` map to enable structured outputs.
+
+  **Example:**
+
+      model = ChatAnthropic.new!(%{
+        model: "claude-sonnet-4-5-20250514",
+        json_response: true,
+        json_schema: %{
+          "type" => "object",
+          "properties" => %{
+            "name" => %{"type" => "string"},
+            "age" => %{"type" => "integer"},
+            "email" => %{"type" => "string"}
+          },
+          "required" => ["name", "age", "email"],
+          "additionalProperties" => false
+        }
+      })
+
+  The response will be returned as a regular text `ContentPart` containing a valid JSON string
+  matching the provided schema.
+
+  **Note:** Structured outputs are incompatible with citations and message prefilling.
 
   ## Prompt Caching
 
@@ -141,7 +243,57 @@ defmodule LangChain.ChatModels.ChatAnthropic do
   reduce costs and latency for frequently repeated content. Prompt caching works by caching large blocks of
   content that are likely to be reused across multiple requests.
 
-  Prompt caching is configured through the `cache_control` option in `ContentPart` options. It can be applied
+  ### Automatic Caching (Recommended for Multi-Turn Conversations)
+
+  The simplest way to enable prompt caching is with the top-level `:cache_control` option. Instead of placing
+  `cache_control` on individual content blocks, set it once on the model and Anthropic automatically applies
+  the cache breakpoint to the last cacheable block in each request.
+
+  See [Automatic caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching#automatic-caching)
+  in the Anthropic docs for full details.
+
+  **Basic usage (5-minute TTL, the default):**
+
+      model = ChatAnthropic.new!(%{
+        model: "claude-sonnet-4-6",
+        cache_control: %{"type" => "ephemeral"}
+      })
+
+  **With a 1-hour TTL (2x base input token price):**
+
+      model = ChatAnthropic.new!(%{
+        model: "claude-sonnet-4-6",
+        cache_control: %{"type" => "ephemeral", "ttl" => "1h"}
+      })
+
+  #### How It Works in Multi-Turn Conversations
+
+  With automatic caching the cache breakpoint moves forward automatically as conversations grow.
+  Each new request caches everything up to the last cacheable block, and previous content is read
+  from cache:
+
+  - **Request 1**: System + messages written to cache
+  - **Request 2**: Previous content read from cache; new messages written to cache
+  - **Request 3+**: Pattern continues -- old content from cache, new content written
+
+  You do not need to update any cache markers as the conversation grows.
+
+  #### Replaces Manual Message Caching
+
+  Automatic caching supersedes the `:cache_messages` setting. The `:cache_messages` option was a
+  client-side behavior coded into this module that applied `cache_control` blocks to the last N user
+  messages, approximating the automatic breakpoint behavior that Anthropic now offers natively through
+  the API. It remains available for backward compatibility, but you should use one or the other, not both:
+
+  - **`:cache_control`** (recommended) -- API-managed, automatic breakpoint placement
+  - **`:cache_messages`** (legacy) -- client-managed, adds `cache_control` to the last N user messages
+
+  For fine-grained control over exactly which content blocks are cached, use the `cache_control` option
+  directly on `ContentPart`, `ToolResult`, and `Function` structs (see "Per-Block Cache Control" below).
+
+  ### Per-Block Cache Control
+
+  For fine-grained control, prompt caching can also be configured through the `cache_control` option in `ContentPart` options. It can be applied
   to both system messages, regular user messages, tool results, and tool definitions.
 
   Anthropic limits a conversation to max of 4 cache_control blocks and will refuse to service requests with more.
@@ -162,6 +314,23 @@ defmodule LangChain.ChatModels.ChatAnthropic do
         ContentPart.text!("<large document content>", cache_control: true)
       ])
 
+  This will set a single cache breakpoint that will include your functions (processed first) and system message.
+  Anthropic limits conversations to a maximum of 4 cache_control blocks.
+
+  For multi-turn conversations, turning on message_caching (see below) will add a second cache breakpoint and
+  give you higher cache utilization and response times. Writing to the cache increases write costs so this setting
+  is not on by default.
+
+  ### Supported Content Types
+
+  Prompt caching can be applied to:
+  - Text content in system messages
+  - Text content in user messages
+  - Tool results in the `content` field when returning a list of `ContentPart` structs.
+  - Tool definitions in the `options` field when creating a `Function` struct.
+
+  For more information, see the [Anthropic prompt caching documentation](https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching).
+
   ### Advanced Cache Control
 
   For more explicit control over caching parameters, you can provide a map instead of `true`:
@@ -174,16 +343,315 @@ defmodule LangChain.ChatModels.ChatAnthropic do
 
   The default is "5m" for 5 minutes but supports "1h" for 1 hour depending on your account.
 
+  ### Automatic Message Caching for Multi-Turn Conversations
 
-  ### Supported Content Types
+  The `:cache_messages` option automates cache breakpoint placement for multi-turn conversations by
+  adding `cache_control` to the last N user messages.
 
-  Prompt caching can be applied to:
-  - Text content in system messages
-  - Text content in user messages
-  - Tool results in the `content` field when returning a list of `ContentPart` structs.
-  - Tool definitions in the `options` field when creating a `Function` struct.
+  #### When to Use This Feature
 
-  For more information, see the [Anthropic prompt caching documentation](https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching).
+  **Good fit:**
+  - Multi-turn conversations (3+ turns) where you'll reuse conversation history
+  - Conversations with tool use where uncached tool messages cause cache degradation
+  - Applications where both cost reduction AND latency reduction are valuable (~10x faster cache reads)
+  - Repeated similar queries with different follow-ups
+
+  **Not recommended:**
+  - Single-turn requests (no benefit, only added cost)
+  - Short conversations (1-2 turns) where break-even isn't reached
+  - Highly diverse conversations with no repeated context
+
+  #### Benefits
+
+  When enabled, you get:
+  - **Reduced latency**: Cache reads are ~10x faster than processing tokens from scratch
+  - **Lower costs**: After break-even (typically 2-3 turns), costs drop significantly
+  - **Automatic optimization**: No manual cache management required
+
+  #### Why Multiple Breakpoints?
+
+  Anthropic limits conversations to 4 cache breakpoints total. The optimal generic strategy is:
+  - **1 breakpoint for system prompt**: Static context (instructions, large documents) that never changes
+  - **3 breakpoints for user messages**: Recent conversation history (this is the default)
+
+  Using multiple user message breakpoints (rather than just 1) provides 15-25% cost savings in
+  multi-turn conversations with tools:
+  - **Single breakpoint problem**: Heavy tool use adds uncached messages between user messages, causing steep degradation
+  - **Multiple breakpoints solution**: Caches recent conversation history, reducing degradation
+  - **Tradeoff**: More cache writes initially, but pays off after 2-3 turns
+
+  #### Key Behaviors
+
+  - **Default count**: 3 user message breakpoints (reserves 1 for system prompt in the 4 breakpoint limit)
+  - **Always cache current messages**: Breakpoints are placed on the most recent user messages, not previous ones
+  - **Breakpoints move**: As conversations grow, old messages fall out of cache but recent ones stay cached
+  - **Expected utilization**: 85-95% for early turns, stabilizes at 70-85% for longer conversations
+
+  #### Enabling Message Caching
+
+  Message caching is disabled by default since writing to the cache increases write costs (1.25x for 5m TTL, 3x for 1h).
+
+  Enable with defaults (3 breakpoints, 5m TTL):
+
+      model = ChatAnthropic.new!(%{
+        model: "claude-sonnet-4-6",
+        cache_messages: %{enabled: true}
+      })
+
+  #### Configuring Breakpoint Count
+
+  Adjust the number of breakpoints based on your use case (max: 4):
+
+      # Conservative: single breakpoint (original behavior)
+      model = ChatAnthropic.new!(%{
+        model: "claude-sonnet-4-6",
+        cache_messages: %{enabled: true, count: 1}
+      })
+
+      # Balanced: 2 breakpoints for moderate conversations
+      model = ChatAnthropic.new!(%{
+        model: "claude-sonnet-4-6",
+        cache_messages: %{enabled: true, count: 2}
+      })
+
+      # Optimal for tool-heavy: 3 breakpoints (default)
+      model = ChatAnthropic.new!(%{
+        model: "claude-sonnet-4-6",
+        cache_messages: %{enabled: true, count: 3}
+      })
+
+      # Maximum: 4 breakpoints (assuming no system prompt caching)
+      model = ChatAnthropic.new!(%{
+        model: "claude-sonnet-4-6",
+        cache_messages: %{enabled: true, count: 4}
+      })
+
+  #### With Custom TTL
+
+  Specify a custom TTL (time-to-live):
+
+      model = ChatAnthropic.new!(%{
+        model: "claude-sonnet-4-6",
+        cache_messages: %{enabled: true, count: 2, ttl: "1h"}
+      })
+
+  Supported TTL values: "5m" (5 minutes, default) and "1h" (1 hour).
+
+  **Cost note**: Cache writes with 5m TTL cost 1.25x, 1h TTL costs 3x.
+
+  #### How It Works
+
+  - Breakpoints are placed on the **last text ContentPart** of each selected user message
+  - Tool results are skipped (not cacheable at the message level)
+  - Explicit `cache_control` settings in ContentParts are preserved
+  - Works alongside system message and tool caching
+
+  #### What to Expect
+
+  Cost breakdown for a conversation with 3 breakpoints and 5m TTL (relative to baseline without caching):
+
+  **Pricing context:**
+  - Baseline input: 1.0x (standard input token cost)
+  - Cache write: 1.25x (costs 25% more than baseline)
+  - Cache read: 0.1x (90% discount - costs 10% of baseline)
+
+  **Turn-by-turn costs:**
+  - **Turn 1**: 0% cache hit, 100% cache write
+    - Effective cost: ~1.25x baseline (all writes, no reads yet)
+  - **Turn 2**: 85-95% cache hit
+    - Effective cost: ~0.20x baseline (mostly cheap reads: 90% × 0.1x + 10% × 1.0x)
+  - **Turn 3+**: 70-85% cache hit
+    - Effective cost: ~0.25x baseline (mostly cheap reads: 80% × 0.1x + 20% × 1.0x)
+
+  **Break-even**: Typically 2-3 turns. After turn 2, you're paying ~20-25% of baseline cost.
+
+  **Latency**: Cache reads are ~10x faster than processing tokens, significantly reducing response time.
+
+  Cache utilization will stabilize around 70-85% for longer conversations as old content
+  falls out of cache, but recent context stays cached. The cost savings and latency benefits
+  continue for the life of the conversation.
+
+  ## Monitoring Cache Utilization
+
+  Cache utilization data is accessible in two places:
+  - The Claude console: https://console.anthropic.com/usage
+  - Response metadata in `LangChain.Message` under `metadata.usage.raw`
+
+  Cache utilization is visible in the message metadata.usage.raw map. Inspecting the first and second
+  completed messages can make the behavior more clear.
+
+  **Turn 1 response (initial request):**
+      %{
+        "cache_creation" => %{
+          "ephemeral_1h_input_tokens" => 0,
+          "ephemeral_5m_input_tokens" => 3657
+        },
+        "cache_creation_input_tokens" => 7314,
+        "cache_read_input_tokens" => 0,
+        "input_tokens" => 18,
+        "output_tokens" => 197,
+        "service_tier" => "standard"
+      }
+
+  Cache read utilization: `cache_read_input_tokens / (cache_read_input_tokens + input_tokens) * 100 = 0%`
+
+  This 0% utilization is expected for the initial request (all cache writes, no reads yet).
+
+  **Turn 2 response (cache now available):**
+      %{
+        "cache_creation" => %{
+          "ephemeral_1h_input_tokens" => 0,
+          "ephemeral_5m_input_tokens" => 146
+        },
+        "cache_creation_input_tokens" => 292,
+        "cache_read_input_tokens" => 3604,
+        "input_tokens" => 18,
+        "output_tokens" => 644,
+        "service_tier" => "standard"
+      }
+
+  Cache read utilization: `3604 / (3604 + 18) * 100 = 99.5%`
+
+  This high utilization shows most of the prompt is being read from cache, with only new content
+  being processed and written.
+
+  ### Important Notes
+
+  - **Minimum prompt length**: If your cache breakpoint doesn't meet the minimum cacheable prompt length, it won't be cached at all.
+  - **Model-specific limits**: Different models have different cache limitations - see https://docs.claude.com/en/docs/build-with-claude/prompt-caching#cache-limitations
+  - **Haiku considerations**: Haiku has a high minimum (4096 tokens) which can mean low initial utilization. However, enabling `:cache_messages` has minimal cost impact, so it's safe to enable.
+  - **TTL tradeoff**: Default TTL is 5m (1.25x write cost). Setting TTL to 1h increases write cost to 3x but may improve utilization for longer sessions.
+
+  ## Tool Search
+
+  With many tools, declaring them all to the model costs accuracy and context.
+  Tool search keeps most of them out of the model's context until it asks for
+  them, without changing the request prefix, so prompt caching and earlier
+  thinking blocks keep working.
+
+  Mark the functions to hide with `defer_loading: true` and add the search
+  tool:
+
+      deferred =
+        Function.new!(%{
+          name: "devices_list",
+          description: "List managed devices.",
+          parameters_schema: %{type: "object", properties: %{}},
+          function: &list_devices/2,
+          options: [defer_loading: true]
+        })
+
+      %{llm: ChatAnthropic.new!(%{model: "claude-sonnet-5-5"})}
+      |> LLMChain.new!()
+      |> LLMChain.add_tools([NativeTool.tool_search(), deferred, other_tools])
+
+  `LangChain.NativeTool.tool_search/1` takes `variant: :bm25` (the default,
+  natural language queries) or `variant: :regex`. Every tool is sent on every
+  request, but the model sees only the tools that are not deferred, plus the
+  search tool. When it needs one of the others it searches, and the API loads
+  the matching tools into the conversation where the search took place.
+
+  - At least one tool must not be deferred. The search tool counts. A request
+    where every tool is deferred raises a `LangChain.LangChainError` before it
+    is sent.
+  - A deferred function cannot carry `cache_control`. It is left out, with a
+    warning. Put the cache breakpoint on a tool that is not deferred.
+  - The model sees nothing about a deferred tool until it finds it. Tell it
+    what it can search for in the system prompt, and give related tools a
+    shared name prefix (`devices_list`, `devices_get`) so one search finds the
+    group.
+  - Keep tool descriptions fixed for the life of a conversation. Every
+    definition is part of every request.
+
+  ### Search blocks in the conversation
+
+  A search adds a `server_tool_use` block and a `tool_search_tool_result`
+  block to the assistant message. Each becomes a
+  `LangChain.Message.ContentPart` of type `:provider_item` and is sent back
+  unchanged, in the same position, on every later request. That is how a
+  loaded tool stays loaded, so keep these parts wherever the conversation is
+  stored. Other chat models leave them out.
+
+  The search runs on Anthropic's servers within the same response. It is never
+  a `LangChain.Message.ToolCall`, and the chain never executes it.
+
+  A response can stop with `stop_reason: "pause_turn"` while a server tool
+  works. The message is `:complete` with `metadata[:end_turn]` set to `false`,
+  so `LangChain.Chains.LLMChain` sends it back and the model continues.
+
+  ### Loading tools from your own tool
+
+  A function can do the search itself and load tools by returning
+  `:tool_reference` parts in its result:
+
+      function: fn %{"ability" => ability}, _context ->
+        parts =
+          ability
+          |> tool_names_for()
+          |> Enum.map(&ContentPart.tool_reference!/1)
+
+        {:ok, [ContentPart.text!("Loaded.") | parts]}
+      end
+
+  Each reference becomes a `tool_reference` block in the `tool_result`, and the
+  API loads that tool. Every referenced tool must be in the request's tools,
+  normally deferred, or the API answers "Tool reference 'name' not found".
+
+  A `tool_result` holding references cannot hold anything else; the API
+  rejects the mix. The result's other content, such as the text above, is sent
+  after the tool results in the same user message, so the model still reads
+  it.
+
+  ## Refusals
+
+  Anthropic's safety classifiers can decline a request. A declined request is a
+  normal HTTP 200 response carrying `stop_reason: "refusal"`, not an error, and
+  its content is empty when the classifier fired before any output or partial
+  when it fired mid-stream.
+
+  A refusal produces a message with `status: :content_filtered`. The response
+  also carries a `stop_details` object naming the policy category that stopped
+  it, which is placed in the message's `metadata` under `:stop_details`:
+
+      {:ok, message} = ChatAnthropic.call(model, messages, [])
+
+      case message.status do
+        :content_filtered ->
+          message.metadata[:stop_details]
+          # => %{"type" => "refusal", "category" => "cyber", "explanation" => "..."}
+
+        _ ->
+          message.content
+      end
+
+  `stop_details` is null for every stop reason other than `refusal`, so the
+  `:stop_details` key is absent from `metadata` on any other message.
+
+  ## Connection Retry Behavior
+
+  The `retry_count` option controls how many times a request is retried when
+  a pooled HTTP connection turns out to be stale (server closed it between
+  requests). This is a transport-level issue where retrying with a fresh
+  connection is the correct response.
+
+  **Only closed-connection errors are retried.** Timeouts, rate limits (429),
+  overloaded (529), authentication errors, and invalid requests all return
+  immediately -- they are not problems that a simple retry will fix.
+
+  | `retry_count` | Total HTTP requests |
+  |---|---|
+  | `0` | 1 (no retries) |
+  | `1` | 2 (1 initial + 1 retry) |
+  | `2` (default) | 3 (1 initial + 2 retries) |
+
+  Req's built-in HTTP retry is disabled to prevent the two retry layers from
+  compounding. See [GitHub issue #503](https://github.com/brainlid/langchain/issues/503).
+
+  When running LLM calls from a background job queue (e.g., Oban) that has its
+  own retry logic, set `retry_count: 0` so there are no hidden retries:
+
+      ChatAnthropic.new!(%{model: "...", retry_count: 0})
+
   """
   use Ecto.Schema
   require Logger
@@ -193,6 +661,7 @@ defmodule LangChain.ChatModels.ChatAnthropic do
   alias LangChain.ChatModels.ChatModel
   alias LangChain.LangChainError
   alias LangChain.Message
+  alias LangChain.Message.Citation
   alias LangChain.Message.ContentPart
   alias LangChain.Message.ToolCall
   alias LangChain.Message.ToolResult
@@ -200,6 +669,7 @@ defmodule LangChain.ChatModels.ChatAnthropic do
   alias LangChain.TokenUsage
   alias LangChain.Function
   alias LangChain.FunctionParam
+  alias LangChain.NativeTool
   alias LangChain.Utils
   alias LangChain.Callbacks
   alias LangChain.Utils.BedrockStreamDecoder
@@ -210,6 +680,14 @@ defmodule LangChain.ChatModels.ChatAnthropic do
   @current_config_version 1
 
   @default_cache_control_block %{"type" => "ephemeral"}
+
+  # The content blocks a server-side tool search adds to an assistant message.
+  @tool_search_block_types ["server_tool_use", "tool_search_tool_result"]
+
+  # The delta type `decode_stream/2` gives a `server_tool_use` block's input
+  # fragments, so they are not read as a tool call's arguments. It never comes
+  # from the API.
+  @server_tool_input_delta "langchain_server_tool_input_json_delta"
 
   # Added "thinking" support - https://docs.anthropic.com/en/api/messages#body-thinking
 
@@ -232,6 +710,13 @@ defmodule LangChain.ChatModels.ChatAnthropic do
     # customer to provide their own.
     field :api_key, :string, redact: true
 
+    # Omit the `x-api-key` header entirely. This is useful when the endpoint is
+    # fronted by its own authentication mechanism (a corporate proxy, or an AWS
+    # SigV4-signed gateway, for example) and sending `x-api-key` would be
+    # rejected or ignored. When true, no `x-api-key` header is sent regardless of
+    # `api_key` or the globally configured key.
+    field :suppress_api_key, :boolean, default: false
+
     # https://docs.anthropic.com/claude/reference/versions
     field :api_version, :string, default: "2023-06-01"
 
@@ -240,8 +725,7 @@ defmodule LangChain.ChatModels.ChatAnthropic do
     # goes on too long by itself, it tends to hallucinate more.
     field :receive_timeout, :integer, default: @receive_timeout
 
-    # field :model, :string, default: "claude-3-haiku-20240307"
-    field :model, :string, default: "claude-3-haiku-20240307"
+    field :model, :string, default: "claude-haiku-4-5"
 
     # The maximum tokens allowed for generating a response. This field is
     # required to be present in the API request. The default is a max of 4096
@@ -274,18 +758,58 @@ defmodule LangChain.ChatModels.ChatAnthropic do
     # A list of maps for callback handlers (treat as private)
     field :callbacks, {:array, :map}, default: []
 
-    # Supported on "thinking" models like Claude 3.7 and later.
+    # Forwarded to the API as given. `type` is one of "adaptive",
+    # "between_tools", "disabled" or "enabled" (with `budget_tokens`); which
+    # ones a model accepts varies. See the "Thinking" section of the moduledoc.
     field :thinking, :map
 
     # Tool choice option
     field :tool_choice, :map
 
     # Beta headers
-    # https://docs.anthropic.com/claude/docs/tool-use - requires tools-2024-04-04 header during beta
-    field :beta_headers, {:array, :string}, default: ["tools-2024-04-04"]
+    # https://docs.claude.com/en/docs/build-with-claude/structured-outputs - for strict tool use
+    field :beta_headers, {:array, :string}, default: ["structured-outputs-2025-11-13"]
 
     # Additional level of raw api request and response data
     field :verbose_api, :boolean, default: false
+
+    # Number of retries on closed-connection errors (stale pool). The initial
+    # request always runs; this controls additional attempts only.
+    field :retry_count, :integer, default: 2
+
+    # Automatically cache messages in multi-turn conversations.
+    # Set to %{enabled: true} to add cache_control to the last N user messages (default: 3).
+    # Can include count: %{enabled: true, count: 2} (max: 4, default: 3)
+    # Can include TTL: %{enabled: true, ttl: "1h"} or %{enabled: true, ttl: "5m"}
+    # Set to %{enabled: false} or nil to disable automatic message caching.
+    field :cache_messages, :map
+
+    # Top-level automatic cache control. When set, Anthropic auto-applies the
+    # cache breakpoint to the last cacheable block in the request.
+    # Example: %{"type" => "ephemeral"} or %{"type" => "ephemeral", "ttl" => "1h"}
+    # See: https://platform.claude.com/docs/en/build-with-claude/prompt-caching#automatic-caching
+    field :cache_control, :map
+
+    # Whether to request a JSON-formatted response with a specific schema.
+    # For supported models see
+    # https://docs.anthropic.com/en/docs/build-with-claude/structured-outputs
+    # When set to true, json_schema is required.
+    field :json_response, :boolean, default: false
+
+    # JSON Schema for the structured output response. Required when json_response is true.
+    # The schema follows standard JSON Schema format.
+    field :json_schema, :map, default: nil
+
+    # Output configuration for controlling model behavior.
+    # e.g., %{"effort" => "medium"} for adaptive thinking effort control.
+    # Effort levels are "low", "medium", "high", "xhigh" (Sonnet 5 and later)
+    # and "max". When `json_response` is true, the JSON schema "format" is
+    # merged into this map.
+    field :output_config, :map
+
+    # Req options to merge into the request.
+    # https://hexdocs.pm/req/Req.html#new/1-options
+    field :req_opts, :any, virtual: true, default: []
   end
 
   @type t :: %ChatAnthropic{}
@@ -293,6 +817,7 @@ defmodule LangChain.ChatModels.ChatAnthropic do
   @create_fields [
     :endpoint,
     :api_key,
+    :suppress_api_key,
     :api_version,
     :receive_timeout,
     :model,
@@ -304,7 +829,15 @@ defmodule LangChain.ChatModels.ChatAnthropic do
     :thinking,
     :tool_choice,
     :beta_headers,
-    :verbose_api
+    :verbose_api,
+    :retry_count,
+    :cache_messages,
+    :cache_control,
+    :json_response,
+    :json_schema,
+    :output_config,
+    :req_opts,
+    :callbacks
   ]
   @required_fields [:endpoint, :model]
 
@@ -339,6 +872,17 @@ defmodule LangChain.ChatModels.ChatAnthropic do
     |> validate_required(@required_fields)
     |> validate_number(:temperature, greater_than_or_equal_to: 0, less_than_or_equal_to: 1)
     |> validate_number(:receive_timeout, greater_than_or_equal_to: 0)
+    |> validate_json_schema_required()
+  end
+
+  defp validate_json_schema_required(changeset) do
+    json_response = Ecto.Changeset.get_field(changeset, :json_response)
+    json_schema = Ecto.Changeset.get_field(changeset, :json_schema)
+
+    case {json_response, json_schema} do
+      {true, nil} -> add_error(changeset, :json_schema, "is required when json_response is true")
+      _ -> changeset
+    end
   end
 
   def get_system_text(nil) do
@@ -370,7 +914,7 @@ defmodule LangChain.ChatModels.ChatAnthropic do
     messages =
       messages
       |> Enum.map(&message_for_api/1)
-      |> post_process_and_combine_messages()
+      |> post_process_and_combine_messages(anthropic.cache_messages)
 
     %{
       model: anthropic.model,
@@ -381,12 +925,14 @@ defmodule LangChain.ChatModels.ChatAnthropic do
       # the messages list.
       system: get_system_text(system)
     }
-    |> Utils.conditionally_add_to_map(:tools, get_tools_for_api(tools))
+    |> Utils.conditionally_add_to_map(:tools, tools |> validate_tools!() |> get_tools_for_api())
     |> Utils.conditionally_add_to_map(:tool_choice, get_tool_choice(anthropic))
     |> Utils.conditionally_add_to_map(:max_tokens, anthropic.max_tokens)
     |> Utils.conditionally_add_to_map(:top_p, anthropic.top_p)
     |> Utils.conditionally_add_to_map(:top_k, anthropic.top_k)
     |> Utils.conditionally_add_to_map(:thinking, anthropic.thinking)
+    |> Utils.conditionally_add_to_map(:output_config, set_output_config(anthropic))
+    |> Utils.conditionally_add_to_map(:cache_control, anthropic.cache_control)
     |> maybe_transform_for_bedrock(anthropic.bedrock)
   end
 
@@ -399,16 +945,50 @@ defmodule LangChain.ChatModels.ChatAnthropic do
   end
 
   defp get_tool_choice(%ChatAnthropic{
-         tool_choice: %{"type" => "tool", "name" => name} = _tool_choice
+         tool_choice: %{"type" => "tool", "name" => name} = tool_choice
        })
-       when is_binary(name) and byte_size(name) > 0,
-       do: %{"type" => "tool", "name" => name}
+       when is_binary(name) and byte_size(name) > 0 do
+    %{"type" => "tool", "name" => name}
+    |> Utils.conditionally_add_to_map(
+      "disable_parallel_tool_use",
+      Map.get(tool_choice, "disable_parallel_tool_use")
+    )
+  end
 
-  defp get_tool_choice(%ChatAnthropic{tool_choice: %{"type" => type} = _tool_choice})
-       when is_binary(type) and byte_size(type) > 0,
-       do: %{"type" => type}
+  defp get_tool_choice(%ChatAnthropic{tool_choice: %{"type" => type} = tool_choice})
+       when is_binary(type) and byte_size(type) > 0 do
+    %{"type" => type}
+    |> Utils.conditionally_add_to_map(
+      "disable_parallel_tool_use",
+      Map.get(tool_choice, "disable_parallel_tool_use")
+    )
+  end
 
   defp get_tool_choice(%ChatAnthropic{}), do: nil
+
+  # The JSON schema format is merged into any caller-supplied `output_config`
+  # so settings like `"effort"` are kept alongside it. Top-level keys are
+  # stringified first so `%{effort: "low"}` and `"format"` cannot produce
+  # mixed or duplicate keys.
+  defp set_output_config(%ChatAnthropic{
+         json_response: true,
+         json_schema: schema,
+         output_config: config
+       })
+       when not is_nil(schema) do
+    config
+    |> stringify_top_level_keys()
+    |> Map.put("format", %{"type" => "json_schema", "schema" => schema})
+  end
+
+  defp set_output_config(%ChatAnthropic{output_config: config}) when is_map(config), do: config
+  defp set_output_config(%ChatAnthropic{}), do: nil
+
+  defp stringify_top_level_keys(nil), do: %{}
+
+  defp stringify_top_level_keys(map) when is_map(map) do
+    Map.new(map, fn {key, value} -> {to_string(key), value} end)
+  end
 
   defp get_tools_for_api(nil), do: []
 
@@ -416,7 +996,68 @@ defmodule LangChain.ChatModels.ChatAnthropic do
     Enum.map(tools, fn
       %Function{} = function ->
         function_for_api(function)
+
+      %NativeTool{} = tool ->
+        native_tool_for_api(tool)
     end)
+  end
+
+  # The API requires at least one tool that is not deferred. The search tool
+  # and any other native tool count. A request where every tool is deferred is
+  # rejected with a 400, so it is reported here with a message that names the
+  # fix.
+  defp validate_tools!(nil), do: nil
+  defp validate_tools!([]), do: []
+
+  defp validate_tools!(tools) when is_list(tools) do
+    if Enum.all?(tools, &match?(%Function{}, &1)) and Enum.all?(tools, &Function.deferred?/1) do
+      raise LangChainError,
+        type: "invalid_tools",
+        message:
+          "Every tool is deferred. Anthropic requires at least one tool that is not. " <>
+            "Add `LangChain.NativeTool.tool_search/1` or leave a function undeferred."
+    end
+
+    tools
+  end
+
+  @tool_search_tools %{
+    "bm25" => %{"type" => "tool_search_tool_bm25_20251119", "name" => "tool_search_tool_bm25"},
+    "regex" => %{"type" => "tool_search_tool_regex_20251119", "name" => "tool_search_tool_regex"}
+  }
+
+  @doc """
+  Convert a `LangChain.NativeTool` to the format expected by the Anthropic API.
+
+  - The tool built by `LangChain.NativeTool.tool_search/1` becomes Anthropic's
+    BM25 or regex tool search tool.
+  - Any other native tool whose `configuration` holds a `"type"` is sent as its
+    configuration, with the tool's `name` added when the configuration has
+    none. This reaches Anthropic's other server tools, such as web search.
+
+  Raises a `LangChain.LangChainError` for a native tool with no `"type"`.
+  """
+  @spec native_tool_for_api(NativeTool.t()) :: map() | no_return()
+  def native_tool_for_api(%NativeTool{name: "tool_search", configuration: config}) do
+    variant = Map.get(config || %{}, "variant", "bm25")
+
+    case Map.fetch(@tool_search_tools, variant) do
+      {:ok, tool} ->
+        tool
+
+      :error ->
+        raise LangChainError,
+              "Unsupported tool search variant #{inspect(variant)} for Anthropic."
+    end
+  end
+
+  def native_tool_for_api(%NativeTool{name: name, configuration: %{"type" => _} = config}) do
+    Map.put_new(config, "name", name)
+  end
+
+  def native_tool_for_api(%NativeTool{name: name}) do
+    raise LangChainError,
+          "Native tool #{inspect(name)} needs a \"type\" in its configuration to be sent to Anthropic."
   end
 
   @doc """
@@ -451,11 +1092,12 @@ defmodule LangChain.ChatModels.ChatAnthropic do
   def call(%ChatAnthropic{} = anthropic, messages, functions) when is_list(messages) do
     metadata = %{
       model: anthropic.model,
+      provider: provider(),
       message_count: length(messages),
       tools_count: length(functions)
     }
 
-    LangChain.Telemetry.span([:langchain, :llm, :call], metadata, fn ->
+    ChatModel.llm_telemetry_span(anthropic, metadata, fn ->
       try do
         # Track the prompt being sent
         LangChain.Telemetry.llm_prompt(
@@ -484,6 +1126,25 @@ defmodule LangChain.ChatModels.ChatAnthropic do
     end)
   end
 
+  @impl ChatModel
+  def provider, do: "anthropic"
+
+  @doc """
+  Determine if an error should be retried. If `true`, a fallback LLM may be
+  used. If `false`, the error is understood to be more fundamental with the
+  request rather than a service issue and it should not be retried or fallback
+  to another service.
+  """
+  @impl ChatModel
+  @spec retry_on_fallback?(LangChainError.t()) :: boolean()
+  def retry_on_fallback?(%LangChainError{type: "rate_limited"}), do: true
+  def retry_on_fallback?(%LangChainError{type: "rate_limit_exceeded"}), do: true
+  def retry_on_fallback?(%LangChainError{type: "overloaded"}), do: true
+  def retry_on_fallback?(%LangChainError{type: "overloaded_error"}), do: true
+  def retry_on_fallback?(%LangChainError{type: "timeout"}), do: true
+  def retry_on_fallback?(%LangChainError{type: "invalid_request_error"}), do: false
+  def retry_on_fallback?(_), do: false
+
   # Call Anthropic's API.
   #
   # The result of the function is:
@@ -495,9 +1156,9 @@ defmodule LangChain.ChatModels.ChatAnthropic do
   #
   # Retries the request up to 3 times on transient errors with a 1 second delay
   @doc false
-  @spec do_api_request(t(), [Message.t()], ChatModel.tools(), non_neg_integer()) ::
+  @spec do_api_request(t(), [Message.t()], ChatModel.tools(), non_neg_integer() | nil) ::
           list() | struct() | {:error, LangChainError.t()} | no_return()
-  def do_api_request(anthropic, messages, tools, retry_count \\ 3)
+  def do_api_request(anthropic, messages, tools, retry_count \\ nil)
 
   def do_api_request(_anthropic, _messages, _functions, 0) do
     raise LangChainError,
@@ -511,6 +1172,7 @@ defmodule LangChain.ChatModels.ChatAnthropic do
         tools,
         retry_count
       ) do
+    retry_count = retry_count || anthropic.retry_count + 1
     raw_data = for_api(anthropic, messages, tools)
 
     if anthropic.verbose_api do
@@ -523,11 +1185,12 @@ defmodule LangChain.ChatModels.ChatAnthropic do
         json: raw_data,
         headers: headers(anthropic),
         receive_timeout: anthropic.receive_timeout,
-        retry: :transient,
-        max_retries: 3,
-        retry_delay: fn attempt -> 300 * attempt end,
+        # Disable Req-level retry to prevent compounding with LangChain's own
+        # :closed retry. See https://github.com/brainlid/langchain/issues/503
+        retry: false,
         aws_sigv4: aws_sigv4_opts(anthropic.bedrock)
       )
+      |> Req.merge(anthropic.req_opts)
 
     req
     |> Req.post()
@@ -554,6 +1217,14 @@ defmodule LangChain.ChatModels.ChatAnthropic do
             result
         end
 
+      {:ok, %Req.Response{status: 401} = error} ->
+        {:error,
+         LangChainError.exception(
+           type: "authentication_error",
+           message: "Authentication Error",
+           original: error
+         )}
+
       {:ok, %Req.Response{status: 429} = response} ->
         rate_limit_info = get_ratelimit_info(response.headers)
 
@@ -574,6 +1245,13 @@ defmodule LangChain.ChatModels.ChatAnthropic do
       {:ok, %Req.Response{status: 529}} ->
         {:error, LangChainError.exception(type: "overloaded", message: "Overloaded")}
 
+      # Any other error status with an API error body. The body names the error
+      # type and explains what was wrong with the request (for example a 400
+      # `invalid_request_error`), and both become the returned error.
+      {:ok, %Req.Response{status: status, body: %{"error" => %{}} = data}}
+      when status in 400..599 ->
+        do_process_response(anthropic, data)
+
       {:error, %Req.TransportError{reason: :timeout} = err} ->
         {:error,
          LangChainError.exception(type: "timeout", message: "Request timed out", original: err)}
@@ -587,10 +1265,25 @@ defmodule LangChain.ChatModels.ChatAnthropic do
         # pass through the already handled exception
         error
 
+      {:error, err} ->
+        Logger.warning(fn -> "Unhandled error non-streamed post call. #{inspect(err)}" end)
+
+        {:error,
+         LangChainError.exception(
+           type: "unhandled_error",
+           message: "Unhanded error in non-streamed response",
+           original: err
+         )}
+
       other ->
-        message = "Unexpected and unhandled API response! #{inspect(other)}"
-        Logger.error(message)
-        {:error, LangChainError.exception(type: "unexpected_response", message: message)}
+        Logger.warning(fn -> "Unexpected and unhandled API response! #{inspect(other)}" end)
+
+        {:error,
+         LangChainError.exception(
+           type: "unexpected_response",
+           message: "Unexpected response",
+           original: other
+         )}
     end
   end
 
@@ -600,6 +1293,7 @@ defmodule LangChain.ChatModels.ChatAnthropic do
         tools,
         retry_count
       ) do
+    retry_count = retry_count || anthropic.retry_count + 1
     raw_data = for_api(anthropic, messages, tools)
 
     if anthropic.verbose_api do
@@ -618,8 +1312,11 @@ defmodule LangChain.ChatModels.ChatAnthropic do
       headers: headers(anthropic),
       receive_timeout: anthropic.receive_timeout,
       aws_sigv4: aws_sigv4_opts(anthropic.bedrock),
-      retry: :transient
+      # Disable Req-level retry to prevent compounding with LangChain's own
+      # :closed retry. See https://github.com/brainlid/langchain/issues/503
+      retry: false
     )
+    |> Req.merge(anthropic.req_opts)
     |> Req.post(
       into:
         Utils.handle_stream_fn(
@@ -638,12 +1335,20 @@ defmodule LangChain.ChatModels.ChatAnthropic do
 
         # Track the stream completion
         LangChain.Telemetry.emit_event(
-          [:langchain, :llm, :response, streaming: true],
+          [:langchain, :llm, :response, :streaming],
           %{system_time: System.system_time()},
           %{model: anthropic.model}
         )
 
-        data
+        # Check for error tuples embedded in the accumulated streaming data.
+        # When an API error event (e.g., overloaded_error) arrives mid-stream
+        # on a 200 connection, do_process_response returns
+        # {:error, %LangChainError{}} which gets accumulated in the response
+        # body list instead of short-circuiting the stream.
+        case extract_streaming_error(data) do
+          {:error, _} = error -> error
+          nil -> data
+        end
 
       # The error tuple was successfully received from the API. Unwrap it and
       # return it as an error.
@@ -663,12 +1368,44 @@ defmodule LangChain.ChatModels.ChatAnthropic do
         # pass through the already handled exception
         error
 
+      {:error, err} ->
+        Logger.warning(fn -> "Unhandled error streamed post call. #{inspect(err)}" end)
+
+        {:error,
+         LangChainError.exception(
+           type: "unhandled_error",
+           message: "Unhanded error in streaming response",
+           original: err
+         )}
+
       other ->
-        message = "Unhandled and unexpected response from streamed post call. #{inspect(other)}"
-        Logger.error(message)
-        {:error, LangChainError.exception(type: "unexpected_response", message: message)}
+        Logger.warning(fn ->
+          "Unhandled and unexpected response from streamed post call. #{inspect(other)}"
+        end)
+
+        {:error,
+         LangChainError.exception(
+           type: "unexpected_response",
+           message: "Unexpected response",
+           original: other
+         )}
     end
   end
+
+  # Scan the accumulated streaming response body for error tuples. During
+  # streaming on a 200 connection, API error events (like overloaded_error)
+  # get accumulated into the body list as {:error, %LangChainError{}} tuples
+  # instead of being returned directly. This extracts the first such error.
+  defp extract_streaming_error(data) when is_list(data) do
+    data
+    |> List.flatten()
+    |> Enum.find_value(fn
+      {:error, %LangChainError{}} = error -> error
+      _ -> nil
+    end)
+  end
+
+  defp extract_streaming_error(_data), do: nil
 
   defp aws_sigv4_opts(nil), do: nil
   defp aws_sigv4_opts(%BedrockConfig{} = bedrock), do: BedrockConfig.aws_sigv4_opts(bedrock)
@@ -682,14 +1419,15 @@ defmodule LangChain.ChatModels.ChatAnthropic do
   defp headers(%ChatAnthropic{
          bedrock: nil,
          api_key: api_key,
+         suppress_api_key: suppress_api_key,
          api_version: api_version,
          beta_headers: beta_headers
        }) do
     %{
-      "x-api-key" => get_api_key(api_key),
       "content-type" => "application/json",
       "anthropic-version" => api_version
     }
+    |> maybe_put_api_key(api_key, suppress_api_key)
     |> Utils.conditionally_add_to_map(
       "anthropic-beta",
       if(!Enum.empty?(beta_headers), do: Enum.join(beta_headers, ","))
@@ -702,6 +1440,14 @@ defmodule LangChain.ChatModels.ChatAnthropic do
       "accept" => "application/json"
     }
   end
+
+  # When `suppress_api_key: true`, omit the `x-api-key` header so the caller's
+  # own authentication (a proxy or SigV4-signed gateway, for example) can take
+  # over.
+  defp maybe_put_api_key(headers, _api_key, true), do: headers
+
+  defp maybe_put_api_key(headers, api_key, false),
+    do: Map.put(headers, "x-api-key", get_api_key(api_key))
 
   defp url(%ChatAnthropic{bedrock: nil} = anthropic) do
     anthropic.endpoint
@@ -719,27 +1465,33 @@ defmodule LangChain.ChatModels.ChatAnthropic do
           | MessageDelta.t()
           | [MessageDelta.t()]
           | {:error, LangChainError.t()}
-  def do_process_response(_model, %{
-        "role" => "assistant",
-        "content" => contents,
-        "stop_reason" => stop_reason,
-        "type" => "message",
-        "usage" => usage
-      }) do
+  def do_process_response(
+        model,
+        %{
+          "role" => "assistant",
+          "content" => contents,
+          "stop_reason" => stop_reason,
+          "type" => "message",
+          "usage" => usage
+        } = data
+      ) do
     new_message =
       %{
         role: :assistant,
         content: [],
         status: stop_reason_to_status(stop_reason)
       }
+      |> Map.merge(stop_metadata(stop_reason, data["stop_details"]))
       |> Message.new()
       |> TokenUsage.set_wrapped(get_token_usage(usage))
       |> to_response()
 
     # reduce over the contents and accumulate to the message
-    Enum.reduce(contents, new_message, fn content, acc ->
+    contents
+    |> Enum.reduce(new_message, fn content, acc ->
       do_process_content_response(acc, content)
     end)
+    |> mark_progress_updates(model)
   end
 
   def do_process_response(_model, %{
@@ -761,7 +1513,7 @@ defmodule LangChain.ChatModels.ChatAnthropic do
     |> to_response()
   end
 
-  def do_process_response(_model, %{
+  def do_process_response(model, %{
         "type" => "content_block_start",
         "index" => index,
         "content_block" => %{
@@ -770,10 +1522,14 @@ defmodule LangChain.ChatModels.ChatAnthropic do
           "signature" => signature
         }
       }) do
+    part =
+      %{type: :thinking, content: content, options: [signature: signature]}
+      |> ContentPart.new!()
+      |> mark_progress_update(model)
+
     %{
       role: :assistant,
-      content:
-        ContentPart.new!(%{type: :thinking, content: content, options: [signature: signature]}),
+      content: part,
       status: :incomplete,
       index: index
     }
@@ -832,6 +1588,23 @@ defmodule LangChain.ChatModels.ChatAnthropic do
   end
 
   def do_process_response(_model, %{
+        "type" => "content_block_delta",
+        "index" => index,
+        "delta" => %{"type" => "citations_delta", "citation" => citation_data}
+      }) do
+    citation = parse_anthropic_citation(citation_data)
+
+    %{
+      role: :assistant,
+      content: %ContentPart{type: :text, content: nil, citations: [citation]},
+      status: :incomplete,
+      index: index
+    }
+    |> MessageDelta.new()
+    |> to_response()
+  end
+
+  def do_process_response(_model, %{
         "type" => "content_block_start",
         "index" => tool_index,
         "content_block" => %{"type" => "tool_use", "id" => call_id, "name" => tool_name}
@@ -871,16 +1644,21 @@ defmodule LangChain.ChatModels.ChatAnthropic do
     |> to_response()
   end
 
-  def do_process_response(_model, %{
+  def do_process_response(model, %{
         "type" => "content_block_delta",
         "index" => content_index,
         "delta" => %{"type" => "thinking_delta", "thinking" => thinking}
       }) do
+    part =
+      %{type: :thinking, content: thinking}
+      |> ContentPart.new!()
+      |> mark_progress_update(model)
+
     %{
       role: :assistant,
       status: :incomplete,
       index: content_index,
-      content: ContentPart.new!(%{type: :thinking, content: thinking})
+      content: part
     }
     |> MessageDelta.new()
     |> to_response()
@@ -905,15 +1683,16 @@ defmodule LangChain.ChatModels.ChatAnthropic do
         _model,
         %{
           "type" => "message_delta",
-          "delta" => %{"stop_reason" => stop_reason},
+          "delta" => %{"stop_reason" => stop_reason} = delta,
           "usage" => usage
-        } = _data
+        } = data
       ) do
     %{
       role: :assistant,
       content: nil,
       status: stop_reason_to_status(stop_reason)
     }
+    |> Map.merge(stop_metadata(stop_reason, delta["stop_details"] || data["stop_details"]))
     |> MessageDelta.new()
     |> TokenUsage.set_wrapped(get_token_usage(usage))
     |> to_response()
@@ -926,18 +1705,15 @@ defmodule LangChain.ChatModels.ChatAnthropic do
           "error" => %{"type" => type, "message" => reason}
         } = response
       ) do
-    Logger.error("Received error from API: #{inspect(response)}")
     {:error, LangChainError.exception(type: type, message: reason, original: response)}
   end
 
   def do_process_response(_model, %{"error" => %{"message" => reason} = error} = response) do
-    Logger.error("Received error from API: #{inspect(response)}")
     {:error, LangChainError.exception(type: error["type"], message: reason, original: response)}
   end
 
   def do_process_response(_model, {:error, %Jason.DecodeError{} = response}) do
     error_message = "Received invalid JSON: #{inspect(response)}"
-    Logger.error(error_message)
 
     {:error,
      LangChainError.exception(type: "invalid_json", message: error_message, original: response)}
@@ -975,9 +1751,44 @@ defmodule LangChain.ChatModels.ChatAnthropic do
      )}
   end
 
-  def do_process_response(_model, other) do
-    Logger.error("Failed to process an unexpected response. #{inspect(other)}")
+  # A server tool's input streams as JSON fragments. `decode_stream/2` relabels
+  # them so they are not read as a tool call's arguments, and each fragment is
+  # appended to the content of the provider item opened by the block's start.
+  def do_process_response(_model, %{
+        "type" => "content_block_delta",
+        "index" => index,
+        "delta" => %{"type" => @server_tool_input_delta, "partial_json" => partial_json}
+      }) do
+    %{
+      role: :assistant,
+      status: :incomplete,
+      index: index,
+      content: ContentPart.new!(%{type: :provider_item, content: partial_json})
+    }
+    |> MessageDelta.new()
+    |> to_response()
+  end
 
+  # Any other content block, such as the `server_tool_use` and
+  # `tool_search_tool_result` blocks of a tool search, is kept whole as a
+  # provider item so it can be sent back unchanged.
+  def do_process_response(_model, %{
+        "type" => "content_block_start",
+        "index" => index,
+        "content_block" => %{"type" => type} = block
+      })
+      when is_binary(type) do
+    %{
+      role: :assistant,
+      status: :incomplete,
+      index: index,
+      content: provider_item(block)
+    }
+    |> MessageDelta.new()
+    |> to_response()
+  end
+
+  def do_process_response(_model, other) do
     {:error,
      LangChainError.exception(
        type: "unexpected_response",
@@ -990,8 +1801,14 @@ defmodule LangChain.ChatModels.ChatAnthropic do
   defp do_process_content_response(%Message{} = message, %{"type" => "text", "text" => ""}),
     do: message
 
-  defp do_process_content_response(%Message{} = message, %{"type" => "text", "text" => text}) do
-    %Message{message | content: message.content ++ [ContentPart.text!(text)]}
+  defp do_process_content_response(
+         %Message{} = message,
+         %{"type" => "text", "text" => text} = block
+       ) do
+    citations = parse_anthropic_citations(Map.get(block, "citations", []))
+    part = ContentPart.text!(text)
+    part = %{part | citations: citations}
+    %Message{message | content: message.content ++ [part]}
   end
 
   defp do_process_content_response(%Message{} = message, %{
@@ -1074,9 +1891,67 @@ defmodule LangChain.ChatModels.ChatAnthropic do
     }
   end
 
+  # Any other block, such as the `server_tool_use` and `tool_search_tool_result`
+  # blocks of a tool search, is kept whole as a provider item so it can be sent
+  # back unchanged, in place.
+  defp do_process_content_response(%Message{} = message, %{"type" => type} = block)
+       when is_binary(type) do
+    %Message{message | content: (message.content || []) ++ [provider_item(block)]}
+  end
+
   defp do_process_content_response({:error, _reason} = error, _content) do
     error
   end
+
+  defp provider_item(%{"type" => type} = block) do
+    unless type in @tool_search_block_types do
+      Logger.debug(fn -> "Keeping unrecognized Anthropic content block #{inspect(type)}" end)
+    end
+
+    ContentPart.provider_item!(provider(), block)
+  end
+
+  # Under `thinking: %{display: "updates"}` the model writes a progress update
+  # between tool calls: a sentence for the person watching, in its own thinking
+  # block, while reasoning blocks come back with empty text. A thinking block
+  # with text is therefore a progress update, and is marked as narration so a
+  # consumer can render it as a status line rather than as reasoning.
+  #
+  # Under any other `display`, a thinking block with text is reasoning, so
+  # nothing is marked.
+  #
+  # The marker here says what an utterance is, not whether the turn is over.
+  # `LangChain.Message.narration?/1` reads text parts, so a progress update
+  # never decides the loop; a progress update is followed by the `tool_use`
+  # block it introduces, and that is what keeps the turn going.
+  defp mark_progress_updates(%Message{content: parts} = message, %ChatAnthropic{} = model)
+       when is_list(parts) do
+    %Message{message | content: Enum.map(parts, &mark_progress_update(&1, model))}
+  end
+
+  defp mark_progress_updates(result, _model), do: result
+
+  defp mark_progress_update(
+         %ContentPart{type: :thinking, content: content} = part,
+         %ChatAnthropic{} = model
+       )
+       when is_binary(content) and content != "" do
+    if progress_updates?(model) do
+      ContentPart.put_utterance(part, "narration")
+    else
+      part
+    end
+  end
+
+  defp mark_progress_update(part, _model), do: part
+
+  # `:thinking` is passed to the API as given, so it is read the same way here,
+  # accepting either key form a caller may have built it with.
+  defp progress_updates?(%ChatAnthropic{thinking: thinking}) when is_map(thinking) do
+    (Map.get(thinking, :display) || Map.get(thinking, "display")) == "updates"
+  end
+
+  defp progress_updates?(%ChatAnthropic{}), do: false
 
   defp to_response({:ok, message}), do: message
 
@@ -1087,10 +1962,34 @@ defmodule LangChain.ChatModels.ChatAnthropic do
   defp stop_reason_to_status("tool_use"), do: :complete
   defp stop_reason_to_status("max_tokens"), do: :length
   defp stop_reason_to_status("stop_sequence"), do: :complete
+  defp stop_reason_to_status("refusal"), do: :content_filtered
+  # A server tool, such as tool search, can pause a long-running turn. The turn
+  # is not over: `stop_metadata/2` marks it open, so the chain sends the paused
+  # content back and the model continues.
+  defp stop_reason_to_status("pause_turn"), do: :complete
 
   defp stop_reason_to_status(other) do
     Logger.warning("Unsupported stop_reason. Reason: #{inspect(other)}")
     nil
+  end
+
+  # Message metadata a stop reason contributes, as attributes to merge into the
+  # message or delta being built.
+  #
+  # - `stop_details` names the policy category behind a refusal and is null for
+  #   every other stop reason, so only a refusal contributes it.
+  # - `pause_turn` leaves the model's turn open (`end_turn: false`), which
+  #   `LangChain.Message.continues_turn?/1` reads so the chain calls the model
+  #   again.
+  defp stop_metadata(stop_reason, details) do
+    metadata =
+      %{}
+      |> then(fn m -> if is_map(details), do: Map.put(m, :stop_details, details), else: m end)
+      |> then(fn m ->
+        if stop_reason == "pause_turn", do: Map.put(m, :end_turn, false), else: m
+      end)
+
+    if map_size(metadata) == 0, do: %{}, else: %{metadata: metadata}
   end
 
   @doc false
@@ -1142,19 +2041,73 @@ defmodule LangChain.ChatModels.ChatAnthropic do
       IO.inspect(chunk, label: "RCVD RAW CHUNK")
     end
 
+    {buffer, server_indexes} = split_stream_buffer(buffer)
     {to_process, incomplete} = parse_stream_events(model, {chunk, buffer})
 
     if model.verbose_api do
       IO.inspect(to_process, label: "RAW TO PROCESS")
     end
 
-    processed = Enum.filter(to_process, &relevant_event?/1)
+    {processed, server_indexes} =
+      to_process
+      |> Enum.filter(&relevant_event?/1)
+      |> label_server_tool_input(server_indexes)
 
     if model.verbose_api do
       IO.inspect(processed, label: "READY TO PROCESS")
     end
 
-    {processed, incomplete}
+    {processed, join_stream_buffer(incomplete, server_indexes)}
+  end
+
+  # A `server_tool_use` block streams its input as `input_json_delta`
+  # fragments, the same delta type a `tool_use` block streams its arguments in.
+  # Only the block's start says which kind a content index holds, and the
+  # fragments can arrive in later chunks. The indexes of open server tool
+  # blocks therefore travel with the stream buffer, which the stream handler
+  # passes back unchanged on the next chunk.
+  #
+  # The buffer stays a plain string while no server tool block is open.
+  defp split_stream_buffer({buffer, server_indexes}) when is_binary(buffer),
+    do: {buffer, server_indexes}
+
+  defp split_stream_buffer(buffer), do: {buffer || "", MapSet.new()}
+
+  defp join_stream_buffer(incomplete, server_indexes) do
+    if MapSet.size(server_indexes) == 0, do: incomplete, else: {incomplete, server_indexes}
+  end
+
+  # Relabels the input fragments of server tool blocks, tracking which content
+  # indexes hold one.
+  defp label_server_tool_input(events, server_indexes) do
+    Enum.map_reduce(events, server_indexes, fn
+      %{"type" => "message_start"} = event, _indexes ->
+        {event, MapSet.new()}
+
+      %{
+        "type" => "content_block_start",
+        "index" => index,
+        "content_block" => %{"type" => "server_tool_use"}
+      } = event,
+      indexes ->
+        {event, MapSet.put(indexes, index)}
+
+      %{
+        "type" => "content_block_delta",
+        "index" => index,
+        "delta" => %{"type" => "input_json_delta"}
+      } =
+          event,
+      indexes ->
+        if MapSet.member?(indexes, index) do
+          {put_in(event, ["delta", "type"], @server_tool_input_delta), indexes}
+        else
+          {event, indexes}
+        end
+
+      event, indexes ->
+        {event, indexes}
+    end)
   end
 
   def relevant_event?(%{"type" => "message_start"}), do: true
@@ -1168,26 +2121,32 @@ defmodule LangChain.ChatModels.ChatAnthropic do
   def relevant_event?(%{"type" => "message_stop"}), do: false
   # catch-all for when we miss something
   def relevant_event?(event) do
-    Logger.error("Unsupported event received when parsing Anthropic response: #{inspect(event)}")
+    Logger.warning(fn ->
+      "Unsupported event received when parsing Anthropic response: #{inspect(event)}"
+    end)
+
     false
   end
 
   @doc false
   def decode_stream(%ChatAnthropic{bedrock: %BedrockConfig{}}, {chunk, buffer}, chunks \\ []) do
+    {buffer, server_indexes} = split_stream_buffer(buffer)
     {chunks, remaining} = BedrockStreamDecoder.decode_stream({chunk, buffer}, chunks)
 
-    chunks =
-      Enum.filter(chunks, fn chunk ->
+    {chunks, server_indexes} =
+      chunks
+      |> Enum.filter(fn chunk ->
         Map.has_key?(chunk, :bedrock_exception) || relevant_event?(chunk)
       end)
+      |> label_server_tool_input(server_indexes)
 
-    {chunks, remaining}
+    {chunks, join_stream_buffer(remaining, server_indexes)}
   end
 
   @doc """
   Convert a LangChain structure to the expected map of data for the Anthropic API.
   """
-  @spec for_api(Message.t() | ContentPart.t() | Function.t()) ::
+  @spec for_api(ToolCall.t() | ToolResult.t()) ::
           %{String.t() => any()} | no_return()
   # def for_api(%Message{role: :assistant, tool_calls: calls} = msg)
   #     when is_list(calls) and calls != [] do
@@ -1254,33 +2213,91 @@ defmodule LangChain.ChatModels.ChatAnthropic do
       "type" => "tool_use",
       "id" => call.call_id,
       "name" => call.name,
-      "input" => call.arguments || %{}
+      "input" => ToolCall.arguments_as_map(call)
     }
   end
 
   # ToolResult support
+  #
+  # A result holding tool references sends only the references here. Its other
+  # content follows the tool results in the same user message; see
+  # `message_for_api/1`.
   def for_api(%ToolResult{} = result) do
+    {content, _following} = split_tool_result_content(result.content)
+
     %{
       "type" => "tool_result",
       "tool_use_id" => result.tool_call_id,
-      "content" => content_parts_for_api(result.content)
+      "content" => content
     }
     |> Utils.conditionally_add_to_map("is_error", result.is_error)
     |> Utils.conditionally_add_to_map("cache_control", get_cache_control_setting(result.options))
   end
+
+  # A tool result is the one place a tool reference has a block of its own: the
+  # API loads each referenced tool, which must be declared in `tools`, normally
+  # deferred. A `tool_result` holding references cannot hold anything else, so
+  # the result's other parts are returned separately, to be sent after the
+  # tool results in the same user message.
+  #
+  # Returns `{tool_result_content, following_blocks}`.
+  defp split_tool_result_content(parts) when is_list(parts) do
+    if Enum.any?(parts, &match?(%ContentPart{type: :tool_reference}, &1)) do
+      {references, others} =
+        Enum.split_with(parts, &match?(%ContentPart{type: :tool_reference}, &1))
+
+      {Enum.map(references, &tool_reference_for_api/1), content_parts_for_api(others)}
+    else
+      {content_parts_for_api(parts), []}
+    end
+  end
+
+  defp split_tool_result_content(content), do: {content_parts_for_api(content), []}
+
+  defp tool_reference_for_api(%ContentPart{type: :tool_reference, content: name}),
+    do: %{"type" => "tool_reference", "tool_name" => name}
 
   @doc """
   Convert a Function to the format expected by the Anthropic API.
   """
   @spec function_for_api(Function.t()) :: map() | no_return()
   def function_for_api(%Function{} = fun) do
-    # I'm here
     %{
       "name" => fun.name,
       "input_schema" => get_parameters(fun)
     }
+    |> then(fn map ->
+      # Don't add the strict flag when fun.strict is nil or false.
+      # Sending strict: false to models that don't support strict tools causes an error.
+      if fun.strict do
+        Map.put(map, "strict", fun.strict)
+      else
+        map
+      end
+    end)
     |> Utils.conditionally_add_to_map("description", fun.description)
-    |> Utils.conditionally_add_to_map("cache_control", get_cache_control_setting(fun.options))
+    |> put_tool_loading(fun)
+  end
+
+  # A deferred tool cannot carry `cache_control`; the API rejects the request.
+  # Deferred tools are never part of the cached prefix anyway, so the setting
+  # is dropped and the breakpoint belongs on a tool that is not deferred.
+  defp put_tool_loading(map, %Function{} = fun) do
+    cache_control = get_cache_control_setting(fun.options)
+
+    if Function.deferred?(fun) do
+      if cache_control do
+        Logger.warning(
+          "Deferred function #{inspect(fun.name)} has cache_control set. A deferred tool " <>
+            "cannot carry cache_control, so it is left out. Put the cache breakpoint on a " <>
+            "tool that is not deferred."
+        )
+      end
+
+      Map.put(map, "defer_loading", true)
+    else
+      Utils.conditionally_add_to_map(map, "cache_control", cache_control)
+    end
   end
 
   @doc """
@@ -1302,11 +2319,18 @@ defmodule LangChain.ChatModels.ChatAnthropic do
     # convert ToolResult into the expected format for Anthropic.
     #
     # A tool result is returned as a list within the content of a user message.
+    # The API requires the tool results first, so the content a result holding
+    # tool references cannot carry itself follows all of them.
     tool_results = Enum.map(results, &for_api(&1))
+
+    following =
+      Enum.flat_map(results, fn %ToolResult{content: content} ->
+        content |> split_tool_result_content() |> elem(1)
+      end)
 
     %{
       "role" => "user",
-      "content" => tool_results
+      "content" => tool_results ++ following
     }
   end
 
@@ -1342,7 +2366,9 @@ defmodule LangChain.ChatModels.ChatAnthropic do
   def content_parts_for_api(nil), do: []
 
   def content_parts_for_api(contents) when is_list(contents) do
-    Enum.map(contents, &content_part_for_api/1)
+    contents
+    |> Enum.map(&content_part_for_api/1)
+    |> Enum.reject(&is_nil/1)
   end
 
   def content_parts_for_api(content) when is_binary(content) do
@@ -1361,6 +2387,13 @@ defmodule LangChain.ChatModels.ChatAnthropic do
   # If the setting is a map, return the map.
   #
   # If the setting is not provided, return nil.
+  defp get_citation_setting(options) do
+    case Keyword.get(options, :citations) do
+      true -> %{"enabled" => true}
+      _ -> nil
+    end
+  end
+
   defp get_cache_control_setting(options) do
     case Keyword.fetch(options || [], :cache_control) do
       :error ->
@@ -1382,7 +2415,9 @@ defmodule LangChain.ChatModels.ChatAnthropic do
   - `:text` - Converts to a text content part, optionally with cache control settings
   - `:thinking` - Converts to a thinking content part with required signature
   - `:unsupported` - Handles custom content types specified in options
-  - `:image` - Converts to an image content part with base64 data and media type
+  - `:image` - Converts to an image content part with base64 data or file_id reference
+  - `:file` - Converts to a document content part with base64 data, plain text, or file_id reference
+  - `:file_url` - Converts to a document content part with a URL source
   - `:image_url` - Raises an error as Anthropic doesn't support image URLs
 
   ## Options
@@ -1397,11 +2432,36 @@ defmodule LangChain.ChatModels.ChatAnthropic do
   - `:type` - Required string specifying the custom content type
 
   For `:image` type:
-  - `:media` - Required media type (`:png`, `:jpg`, `:jpeg`, `:gif`, `:webp`, or a string)
+  - `:type` - Source type. `:file_id` to reference an uploaded file, `:base64` (default) for inline data
+  - `:media` - Required when `:type` is `:base64`. Media type (`:png`, `:jpg`, `:jpeg`, `:gif`, `:webp`, or a string)
+
+  For `:file` type:
+  - `:type` - Source type. `:file_id` to reference an uploaded file, `:base64` (default) for inline data
+  - `:media` - Required when `:type` is `:base64`. Media type (`:pdf`, `:text`, or a string like `"application/pdf"`)
+  - `:title` - Optional document title
+  - `:citations` - Set to `true` to enable citations
+  - `:cache_control` - When provided, adds cache control settings
+
+  Note: Using `:file_id` requires the `"files-api-2025-04-14"` beta header:
+
+      ChatAnthropic.new!(%{
+        model: "claude-sonnet-4-5-20250514",
+        beta_headers: ["structured-outputs-2025-11-13", "files-api-2025-04-14"]
+      })
 
   Returns `nil` for unsupported content without required options.
   """
   @spec content_part_for_api(ContentPart.t()) :: map() | nil | no_return()
+  def content_part_for_api(%ContentPart{type: :text, citations: citations} = part)
+      when is_list(citations) and citations != [] do
+    %{
+      "type" => "text",
+      "text" => part.content,
+      "citations" => Enum.map(citations, &citation_for_api/1)
+    }
+    |> Utils.conditionally_add_to_map("cache_control", get_cache_control_setting(part.options))
+  end
+
   def content_part_for_api(%ContentPart{type: :text} = part) do
     %{"type" => "text", "text" => part.content}
     |> Utils.conditionally_add_to_map("cache_control", get_cache_control_setting(part.options))
@@ -1438,39 +2498,154 @@ defmodule LangChain.ChatModels.ChatAnthropic do
     end
   end
 
+  # An Anthropic block goes back as it arrived. A block whose input streamed in
+  # holds the accumulated JSON in `content`, which becomes its `"input"`. A
+  # provider item from any other provider is omitted.
+  def content_part_for_api(%ContentPart{type: :provider_item} = part) do
+    if ContentPart.provider_item?(part, provider()) do
+      ContentPart.provider_item_block(part)
+    else
+      nil
+    end
+  end
+
+  # A tool reference has a block of its own only inside a tool result (see
+  # `tool_result_content_for_api/1`). Anywhere else it reads as text.
+  def content_part_for_api(%ContentPart{type: :tool_reference} = part) do
+    Logger.warning(
+      "A tool reference outside a tool result is sent as text: #{inspect(part.content)}"
+    )
+
+    %{"type" => "text", "text" => ContentPart.tool_reference_text(part)}
+  end
+
   def content_part_for_api(%ContentPart{type: :image} = part) do
-    media =
-      case Keyword.fetch!(part.options || [], :media) do
-        :png ->
-          "image/png"
+    opts = part.options || []
 
-        :gif ->
-          "image/gif"
+    case Keyword.get(opts, :type, :base64) do
+      :file_id ->
+        %{
+          "type" => "image",
+          "source" => %{
+            "type" => "file",
+            "file_id" => part.content
+          }
+        }
 
-        :jpg ->
-          "image/jpeg"
+      :base64 ->
+        media =
+          case Keyword.get(opts, :media) do
+            nil ->
+              raise LangChainError,
+                    "Required :media option missing for base64-encoded image ContentPart"
 
-        :jpeg ->
-          "image/jpeg"
+            :png ->
+              "image/png"
 
-        :webp ->
-          "image/webp"
+            :gif ->
+              "image/gif"
 
-        value when is_binary(value) ->
-          value
+            :jpg ->
+              "image/jpeg"
 
-        other ->
-          message = "Received unsupported media type for ContentPart: #{inspect(other)}"
-          Logger.error(message)
-          raise LangChainError, message
+            :jpeg ->
+              "image/jpeg"
+
+            :webp ->
+              "image/webp"
+
+            value when is_binary(value) ->
+              value
+
+            other ->
+              raise LangChainError,
+                    "Received unsupported media type for ContentPart: #{inspect(other)}"
+          end
+
+        %{
+          "type" => "image",
+          "source" => %{
+            "type" => "base64",
+            "data" => part.content,
+            "media_type" => media
+          }
+        }
+    end
+  end
+
+  def content_part_for_api(%ContentPart{type: :file} = part) do
+    opts = part.options || []
+
+    base =
+      case Keyword.get(opts, :type, :base64) do
+        :file_id ->
+          %{
+            "type" => "document",
+            "source" => %{
+              "type" => "file",
+              "file_id" => part.content
+            }
+          }
+
+        :base64 ->
+          media =
+            case Keyword.get(opts, :media) do
+              nil ->
+                raise LangChainError,
+                      "Required :media option missing for base64-encoded document ContentPart"
+
+              value ->
+                value
+            end
+
+          case media do
+            :text ->
+              %{
+                "type" => "document",
+                "source" => %{
+                  "type" => "text",
+                  "media_type" => "text/plain",
+                  "data" => part.content
+                }
+              }
+
+            _ ->
+              media_type =
+                case media do
+                  :pdf ->
+                    "application/pdf"
+
+                  value when is_binary(value) ->
+                    value
+
+                  other ->
+                    raise LangChainError,
+                          "Received unsupported media type for ContentPart: #{inspect(other)}"
+                end
+
+              %{
+                "type" => "document",
+                "source" => %{
+                  "type" => "base64",
+                  "data" => part.content,
+                  "media_type" => media_type
+                }
+              }
+          end
       end
 
+    base
+    |> Utils.conditionally_add_to_map("title", Keyword.get(opts, :title))
+    |> Utils.conditionally_add_to_map("citations", get_citation_setting(opts))
+    |> Utils.conditionally_add_to_map("cache_control", get_cache_control_setting(opts))
+  end
+
+  def content_part_for_api(%ContentPart{type: :file_url} = part) do
     %{
-      "type" => "image",
+      "type" => "document",
       "source" => %{
-        "type" => "base64",
-        "data" => part.content,
-        "media_type" => media
+        "type" => "url",
+        "url" => part.content
       }
     }
   end
@@ -1482,13 +2657,14 @@ defmodule LangChain.ChatModels.ChatAnthropic do
   defp get_parameters(%Function{parameters: [], parameters_schema: nil} = _fun) do
     %{
       "type" => "object",
-      "properties" => %{}
+      "properties" => %{},
+      "additionalProperties" => false
     }
   end
 
   defp get_parameters(%Function{parameters: [], parameters_schema: schema} = _fun)
        when is_map(schema) do
-    schema
+    Map.put_new(schema, "additionalProperties", false)
   end
 
   defp get_parameters(%Function{parameters: params} = _fun) do
@@ -1499,25 +2675,142 @@ defmodule LangChain.ChatModels.ChatAnthropic do
   After all the messages have been converted using `for_api/1`, this combines
   multiple sequential tool response messages. The Anthropic API is very strict
   about user, assistant, user, assistant sequenced messages.
-  """
-  def post_process_and_combine_messages(messages) do
-    messages
-    |> Enum.reverse()
-    |> Enum.reduce([], fn
-      # when two "user" role messages are listed together, combine them. This
-      # can happen because multiple ToolCalls require multiple tool response
-      # messages, but Anthropic does those as a User message and strictly
-      # enforces that multiple user messages in a row are not permitted.
-      %{"role" => "user"} = item, [%{"role" => "user"} = prev | rest] = _acc ->
-        updated_prev = merge_user_messages(item, prev)
-        # merge current item into the previous and return the updated list
-        # updated_prev = Map.put(prev, "content", item["content"] ++ prev["content"])
-        [updated_prev | rest]
 
-      item, acc ->
-        [item | acc]
+  When `cache_messages` is set, it also adds cache_control to the last N user messages'
+  last ContentPart to enable efficient caching in multi-turn conversations.
+  """
+  def post_process_and_combine_messages(messages, cache_messages \\ nil) do
+    # First, combine sequential user messages
+    combined_messages =
+      messages
+      |> Enum.reverse()
+      |> Enum.reduce([], fn
+        # when two "user" role messages are listed together, combine them. This
+        # can happen because multiple ToolCalls require multiple tool response
+        # messages, but Anthropic does those as a User message and strictly
+        # enforces that multiple user messages in a row are not permitted.
+        %{"role" => "user"} = item, [%{"role" => "user"} = prev | rest] = _acc ->
+          updated_prev = merge_user_messages(item, prev)
+          [updated_prev | rest]
+
+        item, acc ->
+          [item | acc]
+      end)
+
+    # Then, add cache control to the last N user messages if enabled
+    if cache_messages_enabled?(cache_messages) do
+      add_cache_control_to_user_messages(combined_messages, cache_messages)
+    else
+      combined_messages
+    end
+  end
+
+  # Check if cache_messages is enabled
+  defp cache_messages_enabled?(%{enabled: true}), do: true
+  defp cache_messages_enabled?(%{"enabled" => true}), do: true
+  defp cache_messages_enabled?(_), do: false
+
+  # Get the count of breakpoints to use (default: 3, max: 4)
+  defp get_breakpoint_count(cache_messages) do
+    count =
+      case cache_messages do
+        %{count: c} when is_integer(c) -> c
+        %{"count" => c} when is_integer(c) -> c
+        _ -> 3
+      end
+
+    # Clamp to max of 4
+    min(count, 4)
+  end
+
+  # Add cache_control to the last N user messages
+  defp add_cache_control_to_user_messages(messages, cache_messages) do
+    breakpoint_count = get_breakpoint_count(cache_messages)
+    cache_control = get_cache_control_from_setting(cache_messages)
+
+    # Find indices of all user messages
+    user_message_indices =
+      messages
+      |> Enum.with_index()
+      |> Enum.filter(fn {msg, _idx} -> msg["role"] == "user" end)
+      |> Enum.map(fn {_msg, idx} -> idx end)
+
+    # Get the indices of the last N user messages
+    indices_to_cache = Enum.take(user_message_indices, -breakpoint_count)
+
+    # Add cache_control to those messages
+    messages
+    |> Enum.with_index()
+    |> Enum.map(fn {msg, idx} ->
+      if idx in indices_to_cache do
+        add_cache_control_to_last_content(msg, cache_control)
+      else
+        msg
+      end
     end)
   end
+
+  # Add cache_control to the last ContentPart in a user message
+  defp add_cache_control_to_last_content(
+         %{"role" => "user", "content" => content} = message,
+         cache_control
+       )
+       when is_list(content) and length(content) > 0 do
+    # Find the last text content part (skip tool_result types)
+    {_content_before_last_text, last_text_index} =
+      content
+      |> Enum.with_index()
+      |> Enum.reverse()
+      |> Enum.find({nil, nil}, fn {part, _idx} ->
+        part["type"] == "text"
+      end)
+
+    case last_text_index do
+      nil ->
+        # No text parts found, return message unchanged
+        message
+
+      idx ->
+        # Update the last text part with cache_control (if it doesn't already have one)
+        updated_content =
+          List.update_at(content, idx, fn part ->
+            if Map.has_key?(part, "cache_control") do
+              # Keep existing cache_control
+              part
+            else
+              # Add cache_control
+              Map.put(part, "cache_control", cache_control)
+            end
+          end)
+
+        Map.put(message, "content", updated_content)
+    end
+  end
+
+  defp add_cache_control_to_last_content(message, _cache_control), do: message
+
+  # Convert cache_messages setting to the cache_control block format
+  defp get_cache_control_from_setting(%{enabled: true} = settings) do
+    case Map.get(settings, :ttl) do
+      nil ->
+        @default_cache_control_block
+
+      ttl ->
+        %{"type" => "ephemeral", "ttl" => ttl}
+    end
+  end
+
+  defp get_cache_control_from_setting(%{"enabled" => true} = settings) do
+    case Map.get(settings, "ttl") do
+      nil ->
+        @default_cache_control_block
+
+      ttl ->
+        %{"type" => "ephemeral", "ttl" => ttl}
+    end
+  end
+
+  defp get_cache_control_from_setting(_), do: nil
 
   # Merge the two user messages
   defp merge_user_messages(%{"role" => "user"} = item, %{"role" => "user"} = prev) do
@@ -1557,6 +2850,10 @@ defmodule LangChain.ChatModels.ChatAnthropic do
     return
   end
 
+  # A stream reports usage twice. `message_start` opens the message with the
+  # input classes and `message_delta` closes it with the totals for the whole
+  # message, so `TokenUsage.add/2` keeps the larger reading per class rather
+  # than adding the two together.
   defp get_token_usage(usage_data) do
     # if prompt caching has been used the response will also contain
     # "cache_creation_input_tokens" and "cache_read_input_tokens"
@@ -1566,6 +2863,88 @@ defmodule LangChain.ChatModels.ChatAnthropic do
       raw: usage_data
     })
   end
+
+  # -- Citation parsing helpers --
+
+  defp parse_anthropic_citations(citations) when is_list(citations) do
+    Enum.map(citations, &parse_anthropic_citation/1)
+  end
+
+  defp parse_anthropic_citations(_), do: []
+
+  defp parse_anthropic_citation(%{"type" => type} = citation) do
+    Citation.new!(%{
+      cited_text: Map.get(citation, "cited_text"),
+      source: %{
+        type: :document,
+        title: Map.get(citation, "document_title"),
+        document_id: to_string(Map.get(citation, "document_index"))
+      },
+      metadata: build_anthropic_citation_metadata(type, citation)
+    })
+  end
+
+  defp build_anthropic_citation_metadata("char_location", citation) do
+    %{
+      "provider_type" => "char_location",
+      "start_char_index" => Map.get(citation, "start_char_index"),
+      "end_char_index" => Map.get(citation, "end_char_index")
+    }
+  end
+
+  defp build_anthropic_citation_metadata("page_location", citation) do
+    %{
+      "provider_type" => "page_location",
+      "start_page_number" => Map.get(citation, "start_page_number"),
+      "end_page_number" => Map.get(citation, "end_page_number")
+    }
+  end
+
+  defp build_anthropic_citation_metadata("content_block_location", citation) do
+    %{
+      "provider_type" => "content_block_location",
+      "start_block_index" => Map.get(citation, "start_block_index"),
+      "end_block_index" => Map.get(citation, "end_block_index")
+    }
+  end
+
+  # -- Citation serialization for API round-trip --
+
+  defp citation_for_api(%Citation{} = citation) do
+    meta = citation.metadata || %{}
+    provider_type = Map.get(meta, "provider_type", "char_location")
+
+    base = %{
+      "type" => provider_type,
+      "cited_text" => citation.cited_text,
+      "document_index" => parse_document_index(citation.source.document_id),
+      "document_title" => citation.source.title
+    }
+
+    case provider_type do
+      "char_location" ->
+        Map.merge(base, %{
+          "start_char_index" => Map.get(meta, "start_char_index"),
+          "end_char_index" => Map.get(meta, "end_char_index")
+        })
+
+      "page_location" ->
+        Map.merge(base, %{
+          "start_page_number" => Map.get(meta, "start_page_number"),
+          "end_page_number" => Map.get(meta, "end_page_number")
+        })
+
+      "content_block_location" ->
+        Map.merge(base, %{
+          "start_block_index" => Map.get(meta, "start_block_index"),
+          "end_block_index" => Map.get(meta, "end_block_index")
+        })
+    end
+  end
+
+  defp parse_document_index(nil), do: nil
+  defp parse_document_index(id) when is_binary(id), do: String.to_integer(id)
+  defp parse_document_index(id) when is_integer(id), do: id
 
   @doc """
   Generate a config map that can later restore the model's configuration.
@@ -1585,7 +2964,9 @@ defmodule LangChain.ChatModels.ChatAnthropic do
         :top_p,
         :top_k,
         :stream,
-        :beta_headers
+        :beta_headers,
+        :json_response,
+        :json_schema
       ],
       @current_config_version
     )
